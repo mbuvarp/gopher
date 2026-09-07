@@ -12,13 +12,41 @@ impl Store {
         let connection = Connection::open(directory.join("state.sqlite3"))?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        anyhow::ensure!(version <= 1, "Database belongs to a newer Gopher version");
-        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
+        anyhow::ensure!(version <= 2, "Database belongs to a newer Gopher version");
+        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS prs (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, pr_id TEXT NOT NULL, update_id TEXT NOT NULL, url TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);
-            PRAGMA user_version=1;")?;
+            CREATE TABLE IF NOT EXISTS ignored_prs (id TEXT PRIMARY KEY);
+            PRAGMA user_version=2; COMMIT;")?;
         Ok(Self { connection })
+    }
+
+    pub fn ignored(&self) -> Result<BTreeSet<String>> {
+        let mut query = self.connection.prepare("SELECT id FROM ignored_prs")?;
+        Ok(query
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn ignore(&mut self, id: &str) -> Result<Vec<String>> {
+        let notifications = self.notification_ids(id, None)?;
+        let tx = self.connection.transaction()?;
+        tx.execute("INSERT OR IGNORE INTO ignored_prs (id) VALUES (?1)", [id])?;
+        tx.execute("DELETE FROM prs WHERE id=?1", [id])?;
+        tx.execute("DELETE FROM notifications WHERE pr_id=?1", [id])?;
+        tx.commit()?;
+        tracing::info!(event = "pr_ignored", pr_id = id);
+        Ok(notifications)
+    }
+
+    pub fn notification_ids(&self, pr: &str, update: Option<&str>) -> Result<Vec<String>> {
+        let mut query = self.connection.prepare(
+            "SELECT id FROM notifications WHERE pr_id=?1 AND (?2 IS NULL OR update_id=?2)",
+        )?;
+        Ok(query
+            .query_map(params![pr, update], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn set_viewer(&mut self, viewer: &str) -> Result<bool> {

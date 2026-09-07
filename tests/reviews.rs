@@ -483,3 +483,77 @@ fn persisted_reaction_association_survives_restart() {
         State::Approved
     );
 }
+
+#[test]
+fn ignored_prs_survive_restart_pruning_and_account_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    store.set_viewer("one").unwrap();
+    let pr = transition(snapshot(), None, None, 100, 0);
+    store.save(&pr).unwrap();
+    let notification = store.notification(&pr).unwrap().unwrap();
+    assert_eq!(
+        store.ignore(&pr.snapshot.id).unwrap(),
+        vec![notification.clone()]
+    );
+    assert!(store.load().unwrap().is_empty());
+    assert!(store.notification_target(&notification).unwrap().is_none());
+    store.retain(&Default::default()).unwrap();
+    store.set_viewer("two").unwrap();
+    drop(store);
+    let mut store = Store::open(dir.path()).unwrap();
+    assert!(store.ignored().unwrap().contains(&pr.snapshot.id));
+    assert!(store.ignore(&pr.snapshot.id).unwrap().is_empty());
+}
+
+#[test]
+fn version_one_migration_preserves_acknowledgements_and_notifications() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pr = transition(snapshot(), None, None, 100, 0);
+    pr.acknowledged = Some(pr.update_id.clone());
+    let connection = rusqlite::Connection::open(dir.path().join("state.sqlite3")).unwrap();
+    connection.execute_batch("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE prs (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+        CREATE TABLE notifications (id TEXT PRIMARY KEY, pr_id TEXT NOT NULL, update_id TEXT NOT NULL, url TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);
+        PRAGMA user_version=1;").unwrap();
+    connection
+        .execute(
+            "INSERT INTO prs VALUES (?1,?2)",
+            rusqlite::params![pr.snapshot.id, serde_json::to_string(&pr).unwrap()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO notifications VALUES ('notice',?1,?2,?3,1)",
+            rusqlite::params![pr.snapshot.id, pr.update_id, pr.snapshot.url],
+        )
+        .unwrap();
+    drop(connection);
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(store.load().unwrap()[0].acknowledged, pr.acknowledged);
+    assert!(store.notification_target("notice").unwrap().is_some());
+    assert!(store.ignored().unwrap().is_empty());
+}
+
+#[test]
+fn notification_dismissal_targets_only_the_acknowledged_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let mut pr = transition(snapshot(), None, None, 100, 0);
+    let first = store.notification(&pr).unwrap().unwrap();
+    let old_update = pr.update_id.clone();
+    pr.update_id = "new-update".into();
+    let second = store.notification(&pr).unwrap().unwrap();
+    assert_eq!(
+        store
+            .notification_ids(&pr.snapshot.id, Some(&old_update))
+            .unwrap(),
+        vec![first]
+    );
+    assert_eq!(
+        store
+            .notification_ids(&pr.snapshot.id, Some(&pr.update_id))
+            .unwrap(),
+        vec![second]
+    );
+}

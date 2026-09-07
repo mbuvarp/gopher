@@ -859,6 +859,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-service-management",
  "objc2-user-notifications",
+ "png",
  "regex",
  "rusqlite",
  "serde",

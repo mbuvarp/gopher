@@ -1,6 +1,6 @@
 # Gopher
 
-A native Rust macOS menu bar inbox for GitHub agent reviews. Tracks open PRs you authored, are assigned to, or are requested to review, grouped by repository.
+A native Rust macOS menu bar inbox for GitHub agent reviews. Tracks open PRs you authored, are assigned to, or are requested to review, grouped by repository under `repo • organization` headings, ordered by organization, repository, then ascending PR number.
 
 ## Run
 
@@ -28,7 +28,7 @@ Allow notifications when prompted. Enable **Launch at login** in Gopher's menu t
 
 Findings are held until every participating reviewer finishes. Completed results must remain stable for 30 seconds by default, avoiding notifications while an agent is still publishing its output. An approval describes agent review only; it is not a guarantee of CI success, human approval, or mergeability.
 
-Each PR has **Open PR** and **Acknowledge update** actions. Unacknowledged results affect the main icon, with comments taking priority over approvals. Clicking a review notification opens the PR and acknowledges the notification's update; older notifications cannot acknowledge newer updates.
+Each PR has **Open PR**, **Acknowledge update**, and **Ignore PR** actions. Clicking the PR row itself acknowledges the displayed update; hovering opens its submenu. Opening a PR successfully acknowledges its displayed update and clears that update’s notification. **Ignore PR** permanently removes that PR from polling, menus, and notifications, including after restarts or account changes. Unacknowledged results affect the main icon, with comments taking priority over approvals. The plain cartoon gopher is used both when nothing needs attention and while reviews are running or being confirmed; background polling alone does not change the icon. The question mark is reserved for errors or unacknowledged unknown/stale PRs. Clicking a review notification acknowledges its update without opening the browser. Its action menu offers **Acknowledge** and **Open PR**; **Open PR** opens the browser and acknowledges after it opens successfully. Older notifications cannot acknowledge newer updates.
 
 Codex detection uses its bot reactions, commit-specific reviews, and persistent review summary. Cubic uses checks and explicit issue counts. CodeRabbit uses checks and explicit review verdicts. Successful checks alone do not establish approval. Unknown formats and reactions without a reliable commit association stay Unknown. Resolved threads alone do not establish a clean review.
 
@@ -40,7 +40,7 @@ Everything is stored in `~/.config/gopher`:
 
 ```text
 config.toml           Optional settings; restart to apply
-state.sqlite3         Cached PRs, review evidence, acknowledgements, notification history
+state.sqlite3         Cached PRs, review evidence, acknowledgements, ignored PRs, notification history
 logs/gopher.jsonl     Structured logs, at most 10,000 retained lines
 gopher.lock           Prevents concurrent app instances
 ```

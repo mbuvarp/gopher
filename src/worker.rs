@@ -21,10 +21,12 @@ pub enum UiEvent {
         error: Option<String>,
     },
     Notify {
+        review: bool,
         id: String,
         title: String,
         body: String,
     },
+    DismissNotifications(Vec<String>),
     Open {
         url: String,
         pr: String,
@@ -38,7 +40,11 @@ pub enum Command {
         update: String,
         checked: bool,
     },
-    NotificationClicked(String),
+    Ignore(String),
+    NotificationAction {
+        id: String,
+        open: bool,
+    },
     NotificationDelivered(String),
     NotificationFailed(String),
     Shutdown,
@@ -85,6 +91,7 @@ pub fn start(directory: PathBuf, config: Config, sink: Sink) -> Result<Worker> {
                     error: Some(error.to_string()),
                 });
                 sink(UiEvent::Notify {
+                    review: false,
                     id: "gopher-worker-error".into(),
                     title: "Gopher needs attention".into(),
                     body: error.to_string(),
@@ -102,6 +109,7 @@ async fn fetch(
     references: Vec<PrRef>,
     discover: bool,
     old_viewer: Option<String>,
+    ignored: BTreeSet<String>,
 ) -> Result<Batch> {
     let github = Github::new(&config)?;
     let viewer = github.viewer().await?;
@@ -113,7 +121,9 @@ async fn fetch(
     };
     let references: Vec<_> = references
         .into_iter()
-        .filter(|r| !config.repositories.get(&r.repo).is_some_and(|c| c.ignore))
+        .filter(|r| {
+            !ignored.contains(&r.id) && !config.repositories.get(&r.repo).is_some_and(|c| c.ignore)
+        })
         .collect();
     let mut tasks = tokio::task::JoinSet::new();
     let mut pending = references.clone().into_iter();
@@ -150,9 +160,11 @@ async fn run(
     sink: Sink,
 ) -> Result<()> {
     let mut store = Store::open(&directory)?;
+    let mut ignored = store.ignored()?;
     let mut prs: BTreeMap<_, _> = store
         .load()?
         .into_iter()
+        .filter(|p| !ignored.contains(&p.snapshot.id))
         .map(|p| (p.snapshot.id.clone(), p))
         .collect();
     let mut references: Vec<_> = prs
@@ -170,6 +182,7 @@ async fn run(
     let mut polling = false;
     let mut failures = 0_u32;
     let mut in_flight_notifications = BTreeSet::new();
+    let mut dismiss_after_delivery = BTreeSet::new();
     sink(UiEvent::Updated {
         prs: prs.values().cloned().collect(),
         error: None,
@@ -182,10 +195,11 @@ async fn run(
                 let config = config.clone();
                 let references = references.clone();
                 let viewer = viewer.clone();
+                let ignored = ignored.clone();
                 let sender = sender.clone();
                 let discover = discovered_at.is_none_or(|time|time.elapsed().as_secs() >= config.discovery_seconds);
                 tokio::spawn(async move {
-                    let result = fetch(config,references,discover,viewer).await.map_err(|e|e.to_string());
+                    let result = fetch(config,references,discover,viewer,ignored).await.map_err(|e|e.to_string());
                     let _ = sender.send(Command::PollComplete(result));
                 });
                 continue;
@@ -202,21 +216,59 @@ async fn run(
                 update,
                 checked,
             } => {
-                if let Some(pr) = prs.get_mut(&pr) {
-                    store.acknowledge(pr, &update, checked)?;
+                if let Some(pr) = prs.get_mut(&pr)
+                    && store.acknowledge(pr, &update, checked)?
+                    && checked
+                {
+                    let ids = store.notification_ids(&pr.snapshot.id, Some(&update))?;
+                    dismiss_after_delivery.extend(
+                        ids.iter()
+                            .filter(|id| in_flight_notifications.contains(*id))
+                            .cloned(),
+                    );
+                    sink(UiEvent::DismissNotifications(ids));
                 }
             }
-            Command::NotificationClicked(id) => {
+            Command::Ignore(id) => {
+                let notifications = store.ignore(&id)?;
+                ignored.insert(id.clone());
+                prs.remove(&id);
+                references.retain(|r| r.id != id);
+                dismiss_after_delivery.extend(
+                    notifications
+                        .iter()
+                        .filter(|id| in_flight_notifications.contains(*id))
+                        .cloned(),
+                );
+                sink(UiEvent::DismissNotifications(notifications));
+            }
+            Command::NotificationAction { id, open } => {
                 if let Some((pr, update, url)) = store.notification_target(&id)? {
-                    sink(UiEvent::Open { url, pr, update });
-                    tracing::info!(event="notification_clicked", notification=%id);
+                    if open {
+                        sink(UiEvent::Open { url, pr, update });
+                    } else {
+                        if let Some(pr) = prs.get_mut(&pr) {
+                            store.acknowledge(pr, &update, true)?;
+                        }
+                        if in_flight_notifications.contains(&id) {
+                            dismiss_after_delivery.insert(id.clone());
+                        }
+                        sink(UiEvent::DismissNotifications(vec![id.clone()]));
+                    }
+                    tracing::info!(event="notification_action", notification=%id, open);
                 }
             }
             Command::NotificationDelivered(id) => {
                 store.mark_delivered(&id)?;
+                in_flight_notifications.remove(&id);
+                // A native add request can complete after the user dismissed its update.
+                if dismiss_after_delivery.remove(&id) {
+                    sink(UiEvent::DismissNotifications(vec![id]));
+                }
             }
             Command::NotificationFailed(id) => {
                 in_flight_notifications.remove(&id);
+                dismiss_after_delivery.remove(&id);
             }
             Command::PollComplete(result) => {
                 polling = false;
@@ -234,7 +286,11 @@ async fn run(
                             in_flight_notifications.clear();
                         }
                         viewer = Some(batch.viewer);
-                        references = batch.references;
+                        references = batch
+                            .references
+                            .into_iter()
+                            .filter(|r| !ignored.contains(&r.id))
+                            .collect();
                         if batch.discovered {
                             discovered_at = Some(Instant::now());
                             let ids: BTreeSet<_> =
@@ -244,6 +300,10 @@ async fn run(
                         }
                         let now = chrono::Utc::now().timestamp();
                         for (id, result) in batch.results {
+                            // The user may have ignored this PR while its request was running.
+                            if ignored.contains(&id) {
+                                continue;
+                            }
                             match result {
                                 Err(message) => {
                                     if let Some(pr) = prs.get_mut(&id) {
@@ -289,6 +349,7 @@ async fn run(
                                         && in_flight_notifications.insert(id.clone())
                                     {
                                         sink(UiEvent::Notify {
+                                            review: true,
                                             id,
                                             title: format!(
                                                 "{} #{} · {}",
@@ -310,6 +371,7 @@ async fn run(
                     if let Some(message) = &new_error {
                         tracing::error!(event="service_error",error=%message);
                         sink(UiEvent::Notify {
+                            review: false,
                             id: format!("gopher-error-{}", hash(message)),
                             title: "Gopher needs attention".into(),
                             body: message.clone(),
@@ -374,5 +436,90 @@ pub fn transition(
         head_since,
         candidate_id,
         candidate_since,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignored_pr_cannot_reappear_from_an_in_flight_poll() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            gh_path: Some(directory.path().join("missing-gh")),
+            ..Default::default()
+        };
+        let snapshot = Snapshot {
+            id: "PR_ignored".into(),
+            repo: "owner/repo".into(),
+            number: 1,
+            head: "abc".into(),
+            open: true,
+            ..Default::default()
+        };
+        let store = Store::open(directory.path()).unwrap();
+        let pr = transition(snapshot.clone(), None, None, 100, 0);
+        store.save(&pr).unwrap();
+        let notification = store.notification(&pr).unwrap().unwrap();
+        drop(store);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = start(
+            directory.path().into(),
+            config,
+            Arc::new(move |event| {
+                tx.send(event).unwrap();
+            }),
+        )
+        .unwrap();
+        // Let initial polling fail, then inject a delayed discovery response deterministically.
+        loop {
+            if matches!(
+                rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                UiEvent::Updated { error: Some(_), .. }
+            ) {
+                break;
+            }
+        }
+        worker
+            .sender
+            .send(Command::Ignore(snapshot.id.clone()))
+            .unwrap();
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), UiEvent::DismissNotifications(ids) if ids==vec![notification.clone()])
+        );
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), UiEvent::Updated {prs,..} if prs.is_empty())
+        );
+        worker
+            .sender
+            .send(Command::PollComplete(Ok(Batch {
+                viewer: "viewer".into(),
+                discovered: true,
+                references: vec![PrRef {
+                    id: snapshot.id.clone(),
+                    repo: snapshot.repo.clone(),
+                    number: 1,
+                }],
+                results: vec![(snapshot.id.clone(), Ok(snapshot.clone()))],
+            })))
+            .unwrap();
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), UiEvent::Updated {prs,error:None} if prs.is_empty())
+        );
+        worker
+            .sender
+            .send(Command::NotificationAction {
+                id: notification,
+                open: false,
+            })
+            .unwrap();
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), UiEvent::Updated {prs,..} if prs.is_empty())
+        );
+        drop(worker);
+        let store = Store::open(directory.path()).unwrap();
+        assert!(store.load().unwrap().is_empty());
+        assert!(store.ignored().unwrap().contains(&snapshot.id));
     }
 }

@@ -56,14 +56,6 @@ impl State {
             Self::Approved => "Approved",
         }
     }
-    pub fn symbol(self) -> &'static str {
-        match self {
-            Self::Unknown => "?",
-            Self::Reviewing => "◌",
-            Self::Comments => "●",
-            Self::Approved => "✓",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]

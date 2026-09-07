@@ -4,11 +4,15 @@ Gopher is a personal macOS menu bar app that monitors GitHub PRs, replacing repe
 
 ## Product behavior
 
-- List open PRs authored by, assigned to, or requesting review from the authenticated user, grouped by repository.
-- Give each PR a submenu with **Open PR** and an **Acknowledge update** checkbox.
+- List open PRs authored by, assigned to, or requesting review from the authenticated user, grouped by repository. Headings use `repo • organization`; sort by organization, repository, then ascending PR number.
+- Keep an open menu stable during background updates; apply the latest state after it closes and preserve the update IDs of actions the user actually saw.
+- Show PR review states with native template image icons (SF Symbols), not Unicode prefixes; retain text status labels inside each submenu.
+- Give each PR a submenu with **Open PR**, an **Acknowledge update** checkbox, and **Ignore PR**. Opening a PR successfully acknowledges the displayed update. Clicking the PR row itself also acknowledges that displayed update; hovering still opens its submenu.
+- Ignore permanently hides a specific PR from polling, menus, and notifications. Persist its GitHub node ID independently of cache pruning or account changes; discard any in-flight result for it.
 - Acknowledgement silences that update's contribution to the main menu bar icon. Reset it when a meaningful new update arrives.
+- Use the neutral monochrome cartoon gopher (`assets/gopher.png`) for both idle and review-in-progress menu bar states; background polling alone does not change the icon. Reserve the question mark for errors or unacknowledged unknown/stale PRs.
 - Reflect unacknowledged comments or approvals in the main icon. Notify when a review run finishes with findings or approval; defer findings notifications until all participating reviewers finish.
-- Clicking a review notification opens the PR in the default browser and acknowledges that specific update. An older notification must not acknowledge newer updates.
+- Clicking a review notification or its **Acknowledge** action acknowledges that specific update without opening the browser. The **Open PR** notification action opens the PR and acknowledges only after the browser opens successfully. An older notification must not acknowledge newer updates.
 
 ## Review states
 
@@ -38,7 +42,7 @@ Keep reviewer detection in separate modules. Treat these observed conventions as
 ## Persistence and diagnostics
 
 - Store everything under `~/.config/gopher`; do not use macOS Application Support defaults.
-- Use `state.sqlite3` via `rusqlite` for cached PR data, reviewer evidence/runs, update identifiers, acknowledgements, and notification history. GitHub remains authoritative; show restored data as stale until refreshed.
+- Use `state.sqlite3` via `rusqlite` for cached PR data, reviewer evidence/runs, update identifiers, acknowledgements, ignored PR IDs, and notification history. GitHub remains authoritative; show restored data as stale until refreshed.
 - Keep optional settings in `config.toml`.
 - Write structured JSONL logs to `logs/gopher.jsonl` using `tracing`, retaining at most **10,000 lines across retained logs**. Bound individual entry sizes and safely replace files when trimming.
 - Log request timing/failures, detection evidence, state transitions, notifications, and acknowledgements with timestamps, severity, and PR/reviewer identifiers. Exclude credentials and full API responses by default.
