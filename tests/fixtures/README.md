@@ -1,0 +1,1 @@
+These minimal, sanitized fixtures preserve the observed review formatting from the PR examples supplied during design. Commit IDs and nonessential repository content are replaced or omitted. Other test payloads are synthetic boundary cases, not claims about an agent's documented output contract.

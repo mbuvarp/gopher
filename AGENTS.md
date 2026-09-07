@@ -1,6 +1,6 @@
 # Gopher
 
-Gopher is a personal macOS menu bar app that monitors GitHub PRs, replacing repeated browser checks while agent reviewers work. This file records the agreed design; components below may not be implemented yet.
+Gopher is a personal macOS menu bar app that monitors GitHub PRs, replacing repeated browser checks while agent reviewers work.
 
 ## Product behavior
 
@@ -19,10 +19,12 @@ Gopher is a personal macOS menu bar app that monitors GitHub PRs, replacing repe
 
 Detect participating agents per PR; subscriptions and repository settings vary. Support repository overrides for expected reviewers. Track the current commit and observed review runs, including reruns on the same commit. Never carry an old approval forward without current evidence, or interpret missing activity as approval.
 
+Exclude explicit subscription-limit/paused-review skips from inferred participation, while displaying the reason. An explicitly required reviewer that skips keeps the result Unknown. Confirm actionable results across polls before notifying (30-second default).
+
 Keep reviewer detection in separate modules. Treat these observed conventions as evidence to validate, not guaranteed API contracts:
 
 - **Cubic:** A running PR check indicates review activity. Review summaries include `N issues found`, `No issues found`, or `0 issues found`; summaries may be edited after findings are addressed.
-- **CodeRabbit:** Uses PR checks for activity; verify its completion signals before implementing approval detection.
+- **CodeRabbit:** Uses checks or legacy commit statuses for activity. Require an explicit current-commit review verdict; successful or skipped statuses alone are not approval.
 - **Codex:** Uses an `eyes` reaction on the PR description while reviewing, often with an edited `Codex Review Summary` comment. It may remove `eyes` when posting findings or add `+1` for approval. Attribute reactions to the agent; reactions alone do not identify the reviewed commit.
 
 ## Architecture
@@ -43,7 +45,11 @@ Keep reviewer detection in separate modules. Treat these observed conventions as
 
 ## Development guidance
 
-Prefer structural symbol navigation for unfamiliar code when available; use text search for strings and cross-file usages. Test reviewer parsing and state transitions with representative fixtures, especially stale approvals, edited summaries, overlapping runs, and acknowledgement races. Document actual build/test commands here once established.
+Prefer structural symbol navigation for unfamiliar code when available; use text search for strings and cross-file usages. Test reviewer parsing and state transitions with representative fixtures, especially stale approvals, edited summaries, overlapping runs, and acknowledgement races.
+
+- Check: `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`.
+- Diagnose: `cargo run -- doctor`, `cargo run -- inspect OWNER/REPO NUMBER` (read-only; no notifications).
+- Package: `sh scripts/bundle.sh`. Notifications need the `.app` bundle and reliable Apple signing; the script prefers an installed Apple Development identity. Use `GOPHER_SIGNING_IDENTITY` to override.
 
 ## Git
 

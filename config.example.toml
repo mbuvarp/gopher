@@ -1,0 +1,15 @@
+# Save as ~/.config/gopher/config.toml. Restart Gopher after editing.
+poll_seconds = 30
+discovery_seconds = 120
+request_timeout_seconds = 20
+# Confirm a completed result across polls before announcing it.
+settle_seconds = 30
+notifications = true
+log_level = "info" # Use "debug" for request timing.
+# gh_path = "/opt/homebrew/bin/gh"
+
+# By default, infer reviewers from each PR's activity.
+# An explicit list replaces inference for that repository.
+# [repositories."owner/repo"]
+# reviewers = ["codex", "cubic", "coderabbit"]
+# ignore = false
