@@ -422,7 +422,8 @@ pub fn run(directory: PathBuf, config: Config) -> Result<()> {
                 let attention:Vec<_>=prs.iter().filter(|p|p.needs_attention()).collect();
                 let state=menu_bar_state(&prs,error.is_some());
                 let _=tray.set_icon_with_as_template(Some(icon(state)),true);
-                tray.set_title(if error.is_some(){Some("!")}else{None});
+                // On macOS, None leaves the existing status-item title unchanged.
+                tray.set_title(Some(if error.is_some(){"!"}else{""}));
                 let _=tray.set_tooltip(Some(format!("Gopher · {} PRs · {} updates",prs.len(),attention.len())));
                 tracing::debug!(event="menu_updated",prs=prs.len(),updates=attention.len(),state=?state);
             }
@@ -602,10 +603,10 @@ fn menu(
             .collect();
         let item = Submenu::new(
             format!(
-                "#{} {}{}",
+                "{}#{} {}",
+                if pr.needs_attention() { "● " } else { "" },
                 pr.snapshot.number,
                 title,
-                if pr.needs_attention() { " •" } else { "" }
             ),
             true,
         );
