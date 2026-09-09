@@ -47,6 +47,15 @@ impl Github {
     }
 
     async fn execute(&self, args: &[&str], payload: Option<&Value>) -> Result<Value> {
+        self.execute_with_missing_nodes(args, payload, false).await
+    }
+
+    async fn execute_with_missing_nodes(
+        &self,
+        args: &[&str],
+        payload: Option<&Value>,
+        allow_missing_nodes: bool,
+    ) -> Result<Value> {
         let start = Instant::now();
         let request = request_kind(args, payload);
         let mut command = Command::new(&self.executable);
@@ -76,6 +85,19 @@ impl Github {
                 elapsed_ms = start.elapsed().as_millis() as u64,
                 success = output.status.success()
             );
+            ensure!(
+                output.stdout.len() <= 32 * 1024 * 1024,
+                "GitHub response exceeded 32 MiB"
+            );
+            // gh exits nonzero for GraphQL node-resolution errors, even when
+            // unrelated nodes succeeded. Only the ignored-identity lookup may
+            // accept these narrowly validated partial responses.
+            if allow_missing_nodes
+                && let Ok(response) = serde_json::from_slice::<Value>(&output.stdout)
+                && only_missing_node_errors(&response)
+            {
+                return Ok(response);
+            }
             if !output.status.success() {
                 let failure = classify_failure(&String::from_utf8_lossy(&output.stderr));
                 tracing::warn!(
@@ -88,10 +110,6 @@ impl Github {
                 );
                 bail!("{}", failure.message);
             }
-            ensure!(
-                output.stdout.len() <= 32 * 1024 * 1024,
-                "GitHub response exceeded 32 MiB"
-            );
             serde_json::from_slice(&output.stdout).context("GitHub CLI returned invalid JSON")
         };
         match tokio::time::timeout(self.timeout, operation).await {
@@ -126,7 +144,19 @@ impl Github {
     pub async fn ignored_details(&self, ids: &[String]) -> Result<Vec<Snapshot>> {
         let mut snapshots = Vec::new();
         for batch in ids.chunks(50) {
-            let data = self.graphql("query IgnoredPrDetails($ids:[ID!]!){nodes(ids:$ids){... on PullRequest{id number title url state isDraft repository{nameWithOwner}}}}", json!({"ids":batch})).await?;
+            let response = self.execute_with_missing_nodes(
+                &["api", "graphql", "--hostname", "github.com", "--input", "-"],
+                Some(&json!({"query":"query IgnoredPrDetails($ids:[ID!]!){nodes(ids:$ids){... on PullRequest{id number title url state isDraft repository{nameWithOwner}}}}", "variables":{"ids":batch}})),
+                true,
+            ).await?;
+            ensure!(
+                response.get("errors").is_none() || only_missing_node_errors(&response),
+                "GitHub GraphQL returned errors during ignored PR lookup"
+            );
+            let data = &response["data"];
+            if let Some(errors) = response["errors"].as_array() {
+                tracing::warn!(event = "ignored_prs_unavailable", count = errors.len());
+            }
             for node in data["nodes"]
                 .as_array()
                 .context("Missing ignored PR identities")?
@@ -387,6 +417,30 @@ impl Github {
         tracing::debug!(event="snapshot_complete", repo=%reference.repo, pr=reference.number, elapsed_ms=start.elapsed().as_millis() as u64, threads=snapshot.threads.len());
         Ok(snapshot)
     }
+}
+
+/// Every error must identify an unavailable root node, never an incomplete
+/// field on a returned PR or a query-wide authentication/server failure.
+fn only_missing_node_errors(response: &Value) -> bool {
+    let Some(nodes) = response["data"]["nodes"].as_array() else {
+        return false;
+    };
+    let Some(errors) = response["errors"].as_array().filter(|e| !e.is_empty()) else {
+        return false;
+    };
+    errors.iter().all(|error| {
+        error["type"] == "NOT_FOUND"
+            && error["path"].as_array().is_some_and(|path| {
+                path.len() == 2
+                    && path[0] == "nodes"
+                    && path[1].as_u64().is_some_and(|index| {
+                        usize::try_from(index)
+                            .ok()
+                            .and_then(|index| nodes.get(index))
+                            .is_some_and(Value::is_null)
+                    })
+            })
+    })
 }
 
 fn legacy_checks(statuses: &[Value]) -> Vec<Check> {
