@@ -14,8 +14,15 @@ use std::{
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+const IGNORED_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
 #[derive(Clone, Debug)]
 pub enum UiEvent {
+    IgnoredUpdated {
+        prs: Vec<PullRequest>,
+        error: Option<String>,
+        loading: bool,
+    },
     Updated {
         prs: Vec<PullRequest>,
         error: Option<String>,
@@ -41,6 +48,10 @@ pub enum Command {
         checked: bool,
     },
     Ignore(String),
+    ShowIgnored,
+    CheckIgnored,
+    Restore(String),
+    IgnoredDetailsLoaded(std::result::Result<Vec<Snapshot>, String>),
     NotificationAction {
         id: String,
         open: bool,
@@ -82,7 +93,14 @@ pub fn start(directory: PathBuf, config: Config, sink: Sink) -> Result<Worker> {
                     .worker_threads(2)
                     .enable_all()
                     .build()?;
-                runtime.block_on(run(directory, config, receiver, task_sender, sink.clone()))
+                runtime.block_on(run(
+                    directory,
+                    config,
+                    receiver,
+                    task_sender,
+                    sink.clone(),
+                    IGNORED_CHECK_INTERVAL,
+                ))
             };
             if let Err(error) = run() {
                 tracing::error!(event="worker_failed", error=%error);
@@ -115,7 +133,23 @@ async fn fetch(
     let viewer = github.viewer().await?;
     let discovered = discover || old_viewer.as_deref() != Some(&viewer);
     let references = if discovered {
-        github.discover(&viewer).await?
+        let mut found: BTreeMap<_, _> = github
+            .discover(&viewer)
+            .await?
+            .into_iter()
+            .map(|r| (r.id.clone(), r))
+            .collect();
+        // A missing search hit is not evidence of closure. Keep monitoring known
+        // PRs until their direct snapshot confirms closure, scoped to this account.
+        if old_viewer.as_deref() == Some(&viewer) {
+            for reference in references {
+                if !found.contains_key(&reference.id) {
+                    tracing::info!(event = "discovery_omission_retained", repo = %reference.repo, pr = reference.number);
+                    found.insert(reference.id.clone(), reference);
+                }
+            }
+        }
+        found.into_values().collect()
     } else {
         references
     };
@@ -158,6 +192,7 @@ async fn run(
     mut receiver: UnboundedReceiver<Command>,
     sender: UnboundedSender<Command>,
     sink: Sink,
+    ignored_interval: Duration,
 ) -> Result<()> {
     let mut store = Store::open(&directory)?;
     let mut ignored = store.ignored()?;
@@ -176,10 +211,16 @@ async fn run(
         })
         .collect();
     let mut error: Option<String> = None;
-    let mut viewer: Option<String> = None;
+    let mut viewer = store.viewer()?;
     let mut discovered_at: Option<Instant> = None;
     let mut deadline = Instant::now();
     let mut polling = false;
+    let mut ignored_loading = false;
+    let mut ignored_checked = false;
+    let mut ignored_deadline = Instant::now();
+    let mut ignored_requested = false;
+    let mut rediscover_after_poll = false;
+    let mut invalidated_poll_ids = BTreeSet::new();
     let mut failures = 0_u32;
     let mut in_flight_notifications = BTreeSet::new();
     let mut dismiss_after_delivery = BTreeSet::new();
@@ -190,6 +231,7 @@ async fn run(
     loop {
         let command = tokio::select! {
             command = receiver.recv() => match command { Some(c)=>c,None=>break },
+            _ = tokio::time::sleep_until(ignored_deadline.into()), if !ignored_loading => Command::CheckIgnored,
             _ = tokio::time::sleep_until(deadline.into()), if !polling => {
                 polling = true;
                 let config = config.clone();
@@ -210,6 +252,86 @@ async fn run(
             Command::Refresh => {
                 deadline = Instant::now();
                 discovered_at = None;
+            }
+            Command::ShowIgnored => {
+                ignored_requested = true;
+                if !ignored_checked && !ignored_loading {
+                    let _ = sender.send(Command::CheckIgnored);
+                }
+                sink(UiEvent::IgnoredUpdated {
+                    prs: store.load_ignored()?,
+                    error: None,
+                    loading: ignored_loading,
+                });
+            }
+            Command::CheckIgnored => {
+                if ignored_loading {
+                    continue;
+                }
+                ignored_deadline = Instant::now() + ignored_interval;
+                if ignored.is_empty() {
+                    continue;
+                }
+                ignored_loading = true;
+                let ids: Vec<_> = ignored.iter().cloned().collect();
+                tracing::debug!(event = "ignored_check_started", count = ids.len());
+                let config = config.clone();
+                let sender = sender.clone();
+                tokio::spawn(async move {
+                    let result = async { Github::new(&config)?.ignored_details(&ids).await }
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = sender.send(Command::IgnoredDetailsLoaded(result));
+                });
+                sink(UiEvent::IgnoredUpdated {
+                    prs: store.load_ignored()?,
+                    error: None,
+                    loading: true,
+                });
+            }
+            Command::IgnoredDetailsLoaded(result) => {
+                ignored_loading = false;
+                ignored_deadline = Instant::now() + ignored_interval;
+                let lookup_error = match result {
+                    Ok(snapshots) => {
+                        ignored_checked = true;
+                        tracing::info!(
+                            event = "ignored_check_complete",
+                            checked = snapshots.len(),
+                            closed = snapshots.iter().filter(|p| !p.open).count()
+                        );
+                        for snapshot in snapshots {
+                            store.update_ignored_status(&snapshot)?;
+                        }
+                        None
+                    }
+                    Err(message) => {
+                        ignored_checked = false;
+                        tracing::warn!(event="ignored_details_failed",error=%message);
+                        Some(message)
+                    }
+                };
+                sink(UiEvent::IgnoredUpdated {
+                    prs: store.load_ignored()?,
+                    error: lookup_error,
+                    loading: false,
+                });
+            }
+            Command::Restore(id) => {
+                if store.restore(&id)? {
+                    ignored.remove(&id);
+                    if polling {
+                        invalidated_poll_ids.insert(id);
+                        rediscover_after_poll = true;
+                    }
+                    discovered_at = None;
+                    deadline = Instant::now();
+                }
+                sink(UiEvent::IgnoredUpdated {
+                    prs: store.load_ignored()?,
+                    error: None,
+                    loading: ignored_loading,
+                });
             }
             Command::Acknowledge {
                 pr,
@@ -232,6 +354,10 @@ async fn run(
             Command::Ignore(id) => {
                 let notifications = store.ignore(&id)?;
                 ignored.insert(id.clone());
+                ignored_checked = false;
+                if polling {
+                    invalidated_poll_ids.insert(id.clone());
+                }
                 prs.remove(&id);
                 references.retain(|r| r.id != id);
                 dismiss_after_delivery.extend(
@@ -241,6 +367,13 @@ async fn run(
                         .cloned(),
                 );
                 sink(UiEvent::DismissNotifications(notifications));
+                if ignored_requested {
+                    sink(UiEvent::IgnoredUpdated {
+                        prs: store.load_ignored()?,
+                        error: None,
+                        loading: ignored_loading,
+                    });
+                }
             }
             Command::NotificationAction { id, open } => {
                 if let Some((pr, update, url)) = store.notification_target(&id)? {
@@ -301,7 +434,7 @@ async fn run(
                         let now = chrono::Utc::now().timestamp();
                         for (id, result) in batch.results {
                             // The user may have ignored this PR while its request was running.
-                            if ignored.contains(&id) {
+                            if ignored.contains(&id) || invalidated_poll_ids.contains(&id) {
                                 continue;
                             }
                             match result {
@@ -391,6 +524,12 @@ async fn run(
                     .saturating_mul(2_u64.pow(failures.min(5)))
                     .min(900);
                 deadline = Instant::now() + Duration::from_secs(delay);
+                invalidated_poll_ids.clear();
+                if rediscover_after_poll {
+                    rediscover_after_poll = false;
+                    discovered_at = None;
+                    deadline = Instant::now();
+                }
             }
         }
         sink(UiEvent::Updated {
@@ -424,6 +563,12 @@ pub fn transition(
     let head_since = previous
         .filter(|p| p.snapshot.head == snapshot.head)
         .map_or(now, |p| p.head_since);
+    let reviewing_since = (state == State::Reviewing).then(|| {
+        previous
+            .filter(|p| p.state == State::Reviewing && p.snapshot.head == snapshot.head)
+            .and_then(|p| p.reviewing_since)
+            .unwrap_or(now)
+    });
     PullRequest {
         snapshot,
         agents,
@@ -436,12 +581,90 @@ pub fn transition(
         head_since,
         candidate_id,
         candidate_since,
+        reviewing_since,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovery_omissions_keep_polling_known_prs_only_for_the_same_account() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("gh");
+        let script = include_str!("../tests/fixtures/gh-snapshot.sh").replace("input=$(cat)", r#"
+input=$(cat)
+case "$input" in
+  *AuthoredPrs*) echo '{"data":{"viewer":{"pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":[]}}}}'; exit 0 ;;
+  *search*) echo '{"data":{"search":{"issueCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]}}}'; exit 0 ;;
+  *viewer*) echo '{"data":{"viewer":{"login":"test"}}}'; exit 0 ;;
+esac
+"#);
+        std::fs::write(&path, format!("#!/bin/sh\n{script}")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = Config {
+            gh_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let references = || {
+            vec![PrRef {
+                id: "PR_1".into(),
+                repo: "owner/repo".into(),
+                number: 1,
+            }]
+        };
+        let batch = fetch(
+            config.clone(),
+            references(),
+            true,
+            Some("test".into()),
+            BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(batch.references.len(), 1);
+        assert!(batch.results[0].1.as_ref().unwrap().open);
+
+        // A direct closed result still reaches the worker so it can remove the PR.
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n{}",
+                script.replace("\"state\":\"OPEN\"", "\"state\":\"CLOSED\"")
+            ),
+        )
+        .unwrap();
+        let batch = fetch(
+            config.clone(),
+            references(),
+            true,
+            Some("test".into()),
+            BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!batch.results[0].1.as_ref().unwrap().open);
+
+        for (viewer, ignored) in [
+            ("different-account", BTreeSet::new()),
+            ("test", BTreeSet::from(["PR_1".into()])),
+        ] {
+            let batch = fetch(
+                config.clone(),
+                references(),
+                true,
+                Some(viewer.into()),
+                ignored,
+            )
+            .await
+            .unwrap();
+            assert!(batch.references.is_empty());
+            assert!(batch.results.is_empty());
+        }
+    }
 
     #[test]
     fn ignored_pr_cannot_reappear_from_an_in_flight_poll() {
@@ -521,5 +744,190 @@ mod tests {
         let store = Store::open(directory.path()).unwrap();
         assert!(store.load().unwrap().is_empty());
         assert!(store.ignored().unwrap().contains(&snapshot.id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_during_poll_discards_old_result_and_requests_discovery() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let gh = directory.path().join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\ntouch \"$(dirname \"$0\")/started\"\nexec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = Config {
+            gh_path: Some(gh),
+            notifications: false,
+            ..Default::default()
+        };
+        let snapshot = Snapshot {
+            id: "PR_restore".into(),
+            repo: "owner/repo".into(),
+            number: 42,
+            open: true,
+            head: "current".into(),
+            ..Default::default()
+        };
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .save(&transition(snapshot.clone(), None, None, 100, 0))
+            .unwrap();
+        drop(store);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = start(
+            directory.path().into(),
+            config,
+            Arc::new(move |event| {
+                let _ = tx.send(event);
+            }),
+        )
+        .unwrap();
+        let started = Instant::now();
+        while !directory.path().join("started").exists() {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The real request is now in flight, so both commands invalidate that run.
+        worker
+            .sender
+            .send(Command::Ignore(snapshot.id.clone()))
+            .unwrap();
+        worker
+            .sender
+            .send(Command::Restore(snapshot.id.clone()))
+            .unwrap();
+        loop {
+            if let UiEvent::IgnoredUpdated { prs, .. } =
+                rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            {
+                assert!(prs.is_empty());
+                break;
+            }
+        }
+        // Consume the Restore command's active-state event before injecting a result.
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(),UiEvent::Updated{prs,..} if prs.is_empty())
+        );
+        std::fs::remove_file(directory.path().join("started")).unwrap();
+        let batch = || Batch {
+            viewer: "viewer".into(),
+            discovered: true,
+            references: vec![PrRef {
+                id: snapshot.id.clone(),
+                repo: snapshot.repo.clone(),
+                number: 42,
+            }],
+            results: vec![(snapshot.id.clone(), Ok(snapshot.clone()))],
+        };
+        worker
+            .sender
+            .send(Command::PollComplete(Ok(batch())))
+            .unwrap();
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(),UiEvent::Updated{prs,..} if prs.is_empty())
+        );
+        // Restore overrides the normal polling delay even if the old request completed later.
+        let started = Instant::now();
+        while !directory.path().join("started").exists() {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        worker
+            .sender
+            .send(Command::PollComplete(Ok(batch())))
+            .unwrap();
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(),UiEvent::Updated{prs,..} if prs.len()==1)
+        );
+        drop(worker);
+        let store = Store::open(directory.path()).unwrap();
+        assert!(!store.ignored().unwrap().contains(&snapshot.id));
+        assert!(store.load_ignored().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ignored_checks_repeat_without_opening_the_view_or_refreshing_active_prs() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let gh = directory.path().join("gh");
+        std::fs::write(&gh, r#"#!/bin/sh
+payload=$(cat)
+case "$payload" in
+ *IgnoredPrDetails*)
+   marker="$(dirname "$0")/checked"
+   if [ -f "$marker" ]; then state=OPEN; else state=CLOSED; touch "$marker"; fi
+   echo "{\"data\":{\"nodes\":[{\"id\":\"ignored\",\"number\":42,\"title\":\"Test\",\"url\":\"https://github.com/owner/repo/pull/42\",\"state\":\"$state\",\"isDraft\":false,\"repository\":{\"nameWithOwner\":\"owner/repo\"}}]}}"
+   ;;
+ *AuthoredPrs*) echo '{"data":{"viewer":{"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}';;
+ *viewer*) echo '{"data":{"viewer":{"login":"test"}}}';;
+ *) echo '{"data":{"search":{"issueCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}';;
+esac
+"#).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let pr = PullRequest::unreviewed(Snapshot {
+            id: "ignored".into(),
+            number: 42,
+            repo: "owner/repo".into(),
+            open: true,
+            ..Default::default()
+        });
+        store.save(&pr).unwrap();
+        store.ignore(&pr.snapshot.id).unwrap();
+        drop(store);
+        let config = Config {
+            gh_path: Some(gh),
+            poll_seconds: 3600,
+            notifications: false,
+            ..Default::default()
+        };
+        let (sender, receiver) = unbounded_channel();
+        let (ui_sender, mut ui_receiver) = unbounded_channel();
+        let task = tokio::spawn(run(
+            directory.path().into(),
+            config,
+            receiver,
+            sender.clone(),
+            Arc::new(move |event| {
+                let _ = ui_sender.send(event);
+            }),
+            Duration::from_millis(100),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut closed_seen = false;
+            loop {
+                if let UiEvent::IgnoredUpdated {
+                    prs,
+                    error,
+                    loading: false,
+                } = ui_receiver.recv().await.unwrap()
+                {
+                    assert!(error.is_none());
+                    if !closed_seen {
+                        assert!(prs.is_empty());
+                        closed_seen = true;
+                    } else {
+                        assert_eq!(prs.len(), 1);
+                        assert_eq!(prs[0].snapshot.id, "ignored");
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        sender.send(Command::Shutdown).unwrap();
+        task.await.unwrap().unwrap();
+        assert!(
+            Store::open(directory.path())
+                .unwrap()
+                .ignored()
+                .unwrap()
+                .contains("ignored")
+        );
     }
 }

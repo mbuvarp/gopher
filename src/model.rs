@@ -149,12 +149,49 @@ pub struct PullRequest {
     pub head_since: i64,
     pub candidate_id: String,
     pub candidate_since: i64,
+    /// Local observation time for the current continuous Reviewing state.
+    #[serde(default)]
+    pub reviewing_since: Option<i64>,
 }
 impl PullRequest {
+    /// Identity-only data must never be treated as current review evidence.
+    pub fn unreviewed(snapshot: Snapshot) -> Self {
+        Self {
+            snapshot,
+            agents: vec![],
+            state: State::Unknown,
+            update_id: String::new(),
+            acknowledged: None,
+            fetched_at: 0,
+            stale: true,
+            error: None,
+            head_since: 0,
+            candidate_id: String::new(),
+            candidate_since: 0,
+            reviewing_since: None,
+        }
+    }
     pub fn needs_attention(&self) -> bool {
         !self.stale
             && self.state.actionable()
             && self.acknowledged.as_deref() != Some(&self.update_id)
+    }
+
+    pub fn status_label(&self, now: i64) -> String {
+        if self.stale {
+            return State::Unknown.label().into();
+        }
+        if self.state == State::Reviewing
+            && let Some(started) = self.reviewing_since
+        {
+            let minutes = now.saturating_sub(started).max(0) / 60;
+            return if minutes < 60 {
+                format!("Reviewing ({minutes}m)")
+            } else {
+                format!("Reviewing ({}h {}m)", minutes / 60, minutes % 60)
+            };
+        }
+        self.state.label().into()
     }
 }
 

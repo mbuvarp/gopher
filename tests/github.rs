@@ -55,14 +55,41 @@ async fn requests_timeout() {
 async fn discovery_unions_roles_and_deduplicates() {
     let (_dir, gh) = mock(
         r#"
-cat >/dev/null
-echo '{"data":{"search":{"issueCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PR_1","number":1,"repository":{"nameWithOwner":"owner/repo"}}]}}}'
+input=$(cat)
+case "$input" in
+  *AuthoredPrs*) echo '{"data":{"viewer":{"pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":[{"id":"PR_1","number":1,"repository":{"nameWithOwner":"owner/repo"}}]}}}}' ;;
+  *assignee:*) echo '{"data":{"search":{"issueCount":2,"pageInfo":{"hasNextPage":false},"nodes":[{"id":"PR_1","number":1,"repository":{"nameWithOwner":"owner/repo"}},{"id":"PR_2","number":2,"repository":{"nameWithOwner":"owner/repo"}}]}}}' ;;
+  *review-requested:*) echo '{"data":{"search":{"issueCount":1,"pageInfo":{"hasNextPage":false},"nodes":[{"id":"PR_3","number":3,"repository":{"nameWithOwner":"owner/repo"}}]}}}' ;;
+  *) exit 1 ;;
+esac
 "#,
     );
     let refs = gh.discover("someone").await.unwrap();
-    assert_eq!(refs.len(), 1);
+    assert_eq!(
+        refs.iter().map(|r| r.number).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
     assert_eq!(refs[0].repo, "owner/repo");
 }
+#[tokio::test]
+async fn authored_discovery_paginates_even_when_search_returns_nothing() {
+    let (_dir, gh) = mock(
+        r#"
+input=$(cat)
+case "$input" in
+  *'"cursor":"next"'*) echo '{"data":{"viewer":{"pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":[{"id":"PR_2","number":2,"repository":{"nameWithOwner":"owner/repo"}}]}}}}' ;;
+  *AuthoredPrs*) echo '{"data":{"viewer":{"pullRequests":{"pageInfo":{"hasNextPage":true,"endCursor":"next"},"nodes":[{"id":"PR_1","number":1,"repository":{"nameWithOwner":"owner/repo"}}]}}}}' ;;
+  *) echo '{"data":{"search":{"issueCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]}}}' ;;
+esac
+"#,
+    );
+    let refs = gh.discover("someone").await.unwrap();
+    assert_eq!(
+        refs.iter().map(|r| r.number).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
 #[tokio::test]
 async fn snapshot_paginates_reviews_independently_and_checks_head() {
     let (_dir, gh) = mock(include_str!("fixtures/gh-snapshot.sh"));
@@ -97,4 +124,23 @@ async fn rejects_head_changes_during_pagination() {
             .to_string()
             .contains("changed during pagination")
     );
+}
+
+#[tokio::test]
+async fn ignored_identity_lookup_handles_unavailable_and_closed_prs() {
+    let (_dir, gh) = mock(
+        r#"
+cat >/dev/null
+echo '{"data":{"nodes":[null,{"id":"PR_2","number":42,"title":"Archived change","url":"https://github.com/owner/repo/pull/42","state":"CLOSED","isDraft":false,"repository":{"nameWithOwner":"owner/repo"}}]}}'
+"#,
+    );
+    let found = gh
+        .ignored_details(&["unavailable".into(), "PR_2".into()])
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].number, 42);
+    assert!(!found[0].open);
+    assert!(found[0].reviews.is_empty());
+    assert!(gh.ignored_details(&["different-id".into()]).await.is_err());
 }

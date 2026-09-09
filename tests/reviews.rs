@@ -1,6 +1,67 @@
 use gopher::{model::*, reviewers, store::Store, worker::transition};
 
 const HEAD: &str = "abcdef0123456789012345678901234567890123";
+
+#[test]
+fn reviewing_elapsed_time_floors_minutes_and_does_not_change_update_identity() {
+    let mut s = snapshot();
+    s.reactions.push(eyes());
+    let first = transition(s.clone(), None, None, 1000, 0);
+    assert_eq!(first.reviewing_since, Some(1000));
+    for (seconds, label) in [
+        (-10, "Reviewing (0m)"),
+        (0, "Reviewing (0m)"),
+        (59, "Reviewing (0m)"),
+        (165, "Reviewing (2m)"),
+        (3599, "Reviewing (59m)"),
+        (3600, "Reviewing (1h 0m)"),
+        (3765, "Reviewing (1h 2m)"),
+    ] {
+        assert_eq!(first.status_label(1000 + seconds), label);
+    }
+    let later = transition(s, Some(&first), None, 1200, 0);
+    assert_eq!(later.reviewing_since, first.reviewing_since);
+    assert_eq!(later.update_id, first.update_id);
+}
+
+#[test]
+fn reviewing_clock_survives_restart_and_resets_for_new_review_or_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let mut s = snapshot();
+    s.reactions.push(eyes());
+    let first = transition(s.clone(), None, None, 1000, 0);
+    store.save(&first).unwrap();
+    let restored = store.load().unwrap().remove(0);
+    assert!(restored.stale);
+    assert_eq!(restored.status_label(1200), "Unknown");
+    let resumed = transition(s.clone(), Some(&restored), None, 1200, 0);
+    assert_eq!(resumed.reviewing_since, Some(1000));
+
+    s.head = "new-commit".into();
+    let next_commit = transition(s.clone(), Some(&resumed), None, 1300, 0);
+    assert_eq!(next_commit.reviewing_since, Some(1300));
+    s.reactions.clear();
+    let finished = transition(s.clone(), Some(&next_commit), None, 1400, 0);
+    assert_ne!(finished.state, State::Reviewing);
+    assert_eq!(finished.reviewing_since, None);
+    s.reactions.push(eyes());
+    let rerun = transition(s, Some(&finished), None, 1500, 0);
+    assert_eq!(rerun.reviewing_since, Some(1500));
+}
+
+#[test]
+fn legacy_cache_starts_review_clock_on_next_observation() {
+    let mut s = snapshot();
+    s.reactions.push(eyes());
+    let mut data = serde_json::to_value(transition(s.clone(), None, None, 1000, 0)).unwrap();
+    data.as_object_mut().unwrap().remove("reviewing_since");
+    let legacy: PullRequest = serde_json::from_value(data).unwrap();
+    assert_eq!(legacy.reviewing_since, None);
+    let refreshed = transition(s, Some(&legacy), None, 2000, 0);
+    assert_eq!(refreshed.reviewing_since, Some(2000));
+}
+
 fn snapshot() -> Snapshot {
     Snapshot {
         id: "PR_test".into(),
@@ -504,6 +565,50 @@ fn ignored_prs_survive_restart_pruning_and_account_changes() {
     let mut store = Store::open(dir.path()).unwrap();
     assert!(store.ignored().unwrap().contains(&pr.snapshot.id));
     assert!(store.ignore(&pr.snapshot.id).unwrap().is_empty());
+    let archived = store.load_ignored().unwrap();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].snapshot.repo, pr.snapshot.repo);
+    assert_eq!(archived[0].snapshot.number, pr.snapshot.number);
+    assert!(archived[0].stale);
+    assert!(!archived[0].needs_attention());
+    assert!(store.restore(&pr.snapshot.id).unwrap());
+    // An identity lookup finishing after Restore cannot recreate the entry.
+    store.save_ignored_details(&pr).unwrap();
+    assert!(store.load_ignored().unwrap().is_empty());
+    assert!(store.load().unwrap().is_empty());
+    assert!(!store.restore(&pr.snapshot.id).unwrap());
+    drop(store);
+    assert!(
+        Store::open(dir.path())
+            .unwrap()
+            .ignored()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn legacy_ignored_ids_can_be_listed_and_restored_without_network() {
+    let dir = tempfile::tempdir().unwrap();
+    let connection = rusqlite::Connection::open(dir.path().join("state.sqlite3")).unwrap();
+    connection.execute_batch("CREATE TABLE ignored_prs(id TEXT PRIMARY KEY); INSERT INTO ignored_prs VALUES('legacy-id'); PRAGMA user_version=2;").unwrap();
+    drop(connection);
+    let mut store = Store::open(dir.path()).unwrap();
+    let entries = store.load_ignored().unwrap();
+    assert_eq!(entries[0].snapshot.id, "legacy-id");
+    assert_eq!(entries[0].snapshot.number, 0);
+    assert!(!entries[0].needs_attention());
+    let known = PullRequest::unreviewed(Snapshot {
+        id: "legacy-id".into(),
+        repo: "owner/repo".into(),
+        number: 42,
+        open: true,
+        ..Default::default()
+    });
+    store.save_ignored_details(&known).unwrap();
+    assert_eq!(store.load_ignored().unwrap()[0].snapshot.number, 42);
+    assert!(store.restore("legacy-id").unwrap());
+    assert!(store.load_ignored().unwrap().is_empty());
 }
 
 #[test]
@@ -556,4 +661,36 @@ fn notification_dismissal_targets_only_the_acknowledged_update() {
             .unwrap(),
         vec![second]
     );
+}
+
+#[test]
+fn ignored_lifecycle_hides_closed_and_recovers_reopened_without_losing_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let mut pr = transition(snapshot(), None, None, 100, 0);
+    pr.snapshot.title = "Original title".into();
+    store.save(&pr).unwrap();
+    store.ignore(&pr.snapshot.id).unwrap();
+    let mut identity = pr.snapshot.clone();
+    identity.open = false;
+    identity.title = "Renamed title".into();
+    identity.threads.clear();
+    store.update_ignored_status(&identity).unwrap();
+    assert!(store.load_ignored().unwrap().is_empty());
+    assert!(store.ignored().unwrap().contains(&identity.id));
+    drop(store);
+    let mut store = Store::open(dir.path()).unwrap();
+    assert!(store.load_ignored().unwrap().is_empty());
+    identity.open = true;
+    store.update_ignored_status(&identity).unwrap();
+    let reopened = store.load_ignored().unwrap();
+    assert_eq!(reopened.len(), 1);
+    assert_eq!(reopened[0].snapshot.title, "Renamed title");
+    assert_eq!(reopened[0].update_id, pr.update_id);
+    assert_eq!(reopened[0].agents, pr.agents);
+    assert!(!reopened[0].needs_attention());
+    store.restore(&identity.id).unwrap();
+    store.update_ignored_status(&identity).unwrap();
+    assert!(store.load_ignored().unwrap().is_empty());
+    assert!(store.ignored().unwrap().is_empty());
 }

@@ -13,11 +13,13 @@ impl Store {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         anyhow::ensure!(version <= 2, "Database belongs to a newer Gopher version");
+        // The optional details table is additive; keep compatibility with the main-branch app.
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS prs (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, pr_id TEXT NOT NULL, update_id TEXT NOT NULL, url TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS ignored_prs (id TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS ignored_pr_details (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             PRAGMA user_version=2; COMMIT;")?;
         Ok(Self { connection })
     }
@@ -33,11 +35,86 @@ impl Store {
         let notifications = self.notification_ids(id, None)?;
         let tx = self.connection.transaction()?;
         tx.execute("INSERT OR IGNORE INTO ignored_prs (id) VALUES (?1)", [id])?;
+        tx.execute("INSERT OR REPLACE INTO ignored_pr_details (id,data) SELECT id,data FROM prs WHERE id=?1", [id])?;
         tx.execute("DELETE FROM prs WHERE id=?1", [id])?;
         tx.execute("DELETE FROM notifications WHERE pr_id=?1", [id])?;
         tx.commit()?;
         tracing::info!(event = "pr_ignored", pr_id = id);
         Ok(notifications)
+    }
+
+    pub fn load_ignored(&self) -> Result<Vec<PullRequest>> {
+        let mut query = self.connection.prepare("SELECT i.id,d.data FROM ignored_prs i LEFT JOIN ignored_pr_details d ON d.id=i.id ORDER BY i.id")?;
+        let entries: Vec<PullRequest> = query
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .map(|row| {
+                let (id, data) = row?;
+                let mut pr = match data {
+                    Some(data) => {
+                        serde_json::from_str(&data).context("Invalid ignored PR details")?
+                    }
+                    None => PullRequest::unreviewed(Snapshot {
+                        id,
+                        repo: "Unavailable".into(),
+                        title: "Pull request details unavailable".into(),
+                        ..Default::default()
+                    }),
+                };
+                pr.stale = true;
+                Ok(pr)
+            })
+            .collect::<Result<_>>()?;
+        // Unknown/inaccessible identities remain visible; only confirmed closures hide.
+        Ok(entries
+            .into_iter()
+            .filter(|pr| pr.snapshot.number == 0 || pr.snapshot.open)
+            .collect())
+    }
+
+    pub fn update_ignored_status(&self, snapshot: &Snapshot) -> Result<()> {
+        let data: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT data FROM ignored_pr_details WHERE id=?1",
+                [&snapshot.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut pr = match data {
+            Some(data) => {
+                serde_json::from_str::<PullRequest>(&data).context("Invalid ignored PR details")?
+            }
+            None => PullRequest::unreviewed(snapshot.clone()),
+        };
+        // Refresh identity and lifecycle without overwriting cached review evidence.
+        pr.snapshot.repo.clone_from(&snapshot.repo);
+        pr.snapshot.number = snapshot.number;
+        pr.snapshot.title.clone_from(&snapshot.title);
+        pr.snapshot.url.clone_from(&snapshot.url);
+        pr.snapshot.open = snapshot.open;
+        pr.snapshot.draft = snapshot.draft;
+        pr.stale = true;
+        self.connection.execute("INSERT OR REPLACE INTO ignored_pr_details (id,data) SELECT id,?2 FROM ignored_prs WHERE id=?1", params![snapshot.id, serde_json::to_string(&pr)?])?;
+        Ok(())
+    }
+
+    pub fn save_ignored_details(&self, pr: &PullRequest) -> Result<()> {
+        // A lookup that finishes after Restore must not recreate an ignored entry.
+        self.connection.execute("INSERT OR IGNORE INTO ignored_pr_details (id,data) SELECT id,?2 FROM ignored_prs WHERE id=?1", params![pr.snapshot.id, serde_json::to_string(pr)?])?;
+        Ok(())
+    }
+
+    pub fn restore(&mut self, id: &str) -> Result<bool> {
+        let tx = self.connection.transaction()?;
+        let removed = tx.execute("DELETE FROM ignored_prs WHERE id=?1", [id])? > 0;
+        tx.execute("DELETE FROM ignored_pr_details WHERE id=?1", [id])?;
+        tx.commit()?;
+        if removed {
+            tracing::info!(event = "pr_restored", pr_id = id);
+        }
+        Ok(removed)
     }
 
     pub fn notification_ids(&self, pr: &str, update: Option<&str>) -> Result<Vec<String>> {
@@ -49,13 +126,17 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn set_viewer(&mut self, viewer: &str) -> Result<bool> {
-        let previous: Option<String> = self
+    pub fn viewer(&self) -> Result<Option<String>> {
+        Ok(self
             .connection
             .query_row("SELECT value FROM metadata WHERE key='viewer'", [], |r| {
                 r.get(0)
             })
-            .optional()?;
+            .optional()?)
+    }
+
+    pub fn set_viewer(&mut self, viewer: &str) -> Result<bool> {
+        let previous = self.viewer()?;
         let tx = self.connection.transaction()?;
         let changed = previous.as_deref().is_some_and(|old| old != viewer);
         if changed {

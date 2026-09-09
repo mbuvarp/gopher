@@ -122,6 +122,39 @@ impl Github {
         output.get("data").cloned().context("Missing GraphQL data")
     }
 
+    /// Lightweight identity/lifecycle lookup for ignored entries; no review polling.
+    pub async fn ignored_details(&self, ids: &[String]) -> Result<Vec<Snapshot>> {
+        let mut snapshots = Vec::new();
+        for batch in ids.chunks(50) {
+            let data = self.graphql("query IgnoredPrDetails($ids:[ID!]!){nodes(ids:$ids){... on PullRequest{id number title url state isDraft repository{nameWithOwner}}}}", json!({"ids":batch})).await?;
+            for node in data["nodes"]
+                .as_array()
+                .context("Missing ignored PR identities")?
+            {
+                if node.is_null() {
+                    continue;
+                }
+                let id = required(node, "id")?.to_owned();
+                ensure!(batch.contains(&id), "Unexpected ignored PR identity");
+                snapshots.push(Snapshot {
+                    id,
+                    repo: required(&node["repository"], "nameWithOwner")?.into(),
+                    number: node["number"].as_u64().context("Missing PR number")?,
+                    title: required(node, "title")?.into(),
+                    url: required(node, "url")?.into(),
+                    open: match required(node, "state")? {
+                        "OPEN" => true,
+                        "CLOSED" | "MERGED" => false,
+                        _ => anyhow::bail!("Unknown ignored PR lifecycle state"),
+                    },
+                    draft: node["isDraft"].as_bool().unwrap_or(false),
+                    ..Default::default()
+                });
+            }
+        }
+        Ok(snapshots)
+    }
+
     pub async fn viewer(&self) -> Result<String> {
         let result = self
             .graphql("query { viewer { login } }", json!({}))
@@ -131,7 +164,30 @@ impl Github {
 
     pub async fn discover(&self, login: &str) -> Result<Vec<PrRef>> {
         let mut found = BTreeMap::new();
-        for role in ["author", "assignee", "review-requested"] {
+        // Search can silently omit open PRs. The user's authored-PR connection
+        // reads the underlying records directly and is not subject to search indexing.
+        let mut cursor = Value::Null;
+        loop {
+            let data = self.graphql("query AuthoredPrs($cursor:String) { viewer { pullRequests(states:OPEN,first:100,after:$cursor) { pageInfo { hasNextPage endCursor } nodes { id number repository { nameWithOwner } } } } }", json!({"cursor":cursor})).await?;
+            let connection = &data["viewer"]["pullRequests"];
+            for node in nodes(connection)? {
+                let id = required(node, "id")?.to_owned();
+                found.insert(
+                    id.clone(),
+                    PrRef {
+                        id,
+                        repo: required(&node["repository"], "nameWithOwner")?.to_owned(),
+                        number: node["number"].as_u64().context("Missing PR number")?,
+                    },
+                );
+            }
+            let Some(next) = next_cursor(connection)? else {
+                break;
+            };
+            cursor = Value::String(next);
+        }
+        tracing::debug!(event = "authored_discovery_complete", count = found.len());
+        for role in ["assignee", "review-requested"] {
             let mut cursor = Value::Null;
             loop {
                 let data = self.graphql("query($q:String!,$cursor:String) { search(query:$q,type:ISSUE,first:100,after:$cursor) { issueCount pageInfo { hasNextPage endCursor } nodes { ... on PullRequest { id number repository { nameWithOwner } } } } }", json!({"q":format!("is:pr is:open {role}:{login}"),"cursor":cursor})).await?;
@@ -462,7 +518,7 @@ fn classify_failure(stderr: &str) -> RequestFailure {
 
 fn request_kind(args: &[&str], payload: Option<&Value>) -> &'static str {
     if let Some(query) = payload.and_then(|p| p["query"].as_str()) {
-        if query.contains("search(") {
+        if query.contains("search(") || query.contains("query AuthoredPrs") {
             "discover_prs"
         } else if query.contains("viewer {") {
             "viewer"

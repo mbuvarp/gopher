@@ -2,14 +2,19 @@
 
 Gopher is a personal macOS menu bar app that monitors GitHub PRs, replacing repeated browser checks while agent reviewers work.
 
+## Popover experiment
+
+On `feature/custom-popover`, left-click opens a native AppKit popover; right-click retains the standard menu for comparison. The popover groups Open PR, Details, and Ignore buttons on the left of each row, with expandable review details. Unacknowledged actionable updates use bold PR titles instead of dots; there is no acknowledgement checkbox. Clicking a PR title acknowledges its displayed update without dismissing the popover. Keep controls and scroll position stable across polls, and update acknowledgement indicators from the worker's persisted state. Actions capture their displayed update ID before dispatch. Actions starts with Show ignored; Refresh is only in the header. The ignored view replaces the active list, shows Restore instead of Ignore, and replaces Refresh/Actions with Back. Preserve each view’s scroll position. Archive ignored PR details separately from the active cache. Check ignored PR identities and open/closed state at startup and every 15 minutes, without fetching reviews. Hide confirmed closed or merged PRs, retaining ignore flags so reopened PRs remain ignored and reappear in this view. Failed or unavailable lookups must not be interpreted as closure. Restore removes the persistent ignore flag and triggers fresh discovery, discarding older in-flight review results.
+
 ## Product behavior
 
 - List open PRs authored by, assigned to, or requesting review from the authenticated user, grouped by repository. Headings use `repo • organization`; sort by organization, repository, then ascending PR number.
 - Keep an open menu stable during background updates; apply the latest state after it closes and preserve the update IDs of actions the user actually saw.
 - Show PR review states with native template image icons (SF Symbols), not Unicode prefixes; retain text status labels inside each submenu.
 - Give each PR a submenu with **Open PR**, an **Acknowledge update** checkbox, and **Ignore PR**. Opening a PR successfully acknowledges the displayed update. Clicking the PR row itself also acknowledges that displayed update; hovering still opens its submenu.
-- Ignore permanently hides a specific PR from polling, menus, and notifications. Persist its GitHub node ID independently of cache pruning or account changes; discard any in-flight result for it.
+- Ignore hides a specific PR from review polling, the active list, and notifications until explicitly restored. Persist its GitHub node ID independently of cache pruning or account changes; discard any in-flight result for it.
 - Acknowledgement silences that update's contribution to the main menu bar icon. Reset it when a meaningful new update arrives.
+- Show elapsed local observation time beside Reviewing, flooring to whole minutes (`Reviewing (7m)`, `Reviewing (1h 2m)`). Persist the start across polls/restarts; reset on a new commit or when entering Reviewing again. Elapsed time must not change update IDs or notifications.
 - Use the neutral monochrome cartoon gopher (`assets/gopher.png`) for both idle and review-in-progress menu bar states; background polling alone does not change the icon. Reserve the question mark for errors or unacknowledged unknown/stale PRs.
 - Reflect unacknowledged comments or approvals in the main icon. Notify when a review run finishes with findings or approval; defer findings notifications until all participating reviewers finish.
 - Clicking a review notification or its **Acknowledge** action acknowledges that specific update without opening the browser. The **Open PR** notification action opens the PR and acknowledges only after the browser opens successfully. An older notification must not acknowledge newer updates.
@@ -36,6 +41,7 @@ Keep reviewer detection in separate modules. Treat these observed conventions as
 - Rust; native menus via `tray-icon`/`muda`, background work via `tokio`, parsing via `serde`.
 - Use authenticated `gh api graphql` and REST calls. Require an installed, authenticated GitHub CLI; support common install locations and a configured executable path.
 - Poll tracked PRs about every 30 seconds; discovery may be less frequent. Batch requests, paginate fully, apply timeouts/backoff, and inspect edited summaries and reactions directly.
+- Discover authored PRs through the direct `viewer.pullRequests` connection; use search for assignments and review requests. Search omissions must not evict tracked PRs or reset their acknowledgements. For the same authenticated account, keep polling known PRs until direct evidence confirms closure or the user ignores them.
 - Run one background `.app` in the user session, with launch at login through `SMAppService`. Use native UserNotifications through `objc2` for notification clicks. Keep polling and disk work off the UI thread.
 - Show missing-CLI/authentication errors in both the menu and notifications, deduplicating repeated failures. Distinguish network failures. Request notification permission on first launch.
 
