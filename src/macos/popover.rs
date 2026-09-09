@@ -384,14 +384,20 @@ impl ReviewPopover {
         };
         menu.addItem(&heading);
         let mut login = None;
-        for (title, action) in [
-            ("Show ignored", Action::ShowIgnored),
-            ("Edit configuration… (restart to apply)", Action::Config),
-            ("Open logs…", Action::Logs),
-            ("Notification settings…", Action::NotificationSettings),
-            ("Launch at login", Action::Login),
-            ("Quit Gopher", Action::Quit),
+        for entry in [
+            Some(("Show ignored", Action::ShowIgnored)),
+            None,
+            Some(("Edit configuration (restart to apply)", Action::Config)),
+            Some(("Notification settings", Action::NotificationSettings)),
+            Some(("Open logs", Action::Logs)),
+            None,
+            Some(("Launch at login", Action::Login)),
+            Some(("Quit Gopher", Action::Quit)),
         ] {
+            let Some((title, action)) = entry else {
+                menu.addItem(&NSMenuItem::separatorItem(mtm));
+                continue;
+            };
             let item = unsafe {
                 NSMenuItem::initWithTitle_action_keyEquivalent(
                     NSMenuItem::alloc(mtm),
