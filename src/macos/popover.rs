@@ -8,7 +8,10 @@ use crate::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 mod action_views;
+mod attention;
 mod label_pills;
+mod settings;
+use crate::hotkeys::{HotkeyAction, Navigation};
 use action_views::{DetailPanel, PrActions};
 use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
@@ -29,6 +32,7 @@ use tray_icon::TrayIcon;
 const WIDTH: f64 = 580.0;
 const HEIGHT: f64 = 620.0;
 const CONTENT_WIDTH: f64 = WIDTH - 32.0;
+const HIGHLIGHT_PADDING: f64 = 8.0;
 
 define_class!(
     #[unsafe(super = NSView)]
@@ -89,7 +93,10 @@ define_class!(
                         let pending = &self.ivars().pending_label_requests;
                         pending.set(pending.get().saturating_sub(1));
                     }
-                } else { let _ = self.ivars().proxy.send_event(event); }
+                } else {
+                    if let AppEvent::PopoverAction(Action::Ack { pr, .. }) = &event { let _ = self.ivars().proxy.send_event(AppEvent::HighlightPr(pr.clone())); }
+                    let _ = self.ivars().proxy.send_event(event);
+                }
             }
         }
     }
@@ -227,6 +234,8 @@ fn details(pr: &PullRequest) -> String {
 }
 
 struct Row {
+    normal_blue: std::cell::Cell<bool>,
+    background: Retained<NSBox>,
     view: Retained<FlippedView>,
     icon: Retained<NSImageView>,
     title: Retained<NSButton>,
@@ -244,6 +253,14 @@ impl Row {
         let id = &pr.snapshot.id;
         let placeholder = AppEvent::ToggleDetails(id.clone());
         let view = FlippedView::new(rect(16.0, 0.0, CONTENT_WIDTH, 100.0), mtm);
+        let background = NSBox::new(mtm);
+        background.setBoxType(NSBoxType::Custom);
+        background.setTitlePosition(NSTitlePosition::NoTitle);
+        background.setBorderWidth(0.0);
+        background.setCornerRadius(8.0);
+        background.setTransparent(false);
+        background.setHidden(true);
+        view.addSubview(&background);
         let icon = NSImageView::initWithFrame(NSImageView::alloc(mtm), rect(0.0, 4.0, 36.0, 48.0));
         icon.setImageScaling(NSImageScaling::ScaleProportionallyDown);
         let title = target.button("", placeholder.clone(), mtm);
@@ -282,6 +299,8 @@ impl Row {
             view.addSubview(child);
         }
         Self {
+            normal_blue: std::cell::Cell::new(false),
+            background,
             view,
             icon,
             title,
@@ -294,6 +313,11 @@ impl Row {
             actions,
             action_message,
         }
+    }
+    fn set_blue(&self, blue: bool) {
+        let tint = blue.then(NSColor::systemBlueColor);
+        self.title.setContentTintColor(tint.as_deref());
+        self.icon.setContentTintColor(tint.as_deref());
     }
     fn update(
         &self,
@@ -310,9 +334,8 @@ impl Row {
         };
         self.title.setTitle(&NSString::from_str(&display_title(pr)));
         let needs_attention = !ignored && pr.needs_attention();
-        let tint = needs_attention.then(NSColor::systemBlueColor);
-        self.title.setContentTintColor(tint.as_deref());
-        self.icon.setContentTintColor(tint.as_deref());
+        self.normal_blue.set(needs_attention);
+        self.set_blue(needs_attention);
         let font = if needs_attention {
             NSFont::boldSystemFontOfSize(13.0)
         } else {
@@ -482,6 +505,9 @@ pub(super) struct ReviewPopover {
     scroll_positions: [NSPoint; 2],
     restore_scroll: bool,
     pending_scroll: Option<String>,
+    flash: Option<attention::Flash>,
+    navigation: [Navigation; 2],
+    pub(super) keyboard_state: super::keyboard::State,
     banner: Retained<NSTextField>,
     empty: Retained<NSTextField>,
     login: Retained<NSMenuItem>,
@@ -535,7 +561,7 @@ impl ReviewPopover {
         for entry in [
             Some(("Show ignored", Action::ShowIgnored)),
             None,
-            Some(("Edit configuration (restart to apply)", Action::Config)),
+            Some(("Settings", Action::Config)),
             Some(("Notification settings", Action::NotificationSettings)),
             Some(("Open logs", Action::Logs)),
             None,
@@ -605,6 +631,9 @@ impl ReviewPopover {
             scroll_positions: [NSPoint::new(0.0, 0.0); 2],
             restore_scroll: false,
             pending_scroll: None,
+            flash: None,
+            navigation: Default::default(),
+            keyboard_state: Default::default(),
             banner,
             empty,
             login: login.unwrap(),
@@ -616,7 +645,7 @@ impl ReviewPopover {
             action_state: ActionState::default(),
         }
     }
-    pub(super) fn toggle(&self, tray: &TrayIcon) {
+    pub(super) fn toggle(&mut self, tray: &TrayIcon) {
         if self.popover.isShown() {
             self.popover.close();
             return;
@@ -624,7 +653,15 @@ impl ReviewPopover {
         self.show(tray);
     }
     /// Notification navigation must never toggle an already open popover closed.
-    pub(super) fn show(&self, tray: &TrayIcon) {
+    pub(super) fn show(&mut self, tray: &TrayIcon) {
+        if !self.popover.isShown() {
+            for navigation in &mut self.navigation {
+                navigation.selected = None;
+            }
+            for row in self.rows.values() {
+                row.background.setHidden(true);
+            }
+        }
         // Support the macOS 13 deployment target as well as newer macOS releases.
         #[allow(deprecated)]
         NSApplication::sharedApplication(MainThreadMarker::new().unwrap())
@@ -650,6 +687,8 @@ impl ReviewPopover {
         // remain visible until the user leaves that picker or retries successfully.
         if self.rows.values().any(|row| row.actions.is_tracking())
             || self.labels_saving()
+            || self.keyboard_state.pending
+            || self.keyboard_state.recording.is_some()
             || self
                 .detail
                 .as_ref()
@@ -664,7 +703,112 @@ impl ReviewPopover {
         true
     }
     pub(super) fn scroll_to_pr(&mut self, pr: Option<String>) {
+        self.stop_flash();
+        self.flash = pr.clone().map(attention::Flash::new);
+        self.navigation[usize::from(self.showing_ignored)].selected = pr.clone();
         self.pending_scroll = pr;
+    }
+    fn stop_flash(&mut self) {
+        if let Some(flash) = self.flash.take()
+            && let Some(row) = self.rows.get(&flash.pr)
+        {
+            row.set_blue(row.normal_blue.get());
+        }
+    }
+    pub(super) fn animate(&mut self) -> Option<std::time::Instant> {
+        let flash = self.flash.as_ref()?;
+        if self.popover.isShown()
+            && self.detail.is_none()
+            && !self.showing_ignored
+            && self.navigation[0].selected.as_ref() == Some(&flash.pr)
+            && let Some(row) = self.rows.get(&flash.pr)
+            && let Some((blue, next)) = flash.phase(std::time::Instant::now())
+        {
+            row.set_blue(blue);
+            return Some(next);
+        }
+        self.stop_flash();
+        None
+    }
+    pub(super) fn highlight(&mut self, id: String) {
+        if self.rows.contains_key(&id) {
+            self.navigation[usize::from(self.showing_ignored)].selected = Some(id);
+        }
+    }
+    pub(super) fn keyboard_context(&self) -> (Option<Retained<NSWindow>>, bool, bool) {
+        (
+            self.scroll.window(),
+            self.popover.isShown()
+                && self.detail.is_none()
+                && !self.rows.values().any(|r| r.actions.is_tracking()),
+            matches!(self.detail, Some(DetailPanel::Settings(_))),
+        )
+    }
+    pub(super) fn settings(&mut self) {
+        if self.labels_saving()
+            || self.keyboard_state.pending
+            || matches!(self.detail, Some(DetailPanel::Settings(_)))
+        {
+            return;
+        }
+        self.show_detail(DetailPanel::settings(&self.target));
+    }
+    pub(super) fn shortcut(&mut self, action: HotkeyAction) -> bool {
+        if !self.popover.isShown()
+            || self.detail.is_some()
+            || self.rows.values().any(|r| r.actions.is_tracking())
+        {
+            return false;
+        }
+        if matches!(action, HotkeyAction::Next | HotkeyAction::Previous) {
+            let navigation = &mut self.navigation[usize::from(self.showing_ignored)];
+            navigation.step(action == HotkeyAction::Next);
+            self.pending_scroll = navigation.selected.clone();
+            return true;
+        }
+        if action == HotkeyAction::Refresh {
+            if !self.showing_ignored && self.refresh.isEnabled() {
+                unsafe {
+                    self.refresh.performClick(None);
+                }
+            }
+            return false;
+        }
+        let Some(id) = self.navigation[usize::from(self.showing_ignored)]
+            .selected
+            .as_ref()
+        else {
+            return false;
+        };
+        let Some(row) = self.rows.get(id) else {
+            return false;
+        };
+        let button = match action {
+            HotkeyAction::Acknowledge if !self.showing_ignored => Some(&row.title),
+            HotkeyAction::OpenPr => Some(&row.open),
+            HotkeyAction::Details => Some(&row.disclosure),
+            _ => None,
+        };
+        if let Some(button) = button
+            && button.isEnabled()
+        {
+            // These controls retain their target and capture the displayed update.
+            unsafe {
+                button.performClick(None);
+            }
+        }
+        if action == HotkeyAction::Actions
+            && !self.showing_ignored
+            && !row.actions.button.isHidden()
+        {
+            if let Some(window) = row.actions.button.window() {
+                window.makeFirstResponder(Some(&row.actions.button));
+            }
+            unsafe {
+                row.actions.button.performClick(None);
+            }
+        }
+        false
     }
     pub(super) fn toggle_details(&mut self, id: &str) {
         let expanded = &mut self.expanded[usize::from(self.showing_ignored)];
@@ -684,8 +828,12 @@ impl ReviewPopover {
         }
     }
     fn show_detail(&mut self, panel: DetailPanel) {
-        self.scroll_positions[usize::from(self.showing_ignored)] =
-            self.scroll.contentView().bounds().origin;
+        if let Some(previous) = self.detail.take() {
+            previous.remove(&self.target);
+        } else {
+            self.scroll_positions[usize::from(self.showing_ignored)] =
+                self.scroll.contentView().bounds().origin;
+        }
         self.scroll.setDocumentView(Some(panel.view()));
         self.detail = Some(panel);
         self.scroll
@@ -710,7 +858,7 @@ impl ReviewPopover {
                 .is_some_and(|detail| detail.labels_saving(&self.action_state))
     }
     pub(super) fn back(&mut self) {
-        if self.labels_saving() {
+        if self.labels_saving() || self.keyboard_state.pending {
             return;
         }
         if let Some(detail) = self.detail.take() {
@@ -719,6 +867,21 @@ impl ReviewPopover {
             self.restore_scroll = true;
         } else {
             self.show_ignored(false);
+        }
+    }
+    pub(super) fn escape(&mut self) {
+        if !self.popover.isShown()
+            || self.rows.values().any(|row| row.actions.is_tracking())
+            || self.labels_saving()
+            || self.keyboard_state.pending
+        {
+            return;
+        }
+        if self.detail.is_some() || self.showing_ignored {
+            self.back();
+            self.show_ignored(false);
+        } else {
+            self.popover.close();
         }
     }
     pub(super) fn update(
@@ -733,9 +896,13 @@ impl ReviewPopover {
         if self.rows.values().any(|row| row.actions.is_tracking()) {
             return;
         }
-        self.back.setEnabled(!self.labels_saving());
+        self.back
+            .setEnabled(!self.labels_saving() && !self.keyboard_state.pending);
         let mtm = MainThreadMarker::new().unwrap();
         if let Some(detail) = &mut self.detail {
+            if let DetailPanel::Settings(editor) = detail {
+                editor.update(&self.keyboard_state);
+            }
             self.refresh.setHidden(true);
             self.actions.setHidden(true);
             self.back.setHidden(false);
@@ -832,6 +999,8 @@ impl ReviewPopover {
             let (org, repo) = repo_parts(&pr.snapshot.repo);
             (org.to_lowercase(), repo.to_lowercase(), pr.snapshot.number)
         });
+        self.navigation[usize::from(ignored)]
+            .update(sorted.iter().map(|pr| pr.snapshot.id.clone()).collect());
         let mut y = 8.0;
         let error = self.action_state.error.as_deref().or(error);
         self.banner.setHidden(error.is_none());
@@ -887,7 +1056,27 @@ impl ReviewPopover {
                 &self.target,
                 &self.action_state,
             );
-            row.view.setFrame(rect(16.0, y, CONTENT_WIDTH, height));
+            row.background.setFrame(rect(
+                -HIGHLIGHT_PADDING,
+                0.0,
+                CONTENT_WIDTH + 2.0 * HIGHLIGHT_PADDING,
+                height - 4.0,
+            ));
+            row.background
+                .setFillColor(&NSColor::whiteColor().colorWithAlphaComponent(0.08));
+            row.background.setHidden(
+                self.navigation[usize::from(ignored)].selected.as_deref()
+                    != Some(pr.snapshot.id.as_str()),
+            );
+            row.view.setFrame(rect(
+                16.0 - HIGHLIGHT_PADDING,
+                y,
+                CONTENT_WIDTH + 2.0 * HIGHLIGHT_PADDING,
+                height,
+            ));
+            // Expand the drawing area while keeping controls at their existing positions.
+            row.view
+                .setBoundsOrigin(NSPoint::new(-HIGHLIGHT_PADDING, 0.0));
             y += height;
         }
         self.empty.setHidden(!prs.is_empty());
@@ -915,10 +1104,10 @@ impl ReviewPopover {
                 target.size.height = target.size.height.min(clip.bounds().size.height);
                 self.document.scrollRectToVisible(target);
                 self.scroll.reflectScrolledClipView(&clip);
-                tracing::info!(event="notification_pr_revealed",pr_id=%id);
+                tracing::info!(event="popover_pr_revealed",pr_id=%id);
             } else {
                 // A delivered notification can outlive a closed, ignored, or removed PR.
-                tracing::info!(event="notification_pr_unavailable",pr_id=%id);
+                tracing::info!(event="popover_pr_unavailable",pr_id=%id);
             }
         }
     }

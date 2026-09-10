@@ -513,8 +513,12 @@ pub(super) fn label_color(hex: &str) -> Retained<NSColor> {
 pub(super) enum DetailPanel {
     Configuration(ConfigEditor),
     Labels(LabelPicker),
+    Settings(super::settings::SettingsEditor),
 }
 impl DetailPanel {
+    pub fn settings(target: &ActionTarget) -> Self {
+        Self::Settings(super::settings::SettingsEditor::new(target))
+    }
     pub fn configuration(repo: &str, target: &ActionTarget) -> Self {
         Self::Configuration(ConfigEditor::new(repo, target))
     }
@@ -525,12 +529,14 @@ impl DetailPanel {
         match self {
             Self::Configuration(editor) => &editor.view,
             Self::Labels(picker) => &picker.view,
+            Self::Settings(editor) => &editor.view,
         }
     }
     pub fn title(&self) -> String {
         match self {
             Self::Configuration(editor) => format!("Configure {}", repo_heading(&editor.repo)),
             Self::Labels(picker) => picker.title.clone(),
+            Self::Settings(_) => "Settings".into(),
         }
     }
     pub fn labels_saving(&self, state: &ActionState) -> bool {
@@ -539,7 +545,7 @@ impl DetailPanel {
                 .labels
                 .get(&picker.id)
                 .is_some_and(|labels| !labels.pending.is_empty()),
-            Self::Configuration(_) => false,
+            Self::Configuration(_) | Self::Settings(_) => false,
         }
     }
     pub fn label_error(&self, state: &ActionState) -> bool {
@@ -548,24 +554,27 @@ impl DetailPanel {
                 .labels
                 .get(&picker.id)
                 .is_some_and(|labels| labels.error.is_some()),
-            Self::Configuration(_) => false,
+            Self::Configuration(_) | Self::Settings(_) => false,
         }
     }
     pub fn subtitle(&self) -> &'static str {
         match self {
             Self::Configuration(_) => "Changes save automatically for this repository.",
             Self::Labels(_) => "Changes apply to this pull request.",
+            Self::Settings(_) => "Customize Gopher’s keyboard shortcuts.",
         }
     }
     pub fn update(&mut self, prs: &[PullRequest], state: &ActionState, target: &ActionTarget) {
         match self {
             Self::Configuration(editor) => editor.update(state),
             Self::Labels(picker) => picker.update(prs, state, target),
+            Self::Settings(_) => {}
         }
     }
     pub fn remove(self, target: &ActionTarget) {
         match self {
             Self::Configuration(editor) => forget(editor.tags, target),
+            Self::Settings(editor) => editor.remove(target),
             Self::Labels(picker) => {
                 forget([picker.refresh.tag()], target);
                 forget(picker.rows.values().map(|row| row.checkbox.tag()), target);

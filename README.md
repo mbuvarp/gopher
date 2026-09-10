@@ -14,11 +14,34 @@ The buttons beneath each PR let you:
 - Expand **Details** to inspect reviewer evidence.
 - Open the right-aligned **Actions** dropdown for repository configuration, enabled PR actions, and **Ignore** at the bottom. Ignore hides the PR from the active list, review polling, and notifications until restored.
 
-The header has **Refresh** and an **Actions** menu. Refresh is disabled and reads **Refreshing...** while PRs are being fetched. Actions contains **Show ignored**, configuration, notification settings, logs, launch at login, and Quit Gopher. **Show ignored** replaces the active list with ignored PRs, showing **Restore** buttons and a **Back** button in the header. Restoring resumes discovery for eligible open PRs.
+The header has **Refresh** and an **Actions** menu. Refresh is disabled and reads **Refreshing...** while PRs are being fetched. Actions contains **Show ignored**, **Settings**, notification settings, logs, launch at login, and Quit Gopher. **Show ignored** replaces the active list with ignored PRs, showing **Restore** buttons and a **Back** button in the header. Restoring resumes discovery for eligible open PRs.
 
 The popover updates while open, retaining expanded details and each view's scroll position. Click outside to dismiss it. **Right-click** the menu bar icon for the alternative standard menu, where PR submenus include an **Acknowledge update** checkbox. Both interfaces share the same state and notification behavior.
 
 Ignored PRs are checked at startup and every 15 minutes without fetching reviews. Closed or merged PRs disappear from the ignored list, but keep their ignore flags: if reopened, they reappear there and remain ignored. Unavailable identities keep their cached state and do not block updates to accessible PRs. They can still be restored while offline.
+
+## Settings and hotkeys
+
+Choose **Actions → Settings** to customize shortcuts. Click a binding and press its replacement, use **Clear** to unset it, or **Restore defaults** to reset all eight. Escape cancels recording. Changes save and apply immediately. Conflicting or unavailable bindings show an error and leave your previous shortcut working. **Open configuration file** opens the advanced `config.toml` settings, which still require restart.
+
+| Action | Default | Scope |
+| --- | --- | --- |
+| Open Gopher | Unset | Globally toggles the popover; requires Command, Option, or Control |
+| Next PR | J | Inbox |
+| Previous PR | K | Inbox |
+| Acknowledge | Space | Active inbox |
+| Open PR | O | Inbox |
+| Toggle Details | D | Inbox |
+| Open Actions | A | Active inbox; opens the menu for arrow-key navigation |
+| Refresh | R | Active inbox |
+
+Keyboard navigation highlights a PR without acknowledging it. J starts at the first PR; K starts at the last. Moving beyond either end clears the highlight. The highlighted PR scrolls into view and stays selected through background updates and trips to other panels. Reopening the popover clears the highlight. Notification clicks highlight their target after acknowledgement and flash its title and icon blue three times to draw attention, then restore their normal color. The ignored list supports navigation, Open PR, and Details too.
+
+Command+, is a fixed shortcut that opens Settings from the focused popover. It cannot be reassigned.
+
+Escape is fixed: it returns settings, repository configuration, label pickers, and the ignored list to the main PR list, then closes the popover from there. An open dropdown or shortcut recording consumes Escape first. Navigation waits while changes are being saved.
+
+Inbox shortcuts pause in settings, label pickers, text editing, and native menus. Bindings follow the recorded key position across keyboard layouts, and preferences persist across GitHub account changes.
 
 ## PR actions
 
