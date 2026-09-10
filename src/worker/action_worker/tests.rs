@@ -296,3 +296,82 @@ async fn disabling_labels_reverts_queued_toggles_without_sending_mutations() {
     assert!(labels.error.is_some());
     assert!(!h.directory.path().join("labels.log").exists());
 }
+
+#[tokio::test]
+async fn changes_during_final_authentication_cannot_submit_a_merge() {
+    for change in [
+        "disable",
+        "method",
+        "reviewing",
+        "comments",
+        "cancel",
+        "account",
+    ] {
+        let mut h = Harness::new();
+        let gh = h.config.gh_path.as_ref().unwrap();
+        let script = std::fs::read_to_string(gh)
+            .unwrap()
+            .replace(
+                "case \"$input\" in *viewer*) echo",
+                r#"case "$input" in *viewer*)
+if [ -f "$(dirname "$0")/first-auth" ]; then
+    touch "$(dirname "$0")/final-auth-started"
+    while [ ! -f "$(dirname "$0")/release-auth" ]; do sleep 0.01; done
+fi
+touch "$(dirname "$0")/first-auth"
+echo"#,
+            )
+            .replace("\"isResolved\":false", "\"isResolved\":true");
+        std::fs::write(gh, script).unwrap();
+        h.prs.get_mut("PR_1").unwrap().state = crate::model::State::Approved;
+        h.request(Request::Configure {
+            repo: "owner/repo".into(),
+            change: Setting::Condition(Kind::Merge, Condition::Approved),
+        });
+        let token = h.start_merge();
+        h.handle(ActionCommand::Tick {
+            pr: "PR_1".into(),
+            token,
+            remaining: 0,
+        });
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !h.directory.path().join("final-auth-started").exists() {
+                tokio::select! {
+                    command = h.receiver.recv() => {
+                        if let Some(Command::PrAction(command)) = command { h.handle(command); }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        match change {
+            "disable" => h.request(Request::Configure {
+                repo: "owner/repo".into(),
+                change: Setting::Enabled(Kind::Merge, false),
+            }),
+            "method" => h.request(Request::Configure {
+                repo: "owner/repo".into(),
+                change: Setting::MergeMethod(MergeMethod::Squash),
+            }),
+            "cancel" => h.request(Request::CancelMerge("PR_1".into())),
+            "account" => h.viewer = "another-account",
+            state => {
+                h.prs.get_mut("PR_1").unwrap().state = if state == "reviewing" {
+                    crate::model::State::Reviewing
+                } else {
+                    crate::model::State::Comments
+                }
+            }
+        }
+        std::fs::write(h.directory.path().join("release-auth"), "").unwrap();
+        // Process the authentication result after the worker-owned state changed.
+        h.step().await;
+        assert!(
+            !h.directory.path().join("merge.json").exists(),
+            "merge submitted after {change}"
+        );
+        assert!(h.coordinator.merges.is_empty());
+    }
+}

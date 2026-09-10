@@ -225,10 +225,9 @@ impl Coordinator {
                             tokio::spawn(async move {
                                 let result = async {
                                     let github = Github::new(&config)?;
-                                    ensure!(
-                                        github.viewer().await? == intent.viewer,
-                                        "GitHub account changed; merge cancelled"
-                                    );
+                                    // All read requests finish before MergeChecked.
+                                    // The worker's final validation authorizes submission;
+                                    // do not add another await before the merge request.
                                     github
                                         .merge_pr(
                                             &intent.reference(),
@@ -467,7 +466,14 @@ impl Coordinator {
                     github.viewer().await? == intent.viewer,
                     "GitHub account changed; merge cancelled"
                 );
-                github.snapshot(&intent.reference()).await.map(Box::new)
+                let snapshot = github.snapshot(&intent.reference()).await?;
+                // Remain cancellable while checking authentication, then let the
+                // worker revalidate its latest PR state and settings before merging.
+                ensure!(
+                    github.viewer().await? == intent.viewer,
+                    "GitHub account changed; merge cancelled"
+                );
+                Ok(Box::new(snapshot))
             }
             .await
             .map_err(|e: anyhow::Error| e.to_string());
