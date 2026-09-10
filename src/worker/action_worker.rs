@@ -84,7 +84,9 @@ impl Intent {
                     && (kind != Kind::Merge
                         || preferences.merge_method == self.preferences.merge_method)
                     && preferences.allows(kind, pr)
-                    && (kind != Kind::Merge || pr.snapshot.head == self.pr.snapshot.head)
+                    && (kind != Kind::Merge
+                        || (pr.snapshot.head == self.pr.snapshot.head
+                            && pr.update_id == self.pr.update_id))
             })
     }
 }
@@ -209,7 +211,7 @@ impl Coordinator {
                     let checked = result.and_then(|snapshot| {
                         let expected = context.config.repositories.get(&snapshot.repo).and_then(|r| r.reviewers.as_deref());
                         let fresh = transition(*snapshot, Some(&intent.pr), expected, chrono::Utc::now().timestamp(), context.config.settle_seconds);
-                        if intent.valid(context, &self.state, Kind::Merge) && intent.preferences.allows(Kind::Merge, &fresh) && fresh.snapshot.head == intent.pr.snapshot.head {
+                        if intent.valid(context, &self.state, Kind::Merge) && intent.preferences.allows(Kind::Merge, &fresh) && fresh.snapshot.head == intent.pr.snapshot.head && fresh.update_id == intent.pr.update_id {
                             Ok(())
                         } else { Err("Merge cancelled: the commit, review state, or action settings changed.".into()) }
                     });
@@ -304,10 +306,8 @@ impl Coordinator {
                             tokio::spawn(async move {
                                 let result = async {
                                     let github = Github::new(&config)?;
-                                    ensure!(
-                                        github.viewer().await? == job.intent.viewer,
-                                        "GitHub account changed; label action cancelled"
-                                    );
+                                    // Authentication finished before LabelChecked; submit
+                                    // directly after the worker revalidates the intent.
                                     github
                                         .set_label(&job.intent.reference(), &job.name, job.selected)
                                         .await

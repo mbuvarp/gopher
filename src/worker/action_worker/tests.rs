@@ -112,6 +112,19 @@ esac
             self.handle(command);
         }
     }
+    async fn refresh_pr(&mut self) {
+        let snapshot = Github::new(&self.config)
+            .unwrap()
+            .snapshot(&PrRef {
+                id: "PR_1".into(),
+                repo: "owner/repo".into(),
+                number: 1,
+            })
+            .await
+            .unwrap();
+        self.prs
+            .insert("PR_1".into(), transition(snapshot, None, None, 100, 0));
+    }
     fn assert_no_merge(&self) {
         assert!(!self.directory.path().join("merge.json").exists());
     }
@@ -120,6 +133,7 @@ esac
 #[tokio::test]
 async fn merge_countdown_completes_without_ui_events_and_pins_the_commit() {
     let mut h = Harness::new();
+    h.refresh_pr().await;
     let start = std::time::Instant::now();
     h.start_merge();
     h.assert_no_merge();
@@ -323,7 +337,7 @@ echo"#,
             )
             .replace("\"isResolved\":false", "\"isResolved\":true");
         std::fs::write(gh, script).unwrap();
-        h.prs.get_mut("PR_1").unwrap().state = crate::model::State::Approved;
+        h.refresh_pr().await;
         h.request(Request::Configure {
             repo: "owner/repo".into(),
             change: Setting::Condition(Kind::Merge, Condition::Approved),
@@ -373,5 +387,106 @@ echo"#,
             "merge submitted after {change}"
         );
         assert!(h.coordinator.merges.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn always_merge_rejects_changed_evidence_in_cache_or_final_snapshot() {
+    for cached in [true, false] {
+        let mut h = Harness::new();
+        h.refresh_pr().await;
+        let token = h.start_merge();
+        let original = h.prs["PR_1"].clone();
+        let mut changed = original.snapshot.clone();
+        changed.threads[0].last_comment_id = "new-comment-on-same-head".into();
+        let snapshot = if cached {
+            h.prs.insert(
+                "PR_1".into(),
+                transition(changed, Some(&original), None, 130, 0),
+            );
+            original.snapshot.clone()
+        } else {
+            changed
+        };
+        h.handle(ActionCommand::MergeChecked {
+            pr: "PR_1".into(),
+            token,
+            result: Ok(Box::new(snapshot)),
+        });
+        assert!(matches!(
+            h.coordinator.state.merges["PR_1"],
+            MergeProgress::Failed(_)
+        ));
+        assert!(h.coordinator.merges.is_empty());
+        h.assert_no_merge();
+    }
+}
+
+#[tokio::test]
+async fn label_authentication_finishes_before_the_final_worker_validation() {
+    for change in ["disable", "stale", "condition", "account", "unchanged"] {
+        let mut h = Harness::new();
+        let gh = h.config.gh_path.as_ref().unwrap();
+        let script = std::fs::read_to_string(gh).unwrap().replace(
+            "case \"$input\" in *viewer*) echo",
+            r#"case "$input" in *viewer*)
+echo auth >> "$(dirname "$0")/auth-calls"
+touch "$(dirname "$0")/auth-started"
+while [ ! -f "$(dirname "$0")/release-auth" ]; do sleep 0.01; done
+echo"#,
+        );
+        std::fs::write(gh, script).unwrap();
+        h.coordinator.state.labels.insert(
+            "PR_1".into(),
+            Labels {
+                items: vec![Label {
+                    name: "one".into(),
+                    color: "ff0000".into(),
+                    selected: false,
+                }],
+                ..Default::default()
+            },
+        );
+        h.request(Request::Label {
+            pr: "PR_1".into(),
+            name: "one".into(),
+            selected: true,
+        });
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !h.directory.path().join("auth-started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        match change {
+            "disable" => h.request(Request::Configure {
+                repo: "owner/repo".into(),
+                change: Setting::Enabled(Kind::Label, false),
+            }),
+            "stale" => h.prs.get_mut("PR_1").unwrap().stale = true,
+            "condition" => h.request(Request::Configure {
+                repo: "owner/repo".into(),
+                change: Setting::Condition(Kind::Label, Condition::Approved),
+            }),
+            "account" => h.viewer = "another-account",
+            _ => {}
+        }
+        std::fs::write(h.directory.path().join("release-auth"), "").unwrap();
+        h.step().await;
+        if change == "unchanged" {
+            h.step().await;
+        }
+        assert_eq!(
+            h.directory.path().join("labels.log").exists(),
+            change == "unchanged"
+        );
+        assert_eq!(
+            std::fs::read_to_string(h.directory.path().join("auth-calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
     }
 }

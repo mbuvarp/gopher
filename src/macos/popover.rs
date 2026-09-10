@@ -625,6 +625,11 @@ impl ReviewPopover {
         bundled: bool,
         loading: bool,
     ) {
+        // Keep rows, action bindings, headings, and layout intact while a native
+        // menu is tracking. menuDidClose requests an update with the latest state.
+        if self.rows.values().any(|row| row.actions.is_tracking()) {
+            return;
+        }
         let mtm = MainThreadMarker::new().unwrap();
         if let Some(detail) = &mut self.detail {
             self.refresh.setHidden(true);

@@ -153,7 +153,7 @@ impl PrActions {
     ) {
         // Freeze the PR/head and enabled state the user actually saw in this menu.
         // The worker independently revalidates it before executing a mutation.
-        if self.tracker.ivars().tracking.get() {
+        if self.is_tracking() {
             return;
         }
         let progress = state.merges.get(&pr.snapshot.id);
@@ -182,6 +182,11 @@ impl PrActions {
             .setEnabled(preferences.allows(Kind::Merge, pr) && !busy);
         self.labels.setEnabled(preferences.allows(Kind::Label, pr));
         bind_item(
+            &self.configure,
+            AppEvent::PopoverAction(Action::ConfigureRepo(pr.snapshot.repo.clone())),
+            target,
+        );
+        bind_item(
             &self.merge,
             AppEvent::PrAction(Request::Merge {
                 pr: pr.snapshot.id.clone(),
@@ -189,6 +194,9 @@ impl PrActions {
             }),
             target,
         );
+    }
+    pub fn is_tracking(&self) -> bool {
+        self.tracker.ivars().tracking.get()
     }
     pub fn remove(&self, target: &ActionTarget) {
         forget(
