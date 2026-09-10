@@ -385,7 +385,7 @@ impl LabelPicker {
     fn new(pr: &PullRequest, target: &ActionTarget) -> Self {
         let mtm = MainThreadMarker::new().unwrap();
         let view = FlippedView::new(rect(0.0, 0.0, WIDTH, HEIGHT - 82.0), mtm);
-        let message = label("Loading labels…", 12.0, true, mtm);
+        let message = label("Toggle labels to add or remove them.", 12.0, true, mtm);
         view.addSubview(&message);
         let refresh = target.button(
             "Refresh labels",
@@ -416,14 +416,14 @@ impl LabelPicker {
             .is_some_and(|pr| state.preferences(&pr.snapshot.repo).allows(Kind::Label, pr));
         self.refresh
             .setEnabled(allowed && !labels.loading && labels.pending.is_empty());
-        let text = if let Some(error) = &labels.error {
+        let text = if let Some(error) = labels.error.as_ref().or(labels.catalogue_error.as_ref()) {
             error.as_str()
         } else if !allowed {
             "Label action unavailable for this PR's current state."
-        } else if labels.loading {
-            "Loading labels…"
         } else if !labels.pending.is_empty() {
             "Saving label changes…"
+        } else if !labels.catalogue_ready {
+            "Showing known labels. The repository catalogue refreshes in the background."
         } else if labels.items.is_empty() {
             "This repository has no labels."
         } else {
@@ -488,7 +488,7 @@ impl LabelPicker {
                 NSControlStateValueOff
             });
             row.checkbox
-                .setEnabled(allowed && !labels.loading && !labels.pending.contains(&item.name));
+                .setEnabled(allowed && !labels.pending.contains(&item.name));
             y += 32.0;
         }
         self.view

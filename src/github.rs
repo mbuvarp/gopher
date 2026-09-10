@@ -12,6 +12,8 @@ use tokio::{io::AsyncWriteExt, process::Command};
 pub struct Github {
     executable: PathBuf,
     timeout: Duration,
+    api: std::sync::Arc<std::sync::Mutex<cache::ApiState>>,
+    account: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 #[derive(Clone, Debug)]
 pub struct PrRef {
@@ -40,10 +42,20 @@ pub fn resolve_gh(config: &Config) -> Result<PathBuf> {
 
 impl Github {
     pub fn new(config: &Config) -> Result<Self> {
+        let executable = resolve_gh(config)?;
         Ok(Self {
-            executable: resolve_gh(config)?,
+            api: cache::shared(&executable),
+            account: Default::default(),
+            executable,
             timeout: Duration::from_secs(config.request_timeout_seconds),
         })
+    }
+
+    pub fn cooldown(config: &Config) -> Duration {
+        resolve_gh(config)
+            .ok()
+            .map(|path| cache::shared(&path).lock().unwrap().delay(None))
+            .unwrap_or_default()
     }
 
     async fn execute(&self, args: &[&str], payload: Option<&Value>) -> Result<Value> {
@@ -76,9 +88,34 @@ impl Github {
     ) -> Result<Value> {
         let start = Instant::now();
         let request = request_kind(args, payload);
+        let resource = if args.contains(&"graphql") {
+            "graphql"
+        } else {
+            "core"
+        };
+        let delay = self.api.lock().unwrap().delay(Some(resource));
+        ensure!(
+            delay.is_zero(),
+            "GitHub rate limit: requests paused until the quota cooldown ends"
+        );
+        let endpoint = args.iter().find(|a| a.starts_with("repos/"));
+        let key = if payload.is_none() && !matches!(policy, ResponsePolicy::Mutation) {
+            endpoint.and_then(|endpoint| {
+                self.api
+                    .lock()
+                    .unwrap()
+                    .key(endpoint, self.account.lock().unwrap().as_deref())
+            })
+        } else {
+            None
+        };
+        let cached = key
+            .as_ref()
+            .and_then(|key| self.api.lock().unwrap().get(key));
         let mut command = Command::new(&self.executable);
         command
             .args(args)
+            .arg("--include")
             .env("GH_PROMPT_DISABLED", "1")
             .env("GH_PAGER", "cat")
             .env("GH_HOST", "github.com")
@@ -87,6 +124,9 @@ impl Github {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        if let Some(cached) = &cached {
+            command.args(["-H", &format!("If-None-Match: {}", cached.etag)]);
+        }
         let mut child = command
             .spawn()
             .context("Cannot start GitHub CLI; check gh_path and executable permissions")?;
@@ -98,26 +138,66 @@ impl Github {
                 drop(child.stdin.take());
             }
             let output = child.wait_with_output().await?;
-            tracing::debug!(
-                event = "github_request",
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                success = output.status.success()
-            );
             ensure!(
                 output.stdout.len() <= 32 * 1024 * 1024,
                 "GitHub response exceeded 32 MiB"
             );
+            let (status, headers, body) = cache::response(&output.stdout)?;
+            tracing::debug!(
+                event = "github_request",
+                request,
+                resource,
+                http_status = status,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                conditional = cached.is_some(),
+                success = output.status.success() || status == 304
+            );
+
+            let parsed = if status == 204 {
+                Ok(Value::Null)
+            } else {
+                serde_json::from_slice::<Value>(body)
+            };
+            let failure = classify_failure(&String::from_utf8_lossy(&output.stderr));
+            let limited = status == 429
+                || (status == 403 && headers.contains_key("retry-after"))
+                || failure.category == "rate_limit"
+                || parsed.as_ref().is_ok_and(|v| {
+                    v["message"].as_str().is_some_and(cache::is_rate_limit)
+                        || v["errors"].as_array().is_some_and(|errors| {
+                            errors.iter().any(|e| {
+                                e["type"] == "RATE_LIMITED"
+                                    || e["message"].as_str().is_some_and(cache::is_rate_limit)
+                            })
+                        })
+                });
+            self.api
+                .lock()
+                .unwrap()
+                .observe(&headers, resource, limited);
+            if limited {
+                bail!("GitHub rate limit reached; requests paused until the quota cooldown ends");
+            }
+            if status == 304 {
+                let cached = cached.context("GitHub returned 304 without a cached response")?;
+                ensure!(
+                    key.as_ref()
+                        .is_some_and(|key| self.api.lock().unwrap().get(key).is_some()),
+                    "GitHub response cache changed during the request; retry next poll"
+                );
+                tracing::debug!(event = "github_not_modified", resource);
+                return serde_json::from_slice(&cached.body).context("Invalid cached GitHub JSON");
+            }
             // gh exits nonzero for GraphQL node-resolution errors, even when
             // unrelated nodes succeeded. Only the ignored-identity lookup may
             // accept these narrowly validated partial responses.
             if matches!(policy, ResponsePolicy::MissingNodes)
-                && let Ok(response) = serde_json::from_slice::<Value>(&output.stdout)
-                && only_missing_node_errors(&response)
+                && let Ok(response) = &parsed
+                && only_missing_node_errors(response)
             {
-                return Ok(response);
+                return Ok(response.clone());
             }
-            if !output.status.success() {
-                let failure = classify_failure(&String::from_utf8_lossy(&output.stderr));
+            if !output.status.success() || status >= 400 {
                 tracing::warn!(
                     event = "github_request_failed",
                     request,
@@ -127,17 +207,29 @@ impl Github {
                     elapsed_ms = start.elapsed().as_millis() as u64
                 );
                 if matches!(policy, ResponsePolicy::Mutation)
-                    && let Ok(response) = serde_json::from_slice::<Value>(&output.stdout)
+                    && let Ok(response) = &parsed
                     && response["message"].is_string()
                 {
                     bail!(
                         "GitHub: {}",
-                        actions::message(&response, "Action was rejected")
+                        actions::message(response, "Action was rejected")
                     );
                 }
                 bail!("{}", failure.message);
             }
-            serde_json::from_slice(&output.stdout).context("GitHub CLI returned invalid JSON")
+            let response = parsed.context("GitHub CLI returned invalid JSON")?;
+            if matches!(policy, ResponsePolicy::Mutation) {
+                self.api.lock().unwrap().invalidate();
+            } else if status == 200
+                && response.get("errors").is_none()
+                && let Some(key) = &key
+            {
+                self.api
+                    .lock()
+                    .unwrap()
+                    .put(key, headers.get("etag").map(String::as_str), body);
+            }
+            Ok(response)
         };
         match tokio::time::timeout(self.timeout, operation).await {
             Ok(result) => result,
@@ -216,7 +308,10 @@ impl Github {
         let result = self
             .graphql("query { viewer { login } }", json!({}))
             .await?;
-        Ok(required(&result["viewer"], "login")?.to_owned())
+        let account = required(&result["viewer"], "login")?.to_owned();
+        self.api.lock().unwrap().identify(&account);
+        *self.account.lock().unwrap() = Some(account.clone());
+        Ok(account)
     }
 
     pub async fn discover(&self, login: &str) -> Result<Vec<PrRef>> {
@@ -288,6 +383,60 @@ impl Github {
 
     #[tracing::instrument(skip_all, fields(repo=%reference.repo, pr=reference.number))]
     pub async fn snapshot(&self, reference: &PrRef) -> Result<Snapshot> {
+        let snapshot = self.snapshot_unverified(reference).await?;
+        if snapshot.open {
+            let last = self
+                .graphql(
+                    "query($id:ID!){ node(id:$id){ ... on PullRequest { headRefOid state } } }",
+                    json!({"id":reference.id}),
+                )
+                .await?;
+            ensure!(
+                last["node"]["headRefOid"] == snapshot.head && last["node"]["state"] == "OPEN",
+                "PR changed while fetching checks; retrying next poll"
+            );
+        }
+        Ok(snapshot)
+    }
+
+    pub(crate) async fn final_heads(
+        &self,
+        ids: &[String],
+        viewer: &str,
+    ) -> Result<BTreeMap<String, (String, bool)>> {
+        let mut heads = BTreeMap::new();
+        for batch in ids.chunks(50) {
+            let data = self.graphql("query PollHeads($ids:[ID!]!){viewer{login} nodes(ids:$ids){... on PullRequest{id headRefOid state}}}", json!({"ids":batch})).await?;
+            ensure!(
+                required(&data["viewer"], "login")? == viewer,
+                "GitHub account changed while refreshing PRs"
+            );
+            let nodes = data["nodes"]
+                .as_array()
+                .context("Missing final PR head checks")?;
+            ensure!(
+                nodes.len() == batch.len(),
+                "Incomplete final PR head checks"
+            );
+            for (id, node) in batch.iter().zip(nodes) {
+                ensure!(
+                    node["id"] == *id,
+                    "Missing or unexpected PR identity in final head checks"
+                );
+                let open = match required(node, "state")? {
+                    "OPEN" => true,
+                    "CLOSED" | "MERGED" => false,
+                    _ => bail!("Unknown PR lifecycle state"),
+                };
+                heads.insert(id.clone(), (required(node, "headRefOid")?.into(), open));
+            }
+        }
+        Ok(heads)
+    }
+
+    /// Polling validates these results together with final_heads before publishing.
+    #[tracing::instrument(skip_all, fields(repo=%reference.repo, pr=reference.number))]
+    pub(crate) async fn snapshot_unverified(&self, reference: &PrRef) -> Result<Snapshot> {
         let start = Instant::now();
         let mut cursors = [
             Value::Null,
@@ -447,17 +596,7 @@ impl Github {
             page += 1;
         }
         snapshot.checks.extend(legacy_checks(&statuses));
-        let last = self
-            .graphql(
-                "query($id:ID!){ node(id:$id){ ... on PullRequest { headRefOid state } } }",
-                json!({"id":reference.id}),
-            )
-            .await?;
-        ensure!(
-            last["node"]["headRefOid"] == snapshot.head && last["node"]["state"] == "OPEN",
-            "PR changed while fetching checks; retrying next poll"
-        );
-        tracing::debug!(event="snapshot_complete", repo=%reference.repo, pr=reference.number, elapsed_ms=start.elapsed().as_millis() as u64, threads=snapshot.threads.len());
+        tracing::debug!(event="snapshot_collected", repo=%reference.repo, pr=reference.number, elapsed_ms=start.elapsed().as_millis() as u64, threads=snapshot.threads.len());
         Ok(snapshot)
     }
 }
@@ -749,3 +888,5 @@ enum ResponsePolicy {
     MissingNodes,
     Mutation,
 }
+
+mod cache;

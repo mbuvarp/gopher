@@ -84,7 +84,7 @@ esac
 }
 
 #[tokio::test]
-async fn repository_and_selected_labels_are_both_fully_paginated() {
+async fn repository_labels_are_fully_paginated_without_fetching_assignments() {
     let first: Vec<_> = (0..100)
         .map(|i| serde_json::json!({"name":format!("label-{i:03}"),"color":"ff0011"}))
         .collect();
@@ -92,22 +92,15 @@ async fn repository_and_selected_labels_are_both_fully_paginated() {
     let (_dir, gh) = mock(&format!(
         r#"
 case "$*" in
-  *'&page=1') echo '{first}';;
-  *'&page=2') echo '[{{"name":"last","color":"123456"}}]';;
+  *'/issues/'*) exit 1;;
+  *'&page=1'*) echo '{first}';;
+  *'&page=2'*) echo '[{{"name":"last","color":"123456"}}]';;
   *) exit 1;;
 esac
 "#
     ));
-    let labels = gh
-        .labels(&gopher::github::PrRef {
-            id: "PR_1".into(),
-            repo: "owner/repo".into(),
-            number: 42,
-        })
-        .await
-        .unwrap();
+    let labels = gh.repository_labels("owner/repo").await.unwrap();
     assert_eq!(labels.len(), 101);
-    assert!(labels.iter().all(|label| label.selected));
     assert_eq!(labels.last().unwrap().color, "123456");
 }
 #[tokio::test]
@@ -327,4 +320,119 @@ async fn ignored_lookup_still_rejects_query_and_field_errors() {
             assert!(gh.ignored_details(&["PR_1".into()]).await.is_err());
         }
     }
+}
+
+#[tokio::test]
+async fn rest_etags_reuse_bodies_across_clients_and_mutations_invalidate_them() {
+    let (dir, github) = mock(
+        r#"
+case "$*" in
+  *graphql*) cat >/dev/null; echo '{"data":{"viewer":{"login":"test"}}}'; exit 0;;
+  *'--method DELETE'*) printf 'HTTP/2.0 204 No Content\r\n\r\n'; exit 0;;
+esac
+printf '%s\n' "$*" >> "$(dirname "$0")/calls"
+case "$*" in
+  *If-None-Match*) printf 'HTTP/2.0 304 Not Modified\r\nETag: "abc"\r\n\r\n'; echo 'HTTP 304' >&2; exit 1;;
+  *) printf 'HTTP/2.0 200 OK\r\nETag: "abc"\r\n\r\n[{"name":"bug","color":"112233"}]';;
+esac
+"#,
+    );
+    github.viewer().await.unwrap();
+    let labels = github.repository_labels("owner/repo").await.unwrap();
+    assert_eq!(labels[0].name, "bug");
+    let config = Config {
+        gh_path: Some(dir.path().join("gh")),
+        ..Default::default()
+    };
+    let next = Github::new(&config).unwrap();
+    next.viewer().await.unwrap();
+    assert_eq!(next.repository_labels("owner/repo").await.unwrap(), labels);
+    next.set_label(
+        &gopher::github::PrRef {
+            id: "PR_1".into(),
+            repo: "owner/repo".into(),
+            number: 1,
+        },
+        "bug",
+        false,
+    )
+    .await
+    .unwrap();
+    next.repository_labels("owner/repo").await.unwrap();
+    let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+    let calls: Vec<_> = calls.lines().collect();
+    assert_eq!(calls.len(), 3);
+    assert!(!calls[0].contains("If-None-Match"));
+    assert!(calls[1].contains("If-None-Match: \"abc\""));
+    assert!(!calls[2].contains("If-None-Match"));
+}
+
+#[tokio::test]
+async fn secondary_limit_pauses_other_clients_without_retrying_a_mutation() {
+    let (dir, github) = mock(
+        r#"
+cat >/dev/null
+printf 'call\n' >> "$(dirname "$0")/calls"
+printf 'HTTP/2.0 403 Forbidden\r\nRetry-After: 180\r\n\r\n{"message":"Secondary rate limit reached"}'
+echo 'HTTP 403 SECRET' >&2
+exit 1
+"#,
+    );
+    let error = github.viewer().await.unwrap_err().to_string();
+    assert!(error.contains("rate limit"));
+    assert!(!error.contains("SECRET"));
+    let config = Config {
+        gh_path: Some(dir.path().join("gh")),
+        ..Default::default()
+    };
+    assert!(Github::cooldown(&config) >= std::time::Duration::from_secs(179));
+    let next = Github::new(&config).unwrap();
+    assert!(next.repository_labels("owner/repo").await.is_err());
+    assert!(
+        next.merge_pr(
+            &gopher::github::PrRef {
+                id: "PR_1".into(),
+                repo: "owner/repo".into(),
+                number: 1
+            },
+            "head",
+            gopher::actions::MergeMethod::Merge
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn graphql_primary_limit_in_a_successful_http_response_still_pauses_requests() {
+    let reset = chrono::Utc::now().timestamp() + 600;
+    let (dir, github) = mock(&format!(
+        r#"
+cat >/dev/null
+printf 'HTTP/2.0 200 OK\r\nX-RateLimit-Resource: graphql\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {reset}\r\n\r\n{{"errors":[{{"type":"RATE_LIMITED","message":"quota reached"}}]}}'
+"#
+    ));
+    assert!(
+        github
+            .viewer()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("rate limit")
+    );
+    let config = Config {
+        gh_path: Some(dir.path().join("gh")),
+        ..Default::default()
+    };
+    let expected = reset
+        .saturating_sub(chrono::Utc::now().timestamp() + 1)
+        .max(0) as u64;
+    assert!(Github::cooldown(&config) >= std::time::Duration::from_secs(expected));
 }

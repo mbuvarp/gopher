@@ -1,8 +1,7 @@
 use super::{Github, PrRef, ResponsePolicy};
-use crate::actions::{Label, MergeMethod};
+use crate::actions::MergeMethod;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
 
 pub(super) fn message(response: &Value, fallback: &str) -> String {
     response["message"]
@@ -74,25 +73,14 @@ impl Github {
         unreachable!()
     }
 
-    pub async fn labels(&self, pr: &PrRef) -> Result<Vec<Label>> {
-        let available = self
-            .label_pages(&format!("repos/{}/labels", pr.repo))
-            .await?;
-        let assigned = self
-            .label_pages(&format!("repos/{}/issues/{}/labels", pr.repo, pr.number))
-            .await?;
-        let selected = assigned
-            .iter()
-            .filter_map(|l| l["name"].as_str())
-            .collect::<BTreeSet<_>>();
-        let mut labels = available
+    pub async fn repository_labels(&self, repo: &str) -> Result<Vec<crate::model::PrLabel>> {
+        let labels = self.label_pages(&format!("repos/{repo}/labels")).await?;
+        let mut labels = labels
             .iter()
             .map(|label| {
-                let name = label["name"].as_str().context("Missing label name")?;
-                Ok(Label {
-                    name: name.into(),
+                Ok(crate::model::PrLabel {
+                    name: label["name"].as_str().context("Missing label name")?.into(),
                     color: label["color"].as_str().unwrap_or("808080").into(),
-                    selected: selected.contains(name),
                 })
             })
             .collect::<Result<Vec<_>>>()?;

@@ -21,6 +21,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS ignored_prs (id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS ignored_pr_details (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS repository_actions (repo TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS repository_labels (viewer TEXT NOT NULL, repo TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(viewer,repo));
             PRAGMA user_version=2; COMMIT;")?;
         Ok(Self { connection })
     }
@@ -62,6 +63,44 @@ impl Store {
             params![
                 crate::actions::repo_key(repo),
                 serde_json::to_string(preferences)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn label_catalogues(
+        &self,
+        viewer: &str,
+    ) -> Result<std::collections::BTreeMap<String, crate::actions::LabelCatalogue>> {
+        let mut query = self
+            .connection
+            .prepare("SELECT repo,data FROM repository_labels WHERE viewer=?1")?;
+        query
+            .query_map([viewer], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .map(|row| {
+                let (repo, data) = row?;
+                Ok((
+                    repo,
+                    serde_json::from_str(&data).context("Invalid repository label cache")?,
+                ))
+            })
+            .collect()
+    }
+
+    pub fn save_label_catalogue(
+        &self,
+        viewer: &str,
+        repo: &str,
+        catalogue: &crate::actions::LabelCatalogue,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO repository_labels (viewer,repo,data) VALUES (?1,?2,?3)",
+            params![
+                viewer,
+                crate::actions::repo_key(repo),
+                serde_json::to_string(catalogue)?
             ],
         )?;
         Ok(())

@@ -76,6 +76,7 @@ pub enum Command {
     NotificationFailed(String),
     Shutdown,
     PollComplete(std::result::Result<Batch, String>),
+    CheckLabels,
 }
 pub struct Batch {
     viewer: String,
@@ -186,7 +187,10 @@ async fn fetch(
             };
             let github = github.clone();
             tasks.spawn(async move {
-                let result = github.snapshot(&reference).await.map_err(|e| e.to_string());
+                let result = github
+                    .snapshot_unverified(&reference)
+                    .await
+                    .map_err(|e| e.to_string());
                 (reference.id, result)
             });
         }
@@ -194,6 +198,21 @@ async fn fetch(
             break;
         };
         results.push(result?);
+    }
+    let ids = results
+        .iter()
+        .filter(|(_, result)| result.is_ok())
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    let heads = github.final_heads(&ids, &viewer).await?;
+    for (id, result) in &mut results {
+        if let Ok(snapshot) = result
+            && !heads
+                .get(id)
+                .is_some_and(|(head, open)| head == &snapshot.head && *open == snapshot.open)
+        {
+            *result = Err("PR changed while fetching checks; retrying next poll".into());
+        }
     }
     Ok(Batch {
         viewer,
@@ -248,8 +267,15 @@ async fn run(
         error: None,
         loading: false,
     });
+    let mut label_deadline = Instant::now();
     loop {
+        let cooldown = Github::cooldown(&config);
+        if !cooldown.is_zero() {
+            deadline = deadline.max(Instant::now() + cooldown);
+            ignored_deadline = ignored_deadline.max(Instant::now() + cooldown);
+        }
         let command = tokio::select! {
+            _ = tokio::time::sleep_until(label_deadline.into()) => Command::CheckLabels,
             command = receiver.recv() => match command { Some(c)=>c,None=>break },
             _ = tokio::time::sleep_until(ignored_deadline.into()), if !ignored_loading => Command::CheckIgnored,
             _ = tokio::time::sleep_until(deadline.into()), if !polling => {
@@ -274,6 +300,21 @@ async fn run(
         };
         let mut reveal_target = None;
         match command {
+            Command::CheckLabels => {
+                label_deadline = Instant::now() + Duration::from_secs(30);
+                pr_actions.refresh_catalogues(
+                    &action_worker::Context {
+                        store: &store,
+                        prs: &prs,
+                        viewer: viewer.as_deref(),
+                        config: &config,
+                        sender: &sender,
+                        sink: &sink,
+                    },
+                    None,
+                );
+                continue;
+            }
             Command::LabelSaved {
                 pr: id,
                 viewer: account,
@@ -283,6 +324,7 @@ async fn run(
                 if viewer.as_deref() == Some(account.as_str())
                     && let Some(pr) = prs.get_mut(&id)
                 {
+                    pr_actions.label_saved(&id, &label.name);
                     pr.snapshot
                         .labels
                         .retain(|existing| existing.name != label.name);
@@ -618,6 +660,17 @@ async fn run(
             sender: &sender,
             sink: &sink,
         });
+        pr_actions.refresh_catalogues(
+            &action_worker::Context {
+                store: &store,
+                prs: &prs,
+                viewer: viewer.as_deref(),
+                config: &config,
+                sender: &sender,
+                sink: &sink,
+            },
+            None,
+        );
         sink(UiEvent::Updated {
             prs: prs.values().cloned().collect(),
             error: error.clone(),
@@ -679,6 +732,15 @@ pub fn transition(
 mod tests {
     use super::*;
 
+    fn next_list_event(rx: &std::sync::mpsc::Receiver<UiEvent>) -> UiEvent {
+        loop {
+            let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if !matches!(event, UiEvent::ActionsChanged(_)) {
+                return event;
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn discovery_omissions_keep_polling_known_prs_only_for_the_same_account() {
@@ -688,6 +750,7 @@ mod tests {
         let script = include_str!("../tests/fixtures/gh-snapshot.sh").replace("input=$(cat)", r#"
 input=$(cat)
 case "$input" in
+  *PollHeads*) echo '{"data":{"viewer":{"login":"test"},"nodes":[{"id":"PR_1","headRefOid":"head","state":"OPEN"}]}}'; exit 0 ;;
   *AuthoredPrs*) echo '{"data":{"viewer":{"pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":[]}}}}'; exit 0 ;;
   *search*) echo '{"data":{"search":{"issueCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]}}}'; exit 0 ;;
   *viewer*) echo '{"data":{"viewer":{"login":"test"}}}'; exit 0 ;;
@@ -788,7 +851,7 @@ esac
         // Let initial polling fail, then inject a delayed discovery response deterministically.
         loop {
             if matches!(
-                rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                next_list_event(&rx),
                 UiEvent::Updated { error: Some(_), .. }
             ) {
                 break;
@@ -799,11 +862,9 @@ esac
             .send(Command::Ignore(snapshot.id.clone()))
             .unwrap();
         assert!(
-            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), UiEvent::DismissNotifications(ids) if ids==vec![notification.clone()])
+            matches!(next_list_event(&rx), UiEvent::DismissNotifications(ids) if ids==vec![notification.clone()])
         );
-        assert!(
-            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), UiEvent::Updated {prs,..} if prs.is_empty())
-        );
+        assert!(matches!(next_list_event(&rx), UiEvent::Updated {prs,..} if prs.is_empty()));
         worker
             .sender
             .send(Command::PollComplete(Ok(Batch {
@@ -818,7 +879,7 @@ esac
             })))
             .unwrap();
         assert!(
-            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), UiEvent::Updated {prs,error:None,..} if prs.is_empty())
+            matches!(next_list_event(&rx), UiEvent::Updated {prs,error:None,..} if prs.is_empty())
         );
         worker
             .sender
@@ -828,9 +889,7 @@ esac
                 reveal: false,
             })
             .unwrap();
-        assert!(
-            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), UiEvent::Updated {prs,..} if prs.is_empty())
-        );
+        assert!(matches!(next_list_event(&rx), UiEvent::Updated {prs,..} if prs.is_empty()));
         drop(worker);
         let store = Store::open(directory.path()).unwrap();
         assert!(store.load().unwrap().is_empty());
@@ -891,17 +950,13 @@ esac
             .send(Command::Restore(snapshot.id.clone()))
             .unwrap();
         loop {
-            if let UiEvent::IgnoredUpdated { prs, .. } =
-                rx.recv_timeout(Duration::from_secs(5)).unwrap()
-            {
+            if let UiEvent::IgnoredUpdated { prs, .. } = next_list_event(&rx) {
                 assert!(prs.is_empty());
                 break;
             }
         }
         // Consume the Restore command's active-state event before injecting a result.
-        assert!(
-            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(),UiEvent::Updated{prs,..} if prs.is_empty())
-        );
+        assert!(matches!(next_list_event(&rx),UiEvent::Updated{prs,..} if prs.is_empty()));
         std::fs::remove_file(directory.path().join("started")).unwrap();
         let batch = || Batch {
             viewer: "viewer".into(),
@@ -917,9 +972,7 @@ esac
             .sender
             .send(Command::PollComplete(Ok(batch())))
             .unwrap();
-        assert!(
-            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(),UiEvent::Updated{prs,..} if prs.is_empty())
-        );
+        assert!(matches!(next_list_event(&rx),UiEvent::Updated{prs,..} if prs.is_empty()));
         // Restore overrides the normal polling delay even if the old request completed later.
         let started = Instant::now();
         while !directory.path().join("started").exists() {
@@ -927,7 +980,7 @@ esac
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            next_list_event(&rx),
             UiEvent::Updated { loading: true, .. }
         ));
         worker
@@ -935,7 +988,7 @@ esac
             .send(Command::PollComplete(Ok(batch())))
             .unwrap();
         assert!(
-            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(),UiEvent::Updated{prs,loading:false,..} if prs.len()==1)
+            matches!(next_list_event(&rx),UiEvent::Updated{prs,loading:false,..} if prs.len()==1)
         );
         drop(worker);
         let store = Store::open(directory.path()).unwrap();

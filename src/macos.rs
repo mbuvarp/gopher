@@ -456,7 +456,6 @@ pub fn run(
                             Action::Labels(id)=>{
                                 if let Some(pr)=prs.iter().find(|pr|&pr.snapshot.id==id) {
                                     popover.show_labels(pr);
-                                    let _=sender.send(Command::PrAction(crate::worker::ActionCommand::Request(crate::actions::Request::LoadLabels(id.clone()))));
                                     rebuild=true;
                                 }
                             }
