@@ -262,6 +262,15 @@ async fn run(
     let mut failures = 0_u32;
     let mut in_flight_notifications = BTreeSet::new();
     let mut dismiss_after_delivery = BTreeSet::new();
+    // The first UI snapshot must include cached labels, without waiting for a poll.
+    pr_actions.reconcile(&action_worker::Context {
+        store: &store,
+        prs: &prs,
+        viewer: viewer.as_deref(),
+        config: &config,
+        sender: &sender,
+        sink: &sink,
+    });
     sink(UiEvent::ActionsChanged(pr_actions.state.clone()));
     sink(UiEvent::Updated {
         prs: prs.values().cloned().collect(),

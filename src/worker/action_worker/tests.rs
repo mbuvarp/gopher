@@ -652,8 +652,13 @@ esac
         1
     );
     h.coordinator = Coordinator::new(&h.store).unwrap();
-    h.sync_labels();
+    assert!(h.coordinator.state.labels.is_empty());
     h.refresh_catalogues();
+    let labels = &h.coordinator.state.labels["PR_1"];
+    assert!(labels.catalogue_ready);
+    assert!(!labels.loading);
+    assert!(labels.items[0].selected);
+    assert!(!h.coordinator.state.labels["PR_2"].items[0].selected);
     assert!(
         h.coordinator.loads.is_empty(),
         "Restart must reuse a fresh persisted catalogue"

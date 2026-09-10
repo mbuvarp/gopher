@@ -135,10 +135,11 @@ impl Coordinator {
             }
             jobs.push((repo, token));
         }
+        // Populate picker state even when the persisted catalogue is still fresh.
+        self.sync_labels(context);
         if jobs.is_empty() {
             return;
         }
-        self.sync_labels(context);
         let config = context.config.clone();
         let sender = context.sender.clone();
         let viewer = viewer.to_owned();
