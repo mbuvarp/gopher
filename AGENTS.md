@@ -83,8 +83,12 @@ Prefer structural symbol navigation for unfamiliar code when available; use text
 
 - Check: `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`.
 - Diagnose: `cargo run -- doctor`, `cargo run -- inspect OWNER/REPO NUMBER` (read-only; no notifications).
-- Package: `sh scripts/bundle.sh`. Notifications need the `.app` bundle and reliable Apple signing; the script prefers an installed Apple Development identity. Use `GOPHER_SIGNING_IDENTITY` to override.
+- Package: `sh scripts/bundle.sh` builds explicitly for Apple Silicon/macOS 13. Add `--release` for a versioned unnotarized ZIP and SHA-256 checksum; release packaging requires a real signing identity, while local builds may fall back to ad-hoc signing. Prefer an installed Apple Development identity; use `GOPHER_SIGNING_IDENTITY` to override. Generate bundle versions from Cargo metadata before signing, with build version `(major + 1).minor.patch`. Stage fresh bundles and verify the extracted ZIP before replacing outputs. Run packaging tests with `python3 -m unittest discover -s scripts -p 'test_*.py'`. Notifications and login startup must also be tested on another Mac; an SSH copy does not test browser-download Gatekeeper behavior.
 
 ## Git
 
 Use Conventional Commits: `type(scope): description`, with an optional scope. Choose a descriptive type such as `feat`, `fix`, `docs`, `refactor`, `test`, or `chore`, and keep the subject concise and imperative.
+
+## Linear
+
+This project uses Linear for issue tracking. Issues are in the `Gopher` team. When given a Linear issue for feature work, move it to "In Progress", assign it to the current user if possible, and checkout its git branch. You may make these changes even in no-edit mode.
