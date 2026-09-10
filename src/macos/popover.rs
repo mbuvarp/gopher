@@ -438,6 +438,7 @@ pub(super) struct ReviewPopover {
     showing_ignored: bool,
     scroll_positions: [NSPoint; 2],
     restore_scroll: bool,
+    pending_scroll: Option<String>,
     banner: Retained<NSTextField>,
     empty: Retained<NSTextField>,
     login: Retained<NSMenuItem>,
@@ -560,6 +561,7 @@ impl ReviewPopover {
             showing_ignored: false,
             scroll_positions: [NSPoint::new(0.0, 0.0); 2],
             restore_scroll: false,
+            pending_scroll: None,
             banner,
             empty,
             login: login.unwrap(),
@@ -576,19 +578,50 @@ impl ReviewPopover {
             self.popover.close();
             return;
         }
+        self.show(tray);
+    }
+    /// Notification navigation must never toggle an already open popover closed.
+    pub(super) fn show(&self, tray: &TrayIcon) {
+        // Support the macOS 13 deployment target as well as newer macOS releases.
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(MainThreadMarker::new().unwrap())
+            .activateIgnoringOtherApps(true);
         if let Some(item) = tray.ns_status_item()
             && let Some(button) = item.button(MainThreadMarker::new().unwrap())
         {
-            self.popover.showRelativeToRect_ofView_preferredEdge(
-                button.bounds(),
-                &button,
-                NSRectEdge::MinY,
-            );
-            if let Some(window) = self.document.window() {
+            if !self.popover.isShown() {
+                self.popover.showRelativeToRect_ofView_preferredEdge(
+                    button.bounds(),
+                    &button,
+                    NSRectEdge::MinY,
+                );
+            }
+            if let Some(window) = self.scroll.window() {
                 window.makeKeyWindow();
             }
             tracing::debug!(event = "popover_opened");
         }
+    }
+    pub(super) fn prepare_notification_reveal(&mut self) -> bool {
+        // Defer navigation while controls are in use. A label-save failure must
+        // remain visible until the user leaves that picker or retries successfully.
+        if self.rows.values().any(|row| row.actions.is_tracking())
+            || self.labels_saving()
+            || self
+                .detail
+                .as_ref()
+                .is_some_and(|panel| panel.label_error(&self.action_state))
+        {
+            return false;
+        }
+        if self.detail.is_some() {
+            self.back();
+        }
+        self.show_ignored(false);
+        true
+    }
+    pub(super) fn scroll_to_pr(&mut self, pr: Option<String>) {
+        self.pending_scroll = pr;
     }
     pub(super) fn toggle_details(&mut self, id: &str) {
         let expanded = &mut self.expanded[usize::from(self.showing_ignored)];
@@ -832,5 +865,18 @@ impl ReviewPopover {
         let constrained = clip.constrainBoundsRect(bounds);
         clip.scrollToPoint(constrained.origin);
         self.scroll.reflectScrolledClipView(&clip);
+        if let Some(id) = self.pending_scroll.take() {
+            if let Some(row) = self.rows.get(&id) {
+                let mut target = row.view.frame();
+                // Keep the title visible even when expanded details exceed the viewport.
+                target.size.height = target.size.height.min(clip.bounds().size.height);
+                self.document.scrollRectToVisible(target);
+                self.scroll.reflectScrolledClipView(&clip);
+                tracing::info!(event="notification_pr_revealed",pr_id=%id);
+            } else {
+                // A delivered notification can outlive a closed, ignored, or removed PR.
+                tracing::info!(event="notification_pr_unavailable",pr_id=%id);
+            }
+        }
     }
 }

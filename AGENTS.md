@@ -18,6 +18,7 @@ Left-click opens the native AppKit popover; right-click opens the alternative st
 - Use the neutral monochrome cartoon gopher (`assets/gopher.png`) for both idle and review-in-progress menu bar states; background polling alone does not change the icon. Reserve the question mark for errors or unacknowledged unknown/stale PRs.
 - Reflect unacknowledged comments or approvals in the main icon. Notify when a review run finishes with findings or approval; defer findings notifications until all participating reviewers finish.
 - Clicking a review notification or its **Acknowledge** action acknowledges that specific update without opening the browser. The **Open PR** notification action opens the PR and acknowledges only after the browser opens successfully. An older notification must not acknowledge newer updates.
+- Clicking the notification body also opens the active PR list in the popover and scrolls the target PR into view, without closing an already open popover. Send navigation after persisted acknowledgement state reaches the UI. Defer leaving menus or label pickers while saving; preserve visible label failures. Missing or closed targets open the inbox without restoring ignored PRs. Explicit notification actions retain their behavior.
 
 ## PR actions
 

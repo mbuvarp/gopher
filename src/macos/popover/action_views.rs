@@ -542,6 +542,15 @@ impl DetailPanel {
             Self::Configuration(_) => false,
         }
     }
+    pub fn label_error(&self, state: &ActionState) -> bool {
+        match self {
+            Self::Labels(picker) => state
+                .labels
+                .get(&picker.id)
+                .is_some_and(|labels| labels.error.is_some()),
+            Self::Configuration(_) => false,
+        }
+    }
     pub fn subtitle(&self) -> &'static str {
         match self {
             Self::Configuration(_) => "Changes save automatically for this repository.",

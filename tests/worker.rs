@@ -103,6 +103,7 @@ fn notification_actions_acknowledge_only_their_update_and_open_waits_for_browser
         .send(Command::NotificationAction {
             id: old_notice.clone(),
             open: true,
+            reveal: false,
         })
         .unwrap();
     assert!(
@@ -111,12 +112,17 @@ fn notification_actions_acknowledge_only_their_update_and_open_waits_for_browser
     assert!(
         matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), UiEvent::Updated {prs,..} if prs[0].acknowledged.is_none())
     );
-    for (notice, expected_ack) in [(old_notice, None), (new_notice, Some(pr.update_id.clone()))] {
+    for (notice, expected_ack, reveal) in [
+        (old_notice.clone(), None, false),
+        (old_notice, None, true),
+        (new_notice, Some(pr.update_id.clone()), true),
+    ] {
         worker
             .sender
             .send(Command::NotificationAction {
                 id: notice.clone(),
                 open: false,
+                reveal,
             })
             .unwrap();
         // Acknowledge must dismiss the selected notice without emitting an Open event.
@@ -126,10 +132,61 @@ fn notification_actions_acknowledge_only_their_update_and_open_waits_for_browser
         assert!(
             matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), UiEvent::Updated {prs,..} if prs[0].acknowledged==expected_ack)
         );
+        if reveal {
+            assert!(
+                matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), UiEvent::ShowPopover {pr: Some(id)} if id=="PR_1")
+            );
+        }
     }
     drop(worker);
     assert_eq!(
         Store::open(directory.path()).unwrap().load().unwrap()[0].acknowledged,
         Some(pr.update_id)
     );
+}
+
+#[test]
+fn notification_without_a_saved_target_still_opens_the_popover() {
+    let directory = tempfile::tempdir().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let worker = worker::start(
+        directory.path().into(),
+        Config {
+            gh_path: Some(directory.path().join("missing-gh")),
+            ..Default::default()
+        },
+        Arc::new(move |event| {
+            let _ = tx.send(event);
+        }),
+    )
+    .unwrap();
+    loop {
+        if matches!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            UiEvent::Updated {
+                error: Some(_),
+                loading: false,
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+    worker
+        .sender
+        .send(Command::NotificationAction {
+            id: "service-error".into(),
+            open: false,
+            reveal: true,
+        })
+        .unwrap();
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        UiEvent::Updated { .. }
+    ));
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        UiEvent::ShowPopover { pr: None }
+    ));
+    drop(worker);
 }

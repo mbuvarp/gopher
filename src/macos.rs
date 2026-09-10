@@ -68,7 +68,11 @@ fn notification_command(action: &str, id: String) -> Option<Command> {
         OPEN_PR_ACTION => true,
         _ => return None,
     };
-    Some(Command::NotificationAction { id, open })
+    Some(Command::NotificationAction {
+        id,
+        open,
+        reveal: action == "com.apple.UNNotificationDefaultActionIdentifier",
+    })
 }
 
 fn review_category() -> Retained<UNNotificationCategory> {
@@ -362,6 +366,7 @@ pub fn run(
     let proxy = event_loop.create_proxy();
     let mut exit_reason = "event_loop_returned";
     let mut startup_error = None;
+    let mut pending_reveal: Option<Option<String>> = None;
     event_loop.run_return(|event,_,flow| {
         *flow=ControlFlow::Wait;
         let mut rebuild=false;
@@ -397,6 +402,11 @@ pub fn run(
                 UiEvent::LabelRequestHandled=>{popover.label_request_handled();rebuild=true;}
                 UiEvent::IgnoredUpdated{prs:updated,error,loading}=>{ignored_prs=updated;ignored_error=error;ignored_loading=loading;rebuild=true;}
                 UiEvent::Updated{prs:updated,error,loading}=>{prs=updated;service_error=error;refreshing=loading;rebuild=true;}
+                UiEvent::ShowPopover{pr}=>{
+                    pending_reveal=Some(pr);
+                    if let Some(tray)=&tray {popover.show(tray);}
+                    rebuild=true;
+                }
                 UiEvent::Open{url,pr,update}=>{match open_and_acknowledge(&url,&pr,&update,&sender,open_url){
                     Ok(())=>{}
                     Err(e)=>{ui_error=Some(e.to_string());rebuild=true;}
@@ -492,6 +502,11 @@ pub fn run(
                 }
             }
             _=>(),
+        }
+        if pending_reveal.is_some() && tray.is_some() && popover.prepare_notification_reveal() {
+            popover.scroll_to_pr(pending_reveal.take().flatten());
+            if let Some(tray)=&tray {popover.show(tray);}
+            rebuild=true;
         }
         if rebuild {
             if popover.is_showing_ignored() {
@@ -1049,18 +1064,22 @@ mod tests {
     }
 
     #[test]
-    fn notification_actions_route_default_click_to_acknowledge() {
-        for action in [
-            "com.apple.UNNotificationDefaultActionIdentifier",
-            ACKNOWLEDGE_ACTION,
+    fn notification_actions_reveal_only_for_body_clicks() {
+        for (action, expected_reveal) in [
+            ("com.apple.UNNotificationDefaultActionIdentifier", true),
+            (ACKNOWLEDGE_ACTION, false),
         ] {
             assert!(
-                matches!(notification_command(action, "notice".into()), Some(Command::NotificationAction {id,open:false}) if id=="notice")
+                matches!(notification_command(action, "notice".into()), Some(Command::NotificationAction {id,open:false,reveal}) if id=="notice" && reveal==expected_reveal)
             );
         }
         assert!(matches!(
             notification_command(OPEN_PR_ACTION, "notice".into()),
-            Some(Command::NotificationAction { open: true, .. })
+            Some(Command::NotificationAction {
+                open: true,
+                reveal: false,
+                ..
+            })
         ));
         for action in [
             "com.apple.UNNotificationDismissActionIdentifier",

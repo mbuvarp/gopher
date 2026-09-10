@@ -38,6 +38,10 @@ pub enum UiEvent {
         body: String,
     },
     DismissNotifications(Vec<String>),
+    /// Sent after Updated so notification navigation sees persisted acknowledgement state.
+    ShowPopover {
+        pr: Option<String>,
+    },
     Open {
         url: String,
         pr: String,
@@ -66,6 +70,7 @@ pub enum Command {
     NotificationAction {
         id: String,
         open: bool,
+        reveal: bool,
     },
     NotificationDelivered(String),
     NotificationFailed(String),
@@ -267,6 +272,7 @@ async fn run(
                 continue;
             }
         };
+        let mut reveal_target = None;
         match command {
             Command::LabelSaved {
                 pr: id,
@@ -432,8 +438,12 @@ async fn run(
                     });
                 }
             }
-            Command::NotificationAction { id, open } => {
-                if let Some((pr, update, url)) = store.notification_target(&id)? {
+            Command::NotificationAction { id, open, reveal } => {
+                let target = store.notification_target(&id)?;
+                if reveal {
+                    reveal_target = Some(target.as_ref().map(|(pr, _, _)| pr.clone()));
+                }
+                if let Some((pr, update, url)) = target {
                     if open {
                         sink(UiEvent::Open { url, pr, update });
                     } else {
@@ -445,7 +455,7 @@ async fn run(
                         }
                         sink(UiEvent::DismissNotifications(vec![id.clone()]));
                     }
-                    tracing::info!(event="notification_action", notification=%id, open);
+                    tracing::info!(event="notification_action", notification=%id, open, reveal);
                 }
             }
             Command::NotificationDelivered(id) => {
@@ -613,6 +623,9 @@ async fn run(
             error: error.clone(),
             loading: polling,
         });
+        if let Some(pr) = reveal_target {
+            sink(UiEvent::ShowPopover { pr });
+        }
     }
     tracing::info!(event = "worker_stopped");
     Ok(())
@@ -812,6 +825,7 @@ esac
             .send(Command::NotificationAction {
                 id: notification,
                 open: false,
+                reveal: false,
             })
             .unwrap();
         assert!(
