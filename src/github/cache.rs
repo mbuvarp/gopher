@@ -150,7 +150,8 @@ impl ApiState {
             );
         }
         let now = chrono::Utc::now().timestamp().max(0) as u64;
-        if number("x-ratelimit-remaining") == Some(0) {
+        let primary = number("x-ratelimit-remaining") == Some(0);
+        if primary {
             let seconds = number("x-ratelimit-reset")
                 .map(|v| v.saturating_sub(now).saturating_add(1))
                 .unwrap_or(60);
@@ -160,7 +161,8 @@ impl ApiState {
             self.secondary_failures = 0;
         }
         if limited {
-            // Prefer Retry-After; primary limits also retain their resource reset above.
+            // Honor both deadlines without promoting a primary quota into a
+            // shared secondary limit when GitHub also supplies Retry-After.
             let seconds = number("retry-after").or_else(|| {
                 headers
                     .get("retry-after")
@@ -172,8 +174,13 @@ impl ApiState {
                     })
             });
             if let Some(seconds) = seconds {
-                self.block("secondary", seconds.max(1));
-            } else if number("x-ratelimit-remaining") != Some(0) {
+                let scope = if primary {
+                    actual_resource
+                } else {
+                    "secondary"
+                };
+                self.block(scope, seconds.max(1));
+            } else if !primary {
                 self.secondary_failures = self.secondary_failures.saturating_add(1);
                 self.block(
                     "secondary",
@@ -282,6 +289,50 @@ mod tests {
         state.put(&key, None, b"[]");
         assert!(state.get(&key).is_none());
         assert_eq!(state.bytes, 0);
+    }
+
+    #[test]
+    fn primary_retry_after_preserves_resource_isolation_and_the_longer_deadline() {
+        let now = chrono::Utc::now();
+        for (resource, other) in [("core", "graphql"), ("graphql", "core")] {
+            for (retry_after, seconds) in [
+                ("120".to_owned(), 120),
+                ("1200".to_owned(), 1200),
+                ((now + chrono::Duration::seconds(1200)).to_rfc2822(), 1200),
+            ] {
+                let mut state = ApiState::default();
+                state.observe(
+                    &BTreeMap::from([
+                        ("x-ratelimit-resource".into(), resource.into()),
+                        ("x-ratelimit-remaining".into(), "0".into()),
+                        (
+                            "x-ratelimit-reset".into(),
+                            (now.timestamp() + 600).to_string(),
+                        ),
+                        ("retry-after".into(), retry_after),
+                    ]),
+                    resource,
+                    true,
+                );
+                assert!(state.delay(Some(resource)) >= Duration::from_secs(seconds.max(600) - 2));
+                assert!(state.delay(Some(other)).is_zero());
+                assert!(!state.blocked.contains_key("secondary"));
+                assert_eq!(state.secondary_failures, 0);
+            }
+        }
+        // Secondary limits must still pause both resources.
+        let mut state = ApiState::default();
+        state.observe(
+            &BTreeMap::from([
+                ("x-ratelimit-remaining".into(), "100".into()),
+                ("retry-after".into(), "120".into()),
+            ]),
+            "core",
+            true,
+        );
+        for resource in ["core", "graphql"] {
+            assert!(state.delay(Some(resource)) >= Duration::from_secs(119));
+        }
     }
 
     #[test]
