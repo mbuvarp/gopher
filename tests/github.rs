@@ -411,6 +411,74 @@ exit 1
 }
 
 #[tokio::test]
+async fn service_unavailable_retry_after_pauses_both_resources_and_other_clients() {
+    for (retry_after, exhausted) in [
+        (Some("180".to_string()), false),
+        (
+            Some((chrono::Utc::now() + chrono::Duration::seconds(180)).to_rfc2822()),
+            false,
+        ),
+        (Some("180".to_string()), true),
+        (None, false),
+    ] {
+        let header = retry_after
+            .as_ref()
+            .map(|value| format!("Retry-After: {value}\r\n"))
+            .unwrap_or_default();
+        let quota = if exhausted {
+            "X-RateLimit-Remaining: 0\r\nX-RateLimit-Resource: graphql\r\n"
+        } else {
+            ""
+        };
+        let (dir, github) = mock(&format!(
+            r#"
+cat >/dev/null
+printf 'call\n' >> "$(dirname "$0")/calls"
+printf 'HTTP/2.0 503 Service Unavailable\r\n{header}{quota}\r\n{{"message":"Service unavailable"}}'
+echo 'HTTP 503 SECRET' >&2
+exit 1
+"#
+        ));
+        let error = github.viewer().await.unwrap_err().to_string();
+        assert!(error.contains("server error"));
+        assert!(!error.contains("SECRET"));
+        let config = Config {
+            gh_path: Some(dir.path().join("gh")),
+            ..Default::default()
+        };
+        for resource in ["core", "graphql"] {
+            let delay = Github::cooldown(&config, Some(resource));
+            if retry_after.is_some() {
+                assert!(delay >= std::time::Duration::from_secs(175));
+            } else {
+                assert!(delay.is_zero());
+            }
+        }
+        let next = Github::new(&config).unwrap();
+        assert!(next.viewer().await.is_err());
+        assert!(next.repository_labels("owner/repo").await.is_err());
+        assert!(
+            next.merge_pr(
+                &gopher::github::PrRef {
+                    id: "PR_1".into(),
+                    repo: "owner/repo".into(),
+                    number: 1
+                },
+                "head",
+                gopher::actions::MergeMethod::Merge,
+            )
+            .await
+            .is_err()
+        );
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        assert_eq!(
+            calls.lines().count(),
+            if retry_after.is_some() { 1 } else { 4 }
+        );
+    }
+}
+
+#[tokio::test]
 async fn graphql_primary_limit_in_a_successful_http_response_still_pauses_requests() {
     let reset = chrono::Utc::now().timestamp() + 600;
     let (dir, github) = mock(&format!(

@@ -11,6 +11,20 @@ pub(super) struct ApiState {
     blocked: BTreeMap<String, Instant>,
     secondary_failures: u32,
 }
+fn retry_after(headers: &BTreeMap<String, String>) -> Option<u64> {
+    let value = headers.get("retry-after")?;
+    value.parse().ok().or_else(|| {
+        chrono::DateTime::parse_from_rfc2822(value)
+            .ok()
+            .map(|date| {
+                date.timestamp()
+                    .saturating_sub(chrono::Utc::now().timestamp())
+                    .saturating_add(1)
+                    .max(0) as u64
+            })
+    })
+}
+
 #[derive(Clone)]
 pub(super) struct Cached {
     pub etag: String,
@@ -163,17 +177,7 @@ impl ApiState {
         if limited {
             // Honor both deadlines without promoting a primary quota into a
             // shared secondary limit when GitHub also supplies Retry-After.
-            let seconds = number("retry-after").or_else(|| {
-                headers
-                    .get("retry-after")
-                    .and_then(|v| chrono::DateTime::parse_from_rfc2822(v).ok())
-                    .map(|v| {
-                        (v.timestamp().max(0) as u64)
-                            .saturating_sub(now)
-                            .saturating_add(1)
-                    })
-            });
-            if let Some(seconds) = seconds {
+            if let Some(seconds) = retry_after(headers) {
                 let scope = if primary {
                     actual_resource
                 } else {
@@ -187,6 +191,12 @@ impl ApiState {
                     60 * 2u64.pow(self.secondary_failures.min(5) - 1),
                 );
             }
+        }
+    }
+    pub fn observe_service_retry(&mut self, headers: &BTreeMap<String, String>) {
+        // An outage applies across resources even if quota headers are also present.
+        if let Some(seconds) = retry_after(headers) {
+            self.block("secondary", seconds.max(1));
         }
     }
     fn block(&mut self, resource: &str, seconds: u64) {
@@ -372,6 +382,73 @@ mod tests {
 mod head_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn final_heads_refresh_credentials_before_each_batch() {
+        for switch_before_check in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("gh");
+            let account = dir.path().join("account");
+            let ids: Vec<_> = (0..51).map(|i| format!("PR_{i}")).collect();
+            let nodes = |ids: &[String]| {
+                serde_json::to_string(
+                    &ids.iter()
+                        .map(|id| json!({"id":id,"headRefOid":"head","state":"OPEN"}))
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap()
+            };
+            let first = nodes(&ids[..50]);
+            let last = nodes(&ids[50..]);
+            std::fs::write(
+                &path,
+                format!(
+                    r#"#!/bin/sh
+set -eu
+if [ "$1" = auth ]; then cat "$(dirname "$0")/account"; exit 0; fi
+input=$(cat)
+echo "$GH_TOKEN" >> "$(dirname "$0")/calls"
+nodes='[]'
+case "$input" in
+    *PollHeads*)
+        case "$input" in *'"PR_50"'*) nodes='{last}';; *) nodes='{first}';; esac
+        echo beta > "$(dirname "$0")/account"
+        ;;
+esac
+printf '{{"data":{{"viewer":{{"login":"%s"}},"nodes":%s}}}}' "$GH_TOKEN" "$nodes"
+"#
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(&account, "alpha").unwrap();
+            let gh = Github::new(&Config {
+                gh_path: Some(path),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(gh.viewer().await.unwrap(), "alpha");
+            if switch_before_check {
+                std::fs::write(&account, "beta").unwrap();
+            }
+            assert!(
+                gh.final_heads(&ids, "alpha")
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("account changed")
+            );
+            let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+            assert_eq!(
+                calls,
+                if switch_before_check {
+                    "alpha\nbeta\n"
+                } else {
+                    "alpha\nalpha\nbeta\n"
+                }
+            );
+        }
+    }
 
     #[tokio::test]
     async fn final_heads_are_batched_and_reject_missing_or_changed_accounts() {

@@ -172,7 +172,15 @@ impl Github {
                             })
                         })
                 });
-            api.lock().unwrap().observe(&headers, resource, limited);
+            // Service-unavailable responses can also ask all requests to wait.
+            // Preserve the service error below instead of calling it a quota error.
+            {
+                let mut state = api.lock().unwrap();
+                state.observe(&headers, resource, limited);
+                if status == 503 {
+                    state.observe_service_retry(&headers);
+                }
+            }
             if limited {
                 bail!("GitHub rate limit reached; requests paused until the quota cooldown ends");
             }
@@ -417,6 +425,9 @@ impl Github {
     ) -> Result<BTreeMap<String, (String, bool)>> {
         let mut heads = BTreeMap::new();
         for batch in ids.chunks(50) {
+            // A poll may span a local `gh auth switch`. Recheck credentials for
+            // each batch so its viewer reflects the currently selected account.
+            self.refresh_credentials().await?;
             let data = self.graphql("query PollHeads($ids:[ID!]!){viewer{login} nodes(ids:$ids){... on PullRequest{id headRefOid state}}}", json!({"ids":batch})).await?;
             ensure!(
                 required(&data["viewer"], "login")? == viewer,
