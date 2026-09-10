@@ -74,7 +74,7 @@ Keep reviewer detection in separate modules. Treat these observed conventions as
 - Use `state.sqlite3` via `rusqlite` for cached PR data, reviewer evidence/runs, update identifiers, acknowledgements, ignored PR IDs, and notification history. GitHub remains authoritative; show restored data as stale until refreshed.
 - Keep optional settings in `config.toml`.
 - Write structured JSONL logs to `logs/gopher.jsonl` using `tracing`, retaining at most **10,000 lines across retained logs**. Bound individual entry sizes and safely replace files when trimming.
-- Log request timing/failures, detection evidence, state transitions, notifications, and acknowledgements with timestamps, severity, and PR/reviewer identifiers. Exclude credentials and full API responses by default.
+- Log request timing/failures, detection evidence, state transitions, notifications, and acknowledgements with timestamps, severity, and PR/reviewer identifiers. Exclude credentials and full API responses by default. Log allowlisted request-failure reasons without raw CLI stderr; distinguish TLS handshake timeouts from certificate verification failures and Gopher process timeouts. Timeout messages must not suggest a certificate failure.
 - Keep lifecycle diagnostics independent of log filters, with bounded waits for durable writes. Record Rust panics and orderly quits/signals. Maintain `session.json` only under the app instance lock, completing it explicitly after shutdown; report incomplete previous sessions without inventing a cause. CLI diagnostics must not alter it. Test crashes and signals in isolated subprocesses.
 
 ## Development guidance

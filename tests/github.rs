@@ -111,6 +111,64 @@ async fn authentication_failure_is_actionable_and_does_not_leak_stderr() {
     assert!(!error.contains("SECRET"));
 }
 #[tokio::test]
+async fn tls_failure_diagnostics_are_specific_and_do_not_leak_stderr() {
+    use tracing::instrument::WithSubscriber;
+    // Keep tracing's process-wide callsite cache independent of concurrent tests
+    // that make the same requests without a subscriber.
+    if std::env::var_os("GOPHER_TEST_TLS_LOG_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tls_failure_diagnostics_are_specific_and_do_not_leak_stderr",
+                "--nocapture",
+            ])
+            .env("GOPHER_TEST_TLS_LOG_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for (stderr, reason, expected_message) in [
+        (
+            "net/http: TLS handshake timeout SECRET_TOKEN",
+            "tls_handshake_timeout",
+            "GitHub secure connection timed out; try again shortly.",
+        ),
+        (
+            "tls: failed to verify certificate: x509: certificate signed by unknown authority SECRET_TOKEN",
+            "certificate_verification_failed",
+            "GitHub certificate verification failed; check certificate and network settings.",
+        ),
+    ] {
+        let (_dir, gh) = mock(&format!("cat >/dev/null\necho '{stderr}' >&2\nexit 1"));
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        let error = gh.viewer().with_subscriber(subscriber).await.unwrap_err();
+        assert_eq!(error.to_string(), expected_message);
+        let output = std::fs::read_to_string(log.path()).unwrap();
+        assert!(!output.contains("SECRET_TOKEN"));
+        let events: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let failure = events
+            .iter()
+            .find(|event| event["fields"]["event"] == "github_request_failed")
+            .unwrap();
+        assert_eq!(failure["fields"]["reason"], reason);
+    }
+}
+#[tokio::test]
 async fn refuses_partial_graphql_data() {
     let (_dir, gh) = mock(
         "cat >/dev/null\necho '{\"data\":{\"viewer\":{\"login\":\"someone\"}},\"errors\":[{\"message\":\"Partial\"}]}'",
