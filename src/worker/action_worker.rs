@@ -18,6 +18,8 @@ use tokio::sync::mpsc::UnboundedSender;
 #[cfg(all(test, unix))]
 mod tests;
 
+mod catalogues;
+
 pub enum ActionCommand {
     Request(Request),
     Tick {
@@ -28,7 +30,7 @@ pub enum ActionCommand {
     MergeChecked {
         pr: String,
         token: u64,
-        result: Result<Box<Snapshot>, String>,
+        result: Result<(Box<Snapshot>, Github), String>,
     },
     Merged {
         pr: String,
@@ -36,14 +38,14 @@ pub enum ActionCommand {
         result: Result<(), String>,
     },
     LabelsLoaded {
-        pr: String,
+        repo: String,
         token: u64,
-        result: Result<Vec<Label>, String>,
+        result: Result<Vec<crate::model::PrLabel>, String>,
     },
     LabelChecked {
         pr: String,
         token: u64,
-        result: Result<(), String>,
+        result: Result<Github, String>,
     },
     LabelDone {
         pr: String,
@@ -104,6 +106,10 @@ pub(super) struct Coordinator {
     sequence: u64,
     merges: BTreeMap<String, Intent>,
     loads: BTreeMap<String, u64>,
+    catalogues: BTreeMap<String, LabelCatalogue>,
+    attempts: BTreeMap<String, std::time::Instant>,
+    load_errors: BTreeMap<String, String>,
+    completed_labels: BTreeMap<(String, String), bool>,
     label_jobs: BTreeMap<String, VecDeque<LabelJob>>,
 }
 impl Coordinator {
@@ -117,6 +123,10 @@ impl Coordinator {
             sequence: 0,
             merges: BTreeMap::new(),
             loads: BTreeMap::new(),
+            catalogues: store.label_catalogues(store.viewer()?.as_deref().unwrap_or(""))?,
+            attempts: BTreeMap::new(),
+            load_errors: BTreeMap::new(),
+            completed_labels: BTreeMap::new(),
             label_jobs: BTreeMap::new(),
         })
     }
@@ -153,14 +163,27 @@ impl Coordinator {
             self.viewer = context.viewer.map(str::to_owned);
             self.merges.clear();
             self.loads.clear();
+            self.attempts.clear();
+            self.load_errors.clear();
+            self.completed_labels.clear();
+            self.catalogues = context
+                .viewer
+                .and_then(|viewer| match context.store.label_catalogues(viewer) {
+                    Ok(catalogues) => Some(catalogues),
+                    Err(error) => {
+                        tracing::warn!(event="label_cache_read_failed",error=%error);
+                        None
+                    }
+                })
+                .unwrap_or_default();
             self.label_jobs.clear();
             self.state.merges.clear();
             self.state.labels.clear();
             if changed {
                 self.publish(context);
             }
-            return;
         }
+        self.sync_labels(context);
         let cancelled = self
             .merges
             .iter()
@@ -209,11 +232,11 @@ impl Coordinator {
             }
             ActionCommand::MergeChecked { pr, token, result } => {
                 if let Some(intent) = self.merges.get(&pr).filter(|i| i.token == token).cloned() {
-                    let checked = result.and_then(|snapshot| {
+                    let checked = result.and_then(|(snapshot, github)| {
                         let expected = context.config.repositories.get(&snapshot.repo).and_then(|r| r.reviewers.as_deref());
                         let fresh = transition(*snapshot, Some(&intent.pr), expected, chrono::Utc::now().timestamp(), context.config.settle_seconds);
                         if intent.valid(context, &self.state, Kind::Merge) && intent.preferences.allows(Kind::Merge, &fresh) && fresh.snapshot.head == intent.pr.snapshot.head && fresh.update_id == intent.pr.update_id {
-                            Ok(())
+                            Ok(github)
                         } else { Err("Merge cancelled: the commit, review state, or action settings changed.".into()) }
                     });
                     match checked {
@@ -221,13 +244,11 @@ impl Coordinator {
                             self.merges.remove(&pr);
                             self.state.merges.insert(pr, MergeProgress::Failed(error));
                         }
-                        Ok(()) => {
+                        Ok(github) => {
                             self.state.merges.insert(pr.clone(), MergeProgress::Merging);
-                            let config = context.config.clone();
                             let sender = context.sender.clone();
                             tokio::spawn(async move {
                                 let result = async {
-                                    let github = Github::new(&config)?;
                                     // All read requests finish before MergeChecked.
                                     // The worker's final validation authorizes submission;
                                     // do not add another await before the merge request.
@@ -267,19 +288,39 @@ impl Coordinator {
                     }
                 }
             }
-            ActionCommand::LabelsLoaded { pr, token, result } => {
-                if self.loads.get(&pr) == Some(&token) {
-                    self.loads.remove(&pr);
-                    let labels = self.state.labels.entry(pr).or_default();
-                    labels.loading = false;
+            ActionCommand::LabelsLoaded {
+                repo,
+                token,
+                result,
+            } => {
+                if self.loads.get(&repo) == Some(&token) && self.viewer.as_deref() == context.viewer
+                {
+                    self.loads.remove(&repo);
                     match result {
-                        Ok(items) => {
-                            labels.items = items;
-                            labels.error = None;
+                        Ok(labels) => {
+                            let catalogue = LabelCatalogue {
+                                labels,
+                                fetched_at: chrono::Utc::now().timestamp(),
+                            };
+                            if let Some(viewer) = context.viewer
+                                && let Err(error) = context
+                                    .store
+                                    .save_label_catalogue(viewer, &repo, &catalogue)
+                            {
+                                tracing::warn!(event="label_cache_save_failed",repo=%repo,error=%error);
+                                self.load_errors.insert(
+                                    repo.clone(),
+                                    format!("Could not save label cache: {error}"),
+                                );
+                            } else {
+                                self.load_errors.remove(&repo);
+                            }
+                            tracing::info!(event="repository_labels_refreshed",repo=%repo,count=catalogue.labels.len());
+                            self.catalogues.insert(repo, catalogue);
                         }
                         Err(error) => {
-                            tracing::warn!(event="labels_load_failed", error=%error);
-                            labels.error = Some(error);
+                            tracing::warn!(event="labels_load_failed",repo=%repo,error=%error);
+                            self.load_errors.insert(repo, error);
                         }
                     }
                 }
@@ -294,19 +335,17 @@ impl Coordinator {
                 {
                     match result {
                         Err(error) => self.finish_label(&pr, token, Err(error), context),
-                        Ok(()) if !job.intent.valid(context, &self.state, Kind::Label) => self
+                        Ok(_) if !job.intent.valid(context, &self.state, Kind::Label) => self
                             .finish_label(
                                 &pr,
                                 token,
                                 Err("Label action cancelled: PR or settings changed.".into()),
                                 context,
                             ),
-                        Ok(()) => {
-                            let config = context.config.clone();
+                        Ok(github) => {
                             let sender = context.sender.clone();
                             tokio::spawn(async move {
                                 let result = async {
-                                    let github = Github::new(&config)?;
                                     // Authentication finished before LabelChecked; submit
                                     // directly after the worker revalidates the intent.
                                     github
@@ -388,38 +427,7 @@ impl Coordinator {
             }
             Request::LoadLabels(pr) => {
                 let intent = self.intent(&pr, Kind::Label, context)?;
-                if self.loads.contains_key(&pr)
-                    || self
-                        .label_jobs
-                        .get(&pr)
-                        .is_some_and(|jobs| !jobs.is_empty())
-                {
-                    return Ok(());
-                }
-                let token = intent.token;
-                self.loads.insert(pr.clone(), token);
-                let labels = self.state.labels.entry(pr.clone()).or_default();
-                labels.loading = true;
-                labels.error = None;
-                let config = context.config.clone();
-                let sender = context.sender.clone();
-                tokio::spawn(async move {
-                    let result = async {
-                        let github = Github::new(&config)?;
-                        ensure!(
-                            github.viewer().await? == intent.viewer,
-                            "GitHub account changed"
-                        );
-                        github.labels(&intent.reference()).await
-                    }
-                    .await
-                    .map_err(|e: anyhow::Error| e.to_string());
-                    let _ = sender.send(Command::PrAction(ActionCommand::LabelsLoaded {
-                        pr,
-                        token,
-                        result,
-                    }));
-                });
+                self.refresh_catalogues(context, Some(&intent.pr.snapshot.repo));
             }
             Request::Label { pr, name, selected } => {
                 let intent = self.intent(&pr, Kind::Label, context)?;
@@ -429,7 +437,7 @@ impl Coordinator {
                     .get_mut(&pr)
                     .context("Load the PR labels first")?;
                 ensure!(
-                    !labels.loading && !labels.pending.contains(&name),
+                    !labels.pending.contains(&name),
                     "Label update already pending"
                 );
                 let label = labels
@@ -481,7 +489,7 @@ impl Coordinator {
                     github.viewer().await? == intent.viewer,
                     "GitHub account changed; merge cancelled"
                 );
-                Ok(Box::new(snapshot))
+                Ok((Box::new(snapshot), github))
             }
             .await
             .map_err(|e: anyhow::Error| e.to_string());
@@ -514,11 +522,12 @@ impl Coordinator {
         }
         tokio::spawn(async move {
             let result = async {
+                let github = Github::new(&config)?;
                 ensure!(
-                    Github::new(&config)?.viewer().await? == job.intent.viewer,
+                    github.viewer().await? == job.intent.viewer,
                     "GitHub account changed; label action cancelled"
                 );
-                Ok(())
+                Ok(github)
             }
             .await
             .map_err(|e: anyhow::Error| e.to_string());
@@ -552,6 +561,8 @@ impl Coordinator {
                 tracing::warn!(event="label_update_failed", pr_id=%pr, error=%error);
                 labels.error = Some(error);
             } else {
+                self.completed_labels
+                    .insert((pr.into(), job.name.clone()), job.selected);
                 tracing::info!(event="label_updated", pr_id=%pr, label=%job.name, selected=job.selected);
                 if let Some(label) = labels.items.iter().find(|label| label.name == job.name) {
                     let _ = context.sender.send(Command::LabelSaved {

@@ -157,10 +157,12 @@ pub struct Label {
     pub color: String,
     pub selected: bool,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Labels {
     pub items: Vec<Label>,
     pub loading: bool,
+    pub catalogue_ready: bool,
+    pub catalogue_error: Option<String>,
     pub pending: BTreeSet<String>,
     pub error: Option<String>,
 }
@@ -203,4 +205,10 @@ impl ActionState {
             .cloned()
             .unwrap_or_default()
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LabelCatalogue {
+    pub labels: Vec<crate::model::PrLabel>,
+    pub fetched_at: i64,
 }

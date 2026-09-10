@@ -25,6 +25,7 @@ case "$input" in *viewer*) echo '{"data":{"viewer":{"login":"test"}}}'; exit 0;;
 "#,
         );
         std::fs::write(&gh, format!(r#"#!/bin/sh
+if [ "$1" = auth ]; then echo test-credential; exit 0; fi
 case "$*" in
  *'--method PUT'*) cat > "$(dirname "$0")/merge.json"; echo '{{"merged":true}}'; exit 0;;
  *'--method POST'*|*'--method DELETE'*) printf '%s\n' "$*" >> "$(dirname "$0")/labels.log"; cat >/dev/null; echo '[]'; exit 0;;
@@ -226,7 +227,7 @@ async fn fresh_validation_cannot_merge_a_changed_head_or_a_closed_pr() {
         h.handle(ActionCommand::MergeChecked {
             pr: "PR_1".into(),
             token,
-            result: Ok(Box::new(snapshot)),
+            result: Ok((Box::new(snapshot), Github::new(&h.config).unwrap())),
         });
         assert!(matches!(
             h.coordinator.state.merges["PR_1"],
@@ -239,6 +240,15 @@ async fn fresh_validation_cannot_merge_a_changed_head_or_a_closed_pr() {
 #[tokio::test]
 async fn label_toggles_are_queued_and_results_only_change_the_requested_label() {
     let mut h = Harness::new();
+    h.prs
+        .get_mut("PR_1")
+        .unwrap()
+        .snapshot
+        .labels
+        .push(crate::model::PrLabel {
+            name: "second".into(),
+            color: "00ff00".into(),
+        });
     h.coordinator.state.labels.insert(
         "PR_1".into(),
         Labels {
@@ -412,7 +422,7 @@ async fn always_merge_rejects_changed_evidence_in_cache_or_final_snapshot() {
         h.handle(ActionCommand::MergeChecked {
             pr: "PR_1".into(),
             token,
-            result: Ok(Box::new(snapshot)),
+            result: Ok((Box::new(snapshot), Github::new(&h.config).unwrap())),
         });
         assert!(matches!(
             h.coordinator.state.merges["PR_1"],
@@ -564,4 +574,226 @@ async fn label_receipt_follows_pending_or_rejected_action_state() {
             assert!(state.error.is_some());
         }
     }
+}
+
+impl Harness {
+    fn sync_labels(&mut self) {
+        self.coordinator.reconcile(&Context {
+            store: &self.store,
+            prs: &self.prs,
+            viewer: Some(self.viewer),
+            config: &self.config,
+            sender: &self.sender,
+            sink: &self.sink,
+        });
+    }
+    fn refresh_catalogues(&mut self) {
+        self.coordinator.refresh_catalogues(
+            &Context {
+                store: &self.store,
+                prs: &self.prs,
+                viewer: Some(self.viewer),
+                config: &self.config,
+                sender: &self.sender,
+                sink: &self.sink,
+            },
+            None,
+        );
+    }
+}
+
+fn catalogue(names: &[&str]) -> LabelCatalogue {
+    LabelCatalogue {
+        labels: names
+            .iter()
+            .map(|name| crate::model::PrLabel {
+                name: (*name).into(),
+                color: "112233".into(),
+            })
+            .collect(),
+        fetched_at: chrono::Utc::now().timestamp(),
+    }
+}
+
+#[tokio::test]
+async fn catalogue_is_shared_persisted_and_refreshed_only_when_due_or_requested() {
+    let mut h = Harness::new();
+    std::fs::write(h.config.gh_path.as_ref().unwrap(), r#"#!/bin/sh
+if [ "$1" = auth ]; then echo test-credential; exit 0; fi
+case "$*" in
+  *graphql*) cat >/dev/null; echo '{"data":{"viewer":{"login":"test"}}}';;
+  *repos/owner/repo/labels*) echo fetch >> "$(dirname "$0")/catalogue.log"; echo '[{"name":"bug","color":"ff0000"}]';;
+  *) exit 1;;
+esac
+"#).unwrap();
+    let mut second = h.prs["PR_1"].clone();
+    second.snapshot.id = "PR_2".into();
+    h.prs.insert("PR_2".into(), second);
+    h.prs.get_mut("PR_1").unwrap().snapshot.labels = catalogue(&["bug"]).labels;
+    h.sync_labels();
+    assert!(h.coordinator.state.labels["PR_1"].items[0].selected);
+    assert!(!h.coordinator.state.labels["PR_1"].catalogue_ready);
+    h.refresh_catalogues();
+    let token = h.coordinator.loads["owner/repo"];
+    h.request(Request::LoadLabels("PR_2".into()));
+    assert_eq!(h.coordinator.loads["owner/repo"], token);
+    h.step().await;
+    assert!(h.coordinator.loads.is_empty());
+    assert!(h.coordinator.state.labels["PR_1"].catalogue_ready);
+    assert!(h.coordinator.state.labels["PR_1"].items[0].selected);
+    assert!(!h.coordinator.state.labels["PR_2"].items[0].selected);
+    h.refresh_catalogues();
+    assert!(h.coordinator.loads.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(h.directory.path().join("catalogue.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    h.coordinator = Coordinator::new(&h.store).unwrap();
+    assert!(h.coordinator.state.labels.is_empty());
+    h.refresh_catalogues();
+    let labels = &h.coordinator.state.labels["PR_1"];
+    assert!(labels.catalogue_ready);
+    assert!(!labels.loading);
+    assert!(labels.items[0].selected);
+    assert!(!h.coordinator.state.labels["PR_2"].items[0].selected);
+    assert!(
+        h.coordinator.loads.is_empty(),
+        "Restart must reuse a fresh persisted catalogue"
+    );
+    h.coordinator
+        .catalogues
+        .get_mut("owner/repo")
+        .unwrap()
+        .fetched_at -= 901;
+    h.refresh_catalogues();
+    h.step().await;
+    h.request(Request::LoadLabels("PR_1".into()));
+    h.step().await;
+    assert_eq!(
+        std::fs::read_to_string(h.directory.path().join("catalogue.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn catalogue_refresh_preserves_pending_toggles_and_uses_latest_snapshot_assignments() {
+    let mut h = Harness::new();
+    h.coordinator
+        .catalogues
+        .insert("owner/repo".into(), catalogue(&["bug", "ready"]));
+    h.prs.get_mut("PR_1").unwrap().snapshot.labels = catalogue(&["bug"]).labels;
+    h.sync_labels();
+    let labels = h.coordinator.state.labels.get_mut("PR_1").unwrap();
+    labels.items[0].selected = false;
+    labels.pending.insert("bug".into());
+    labels.items[1].selected = true;
+    h.coordinator
+        .completed_labels
+        .insert(("PR_1".into(), "ready".into()), true);
+    h.coordinator.loads.insert("owner/repo".into(), 42);
+    h.handle(ActionCommand::LabelsLoaded {
+        repo: "owner/repo".into(),
+        token: 42,
+        result: Ok(catalogue(&["ready", "new"]).labels),
+    });
+    let labels = &h.coordinator.state.labels["PR_1"];
+    assert!(
+        !labels
+            .items
+            .iter()
+            .find(|l| l.name == "bug")
+            .unwrap()
+            .selected
+    );
+    assert!(
+        labels
+            .items
+            .iter()
+            .find(|l| l.name == "ready")
+            .unwrap()
+            .selected
+    );
+    assert!(labels.pending.contains("bug"));
+    // Once LabelSaved updates the snapshot, subsequent polls control the selection again.
+    h.prs.get_mut("PR_1").unwrap().snapshot.labels = catalogue(&["new", "ready"]).labels;
+    h.coordinator.label_saved("PR_1", "ready");
+    h.sync_labels();
+    assert!(
+        h.coordinator.state.labels["PR_1"]
+            .items
+            .iter()
+            .find(|l| l.name == "new")
+            .unwrap()
+            .selected
+    );
+    h.prs.get_mut("PR_1").unwrap().snapshot.labels.clear();
+    h.sync_labels();
+    assert!(
+        !h.coordinator.state.labels["PR_1"]
+            .items
+            .iter()
+            .find(|l| l.name == "ready")
+            .unwrap()
+            .selected
+    );
+}
+
+#[test]
+fn catalogue_errors_keep_cached_labels_and_do_not_hide_mutation_errors() {
+    let mut h = Harness::new();
+    h.coordinator
+        .catalogues
+        .insert("owner/repo".into(), catalogue(&["bug"]));
+    h.sync_labels();
+    h.coordinator.state.labels.get_mut("PR_1").unwrap().error = Some("Mutation failed".into());
+    h.coordinator.loads.insert("owner/repo".into(), 1);
+    h.handle(ActionCommand::LabelsLoaded {
+        repo: "owner/repo".into(),
+        token: 1,
+        result: Err("Offline".into()),
+    });
+    let labels = &h.coordinator.state.labels["PR_1"];
+    assert_eq!(labels.items.len(), 1);
+    assert_eq!(labels.catalogue_error.as_deref(), Some("Offline"));
+    h.coordinator.loads.insert("owner/repo".into(), 2);
+    h.handle(ActionCommand::LabelsLoaded {
+        repo: "owner/repo".into(),
+        token: 2,
+        result: Ok(catalogue(&["bug", "ready"]).labels),
+    });
+    let labels = &h.coordinator.state.labels["PR_1"];
+    assert_eq!(labels.items.len(), 2);
+    assert!(labels.catalogue_error.is_none());
+    assert_eq!(labels.error.as_deref(), Some("Mutation failed"));
+}
+
+#[test]
+fn catalogue_cache_and_in_flight_results_are_scoped_to_account() {
+    let mut h = Harness::new();
+    h.store
+        .save_label_catalogue("test", "OWNER/REPO", &catalogue(&["private"]))
+        .unwrap();
+    h.coordinator = Coordinator::new(&h.store).unwrap();
+    h.sync_labels();
+    assert_eq!(h.coordinator.state.labels["PR_1"].items.len(), 1);
+    h.coordinator.loads.insert("owner/repo".into(), 1);
+    h.viewer = "other";
+    h.sync_labels();
+    h.handle(ActionCommand::LabelsLoaded {
+        repo: "owner/repo".into(),
+        token: 1,
+        result: Ok(catalogue(&["late"]).labels),
+    });
+    assert!(h.coordinator.state.labels["PR_1"].items.is_empty());
+    assert!(h.store.label_catalogues("other").unwrap().is_empty());
+    assert_eq!(
+        h.store.label_catalogues("test").unwrap()["owner/repo"].labels[0].name,
+        "private"
+    );
 }

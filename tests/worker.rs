@@ -190,3 +190,77 @@ fn notification_without_a_saved_target_still_opens_the_popover() {
     ));
     drop(worker);
 }
+
+#[test]
+fn first_ui_state_contains_persisted_catalogue_and_assignments_without_github() {
+    use gopher::{
+        actions::LabelCatalogue,
+        model::{PrLabel, Snapshot},
+        store::Store,
+        worker::transition,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Store::open(directory.path()).unwrap();
+    store.set_viewer("test").unwrap();
+    let bug = PrLabel {
+        name: "bug".into(),
+        color: "ff0000".into(),
+    };
+    store
+        .save_label_catalogue(
+            "test",
+            "owner/repo",
+            &LabelCatalogue {
+                labels: vec![
+                    bug.clone(),
+                    PrLabel {
+                        name: "ready".into(),
+                        color: "00ff00".into(),
+                    },
+                ],
+                fetched_at: chrono::Utc::now().timestamp(),
+            },
+        )
+        .unwrap();
+    store
+        .save(&transition(
+            Snapshot {
+                id: "PR_cached".into(),
+                repo: "owner/repo".into(),
+                number: 1,
+                open: true,
+                head: "head".into(),
+                labels: vec![bug],
+                ..Default::default()
+            },
+            None,
+            None,
+            chrono::Utc::now().timestamp(),
+            0,
+        ))
+        .unwrap();
+    drop(store);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = gopher::worker::start(
+        directory.path().into(),
+        gopher::config::Config {
+            gh_path: Some(directory.path().join("missing-gh")),
+            ..Default::default()
+        },
+        std::sync::Arc::new(move |event| {
+            let _ = tx.send(event);
+        }),
+    )
+    .unwrap();
+    let event = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    let gopher::worker::UiEvent::ActionsChanged(state) = event else {
+        panic!("Expected cached actions as the first UI event")
+    };
+    let labels = &state.labels["PR_cached"];
+    assert!(labels.catalogue_ready);
+    assert!(!labels.loading);
+    assert_eq!(labels.items.len(), 2);
+    assert!(labels.items[0].selected);
+    assert!(!labels.items[1].selected);
+    drop(worker);
+}
