@@ -100,6 +100,7 @@ esac
         self.request(Request::Merge {
             pr: "PR_1".into(),
             head: "head".into(),
+            update: self.prs["PR_1"].update_id.clone(),
         });
         self.coordinator.merges["PR_1"].token
     }
@@ -489,4 +490,40 @@ echo"#,
             1
         );
     }
+}
+
+#[tokio::test]
+async fn merge_rejects_unseen_same_head_evidence_before_starting_countdown() {
+    let mut h = Harness::new();
+    h.refresh_pr().await;
+    let displayed = h.prs["PR_1"].clone();
+    let mut changed = displayed.snapshot.clone();
+    changed.threads[0].last_comment_id = "posted-while-menu-open".into();
+    let current = transition(changed, Some(&displayed), None, 130, 0);
+    assert_ne!(current.update_id, displayed.update_id);
+    assert_eq!(current.snapshot.head, displayed.snapshot.head);
+    h.prs.insert("PR_1".into(), current);
+    h.request(Request::Merge {
+        pr: "PR_1".into(),
+        head: displayed.snapshot.head,
+        update: displayed.update_id,
+    });
+    assert!(h.coordinator.merges.is_empty());
+    assert!(h.coordinator.state.merges.is_empty());
+    assert!(
+        h.coordinator
+            .state
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("review changed")
+    );
+    h.assert_no_merge();
+    // Reopening the menu with current evidence can start a new countdown.
+    h.start_merge();
+    assert_eq!(
+        h.coordinator.state.merges["PR_1"],
+        MergeProgress::Countdown(5)
+    );
+    h.request(Request::CancelMerge("PR_1".into()));
 }

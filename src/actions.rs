@@ -140,6 +140,7 @@ pub enum Request {
     Merge {
         pr: String,
         head: String,
+        update: String,
     },
     CancelMerge(String),
     LoadLabels(String),

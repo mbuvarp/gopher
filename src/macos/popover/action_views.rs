@@ -101,6 +101,7 @@ impl PrActions {
             Some(AppEvent::PrAction(Request::Merge {
                 pr: pr.snapshot.id.clone(),
                 head: pr.snapshot.head.clone(),
+                update: pr.update_id.clone(),
             })),
             target,
         );
@@ -191,6 +192,7 @@ impl PrActions {
             AppEvent::PrAction(Request::Merge {
                 pr: pr.snapshot.id.clone(),
                 head: pr.snapshot.head.clone(),
+                update: pr.update_id.clone(),
             }),
             target,
         );

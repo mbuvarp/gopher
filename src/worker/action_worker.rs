@@ -342,7 +342,7 @@ impl Coordinator {
                 self.state.preferences.insert(repo_key(&repo), preferences);
                 tracing::info!(event="action_settings_saved", repo=%repo);
             }
-            Request::Merge { pr, head } => {
+            Request::Merge { pr, head, update } => {
                 ensure!(
                     !self.merges.contains_key(&pr),
                     "A merge is already pending for this PR"
@@ -351,6 +351,10 @@ impl Coordinator {
                 ensure!(
                     head == intent.pr.snapshot.head && !head.is_empty(),
                     "The PR commit changed; refresh before merging"
+                );
+                ensure!(
+                    update == intent.pr.update_id,
+                    "The PR review changed; refresh before merging"
                 );
                 let token = intent.token;
                 self.merges.insert(pr.clone(), intent);

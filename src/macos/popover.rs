@@ -641,13 +641,10 @@ impl ReviewPopover {
             set_text(&self.title, &detail.title());
             self.title
                 .setToolTip(Some(&NSString::from_str(&detail.title())));
-            set_text(
-                &self.summary,
-                self.action_state
-                    .error
-                    .as_deref()
-                    .unwrap_or(detail.subtitle()),
-            );
+            let message = self.action_state.error.as_deref().or(error);
+            set_text(&self.summary, message.unwrap_or(detail.subtitle()));
+            self.summary
+                .setToolTip(message.map(NSString::from_str).as_deref());
             detail.update(prs, &self.action_state, &self.target);
             return;
         }
@@ -655,6 +652,7 @@ impl ReviewPopover {
         self.title
             .setFont(Some(&NSFont::boldSystemFontOfSize(21.0)));
         self.title.setToolTip(None);
+        self.summary.setToolTip(None);
         let ignored = self.showing_ignored;
         self.refresh.setHidden(ignored);
         self.refresh.setEnabled(!loading);
