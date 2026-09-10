@@ -1,0 +1,101 @@
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Validate signed packaging only, or publish a release
+        type: choice
+        options: [validate, publish]
+        default: validate
+        required: true
+
+permissions:
+  contents: read
+concurrency:
+  group: gopher-release
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_PROMPT_DISABLED: '1'
+
+jobs:
+  build:
+    if: github.repository == 'mbuvarp/gopher' && github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    environment: release
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Validate release eligibility
+        run: python3 scripts/release.py prepare
+      - name: Set up Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup component add rustfmt clippy
+          rustup target add aarch64-apple-darwin
+      - name: Check
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Import signing credentials
+        env:
+          GOPHER_APPLE_CERTIFICATE_P12: ${{ secrets.GOPHER_APPLE_CERTIFICATE_P12 }}
+          GOPHER_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.GOPHER_APPLE_CERTIFICATE_PASSWORD }}
+          GOPHER_SPARKLE_PRIVATE_KEY: ${{ secrets.GOPHER_SPARKLE_PRIVATE_KEY }}
+        run: python3 scripts/release_signing.py setup
+      - name: Package and sign
+        env:
+          GOPHER_RELEASE_NOTES_FILE: ${{ github.workspace }}/dist/release-notes.md
+        run: |
+          sh scripts/bundle.sh --release
+          python3 scripts/release.py receipt
+      - name: Remove signing credentials
+        if: always()
+        run: python3 scripts/release_signing.py cleanup
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gopher-release-${{ github.sha }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+            dist/install.sh
+            dist/appcast.xml
+            dist/release.json
+            dist/release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+      - name: Report validation
+        run: echo 'Signed packaging validated. Publishing occurs only in publish mode.' >> "$GITHUB_STEP_SUMMARY"
+  publish:
+    needs: build
+    if: inputs.mode == 'publish'
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: gopher-release-${{ github.sha }}
+          path: dist
+      - name: Publish complete immutable release
+        run: python3 scripts/release.py publish >> "$GITHUB_STEP_SUMMARY"

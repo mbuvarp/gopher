@@ -90,14 +90,16 @@ def validate_feed(feed, archive, version):
     return signature
 
 
-def appcast(archive, version, sdk_path, destination, key_file=None):
+def appcast(archive, version, sdk_path, destination, key_file=None, notes=None):
     """Create one signed release item. GOP-4 publishes it with its immutable archive."""
     with tempfile.TemporaryDirectory(prefix="appcast-", dir=destination.parent) as temporary:
         stage = Path(temporary)
         shutil.copy2(archive, stage / archive.name)
+        if notes is not None:
+            (stage / archive.with_suffix(".md").name).write_text(notes)
         key = ["--ed-key-file", str(key_file)] if key_file else ["--account", KEY_ACCOUNT]
         subprocess.run([str(sdk_path / "bin/generate_appcast"), *key,
-                        "--maximum-deltas", "0", "--download-url-prefix",
+                        "--maximum-deltas", "0", "--embed-release-notes", "--download-url-prefix",
                         f"https://github.com/mbuvarp/gopher/releases/download/v{version}/",
                         str(stage)], check=True)
         feed = stage / "appcast.xml"
