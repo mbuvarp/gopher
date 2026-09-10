@@ -170,7 +170,9 @@ def build(release):
                     digest.update(chunk)
             checksum.write_text(f"{digest.hexdigest()}  {archive.name}\n")
             feed = stage / "appcast.xml"
-            sparkle.appcast(archive, version, sdk_path, feed, os.environ.get("GOPHER_UPDATE_KEY_FILE"))
+            notes_file = os.environ.get("GOPHER_RELEASE_NOTES_FILE")
+            notes = Path(notes_file).read_text() if notes_file else None
+            sparkle.appcast(archive, version, sdk_path, feed, os.environ.get("GOPHER_UPDATE_KEY_FILE"), notes)
             products.extend([archive, checksum, feed])
             sdk_context.cleanup()
             installer = stage / "install.sh"

@@ -12,15 +12,16 @@ is in the developer's Keychain under account `dev.mbuvarp.gopher`. Do not regene
 it during builds. Back it up securely before distributing the first release.
 For CI, export to protected secret storage and materialize a private, temporary key
 file, passing its path through `GOPHER_UPDATE_KEY_FILE`; never print the key or pass
-it as a command-line argument. Release publishing/secrets setup belongs to GOP-4.
+it as a command-line argument. See the manual release and signing-secret setup below.
 
 Packaging emits `appcast.xml` alongside the ZIP, checksum, and installer. It validates
 that the signed feed identifies the exact version, build number, URL, archive length,
 and archive signature. The feed URL is
 `https://github.com/mbuvarp/gopher/releases/latest/download/appcast.xml`, while enclosure
-URLs name immutable versions. GOP-4 must publish all assets together from a complete
-draft release. Do not edit feeds after signing or overwrite published archives. No
-delta updates are generated yet. Changelog-derived notes will be added by GOP-4.
+URLs name immutable versions. The Release workflow publishes all assets together
+from a complete draft release. Do not edit feeds after signing or overwrite published archives. No
+delta updates are generated yet. The workflow embeds changelog-derived release notes
+before the appcast is signed.
 
 ## Manual isolated validation
 
@@ -60,3 +61,59 @@ Ordinary Rust/Python checks cover release metadata, feed/archive consistency, co
 SDK rejection, incremental mutations, account changes, and draining/persisting queued
 label results during shutdown. Runtime updater failures include domain/code in JSONL;
 Sparkle's own helper diagnostics are also available in macOS Console.
+
+## Manual GitHub releases
+
+The **Release** Actions workflow is dispatched on `main`. Its default `validate`
+mode checks eligibility, runs tests, and builds/signs the release, then retains the
+outputs as a seven-day Actions artifact. It creates no Git tag or GitHub release.
+Choose `publish` explicitly to publish. Both modes require the signing secrets and
+a release-ready changelog/version; an empty `[Unreleased]` section is not enough.
+The workflow must first be merged to the default branch before it can be dispatched.
+
+Version changes remain manual. Update Cargo.toml and Cargo.lock and add exactly one
+nonempty `## [major.minor.patch] - YYYY-MM-DD` entry to CHANGELOG.md. Stable numeric
+versions must exceed every published stable release; drafts and prereleases do not
+establish that baseline. With no published releases, the current valid version can
+be the first release. API errors never count as an empty release history. Packaging's
+macOS version-component limits also apply. GOP-5 will guide version/changelog approval.
+
+All jobs check out the dispatched commit and verify it belongs to main; main advancing
+while a build runs does not change that build. Release runs are serialized. The build
+job has read-only repository access; only the separate publish job has contents-write
+permission. Signing uses the main-only `release` environment and a temporary keychain.
+Repository release immutability must remain enabled (it is configured separately).
+GitHub restricts reading that setting to administrators, so the workflow does not
+require an admin token; it verifies the published response is immutable and reports
+a failure if that confirmation is missing. The three environment secrets are:
+
+- `GOPHER_APPLE_CERTIFICATE_P12`: base64 of the selected Apple Development identity's
+  PKCS#12 export, including its private key, for the existing Gopher signing team.
+- `GOPHER_APPLE_CERTIFICATE_PASSWORD`: the export's password.
+- `GOPHER_SPARKLE_PRIVATE_KEY`: the existing base64 Sparkle key exported by
+  `generate_keys --account dev.mbuvarp.gopher -x <private-file>`.
+
+Transfer secrets directly to GitHub secret storage without printing them, putting
+private values in command arguments, or committing exported files. Do not generate a
+new Sparkle key. macOS may require user interaction to export an Apple identity.
+
+Publication creates a draft for `v<version>` at the exact commit, uploads the ZIP,
+checksum, installer, and signed appcast, and compares GitHub's uploaded asset sizes
+and SHA-256 digests with the build receipt. Changelog notes are embedded in the signed
+appcast and used as GitHub release notes. The complete draft is published as an immutable
+release and marked latest. No additional workflow approval is required after choosing
+publish. Published archives/tags cannot be replaced; fixes need another version.
+
+A failed upload leaves an unpublished draft. Rerunning the same commit/version can
+recover a draft only if it has this workflow's marker, GitHub Actions authorship, and
+matching target commit. The workflow replaces the complete expected asset set, verifies
+it, and publishes. Unknown assets, different commits, unrelated drafts, or tag collisions
+fail for manual inspection; the workflow never deletes such releases or tags. If a code
+fix changes the commit, inspect and remove the failed unpublished draft/tag manually
+before dispatching that version again. Never delete a published release to reuse its
+version. If publication's response is lost, inspect GitHub first; rerunning cannot
+modify the now-published release. Validation-only runs never change an existing draft.
+
+Before the first real publication, GOP-7 covers validation mode on GitHub and the
+colleague installation checks. Local tests use fake GitHub responses and isolated
+signed fixtures; do not publish test versions to the production release feed.

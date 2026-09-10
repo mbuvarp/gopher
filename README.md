@@ -182,5 +182,11 @@ standard update dialog. Updates wait for submitted PR actions to finish before q
 Background failures are logged without repeated alerts. Local development builds do not
 check for releases or replace themselves.
 
-Update feeds will become available when the release publishing workflow ships.
+Update feeds become available after the first release is published.
 See [update maintenance and validation](docs/updates.md) for signing and testing details.
+
+Releases are created manually through the **Release** GitHub Actions workflow on
+`main`. Start with its default **validate** mode to check signed packaging; choose
+**publish** explicitly to release. A newer Cargo version and matching nonempty
+`CHANGELOG.md` entry are required after the first release. See
+[release setup and recovery](docs/updates.md#manual-github-releases).
