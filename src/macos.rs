@@ -55,6 +55,7 @@ enum AppEvent {
     ToggleDetails(String),
     PrAction(crate::actions::Request),
     RefreshPopover,
+    Shutdown(&'static str),
 }
 
 const REVIEW_CATEGORY: &str = "gopher.review";
@@ -269,11 +270,28 @@ impl Drop for MenuObserver {
     }
 }
 
-pub fn run(directory: PathBuf, config: Config) -> Result<()> {
+pub fn run(
+    directory: PathBuf,
+    config: Config,
+    log: crate::logging::LogWriter,
+) -> Result<&'static str> {
     let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     event_loop.set_activation_policy(ActivationPolicy::Accessory);
     event_loop.set_dock_visibility(false);
     event_loop.set_activate_ignoring_other_apps(false);
+    let signal_proxy = event_loop.create_proxy();
+    let signal_log = log.clone();
+    let _signals = crate::lifecycle::ShutdownSignals::start(move |reason| {
+        if let Err(error) = signal_log.diagnostic(
+            "INFO",
+            serde_json::json!({
+                "event": "shutdown_requested", "reason": reason, "pid": std::process::id(),
+            }),
+        ) {
+            eprintln!("Gopher could not log termination signal: {error}");
+        }
+        let _ = signal_proxy.send_event(AppEvent::Shutdown(reason));
+    })?;
     let proxy = event_loop.create_proxy();
     let sink = Arc::new(move |event| {
         let _ = proxy.send_event(AppEvent::Worker(event));
@@ -342,14 +360,24 @@ pub fn run(directory: PathBuf, config: Config) -> Result<()> {
     };
     let mut pending = Vec::new();
     let proxy = event_loop.create_proxy();
+    let mut exit_reason = "event_loop_returned";
+    let mut startup_error = None;
     event_loop.run_return(|event,_,flow| {
         *flow=ControlFlow::Wait;
         let mut rebuild=false;
         match event {
+            Event::LoopDestroyed => {
+                if let Err(error)=log.diagnostic("INFO",serde_json::json!({"event":"event_loop_stopped","reason":exit_reason,"pid":std::process::id()})) {eprintln!("Gopher could not log event loop shutdown: {error}");}
+            }
+            Event::UserEvent(AppEvent::Shutdown(reason)) => {
+                exit_reason = reason;
+                let _ = sender.send(Command::Shutdown);
+                *flow = ControlFlow::Exit;
+            }
             Event::NewEvents(StartCause::Init) => {
                 match TrayIconBuilder::new().with_menu_on_left_click(false).with_tooltip("Gopher — GitHub reviews").with_icon(icon(MenuBarState::Idle)).with_icon_as_template(true).build() {
                     Ok(icon)=>{tray=Some(icon);tracing::info!(event="menu_bar_created");},
-                    Err(e)=>{eprintln!("Cannot create menu bar icon: {e}");*flow=ControlFlow::Exit;}
+                    Err(e)=>{startup_error=Some(anyhow::anyhow!("Cannot create menu bar icon: {e}"));*flow=ControlFlow::Exit;}
                 }
                 rebuild=true;
             }
@@ -452,7 +480,11 @@ pub fn run(directory: PathBuf, config: Config) -> Result<()> {
                                 }
                                 rebuild=true;
                             }
-                            Action::Quit=>{let _=sender.send(Command::Shutdown);*flow=ControlFlow::Exit;}
+                            Action::Quit=>{
+                                exit_reason="quit";
+                                if let Err(error)=log.diagnostic("INFO",serde_json::json!({"event":"shutdown_requested","reason":"quit","pid":std::process::id()})) {eprintln!("Gopher could not log quit: {error}");}
+                                let _=sender.send(Command::Shutdown);*flow=ControlFlow::Exit;
+                            }
                         }
                         Ok(())
                     })();
@@ -496,7 +528,10 @@ pub fn run(directory: PathBuf, config: Config) -> Result<()> {
     let _ = sender.send(Command::Shutdown);
     drop(menu_observer);
     drop(delegate);
-    Ok(())
+    match startup_error {
+        Some(error) => Err(error),
+        None => Ok(exit_reason),
+    }
 }
 
 fn notify(

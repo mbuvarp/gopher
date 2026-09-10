@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc::{self, SyncSender},
     thread::JoinHandle,
+    time::{Duration, Instant},
 };
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -13,6 +14,7 @@ pub const MAX_LINES: usize = 10_000;
 const MAX_BYTES: usize = 16_384;
 enum Message {
     Record(Vec<u8>),
+    Durable(Vec<u8>, SyncSender<io::Result<()>>),
     Shutdown,
 }
 #[derive(Clone)]
@@ -26,6 +28,63 @@ pub struct RecordWriter {
 pub struct LogGuard {
     sender: SyncSender<Message>,
     thread: Option<JoinHandle<()>>,
+}
+
+impl LogWriter {
+    /// Reserved for lifecycle diagnostics and panic hooks, never a signal handler.
+    /// Bypasses tracing filters and waits at most two seconds for durable storage.
+    pub fn diagnostic(&self, level: &str, mut fields: serde_json::Value) -> io::Result<()> {
+        let mut record = serde_json::json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "level": level,
+            "target": "gopher::lifecycle",
+            "fields": fields,
+        });
+        let mut bytes = serde_json::to_vec(&record)?;
+        // Preserve the event and valid JSON even for enormous panic payloads.
+        let mut limit = 2048;
+        while bytes.len() >= MAX_BYTES {
+            if let Some(values) = fields.as_object_mut() {
+                for (key, value) in values {
+                    if key != "event"
+                        && let Some(text) = value.as_str()
+                    {
+                        let mut end = text.len().min(limit);
+                        while !text.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        *value = serde_json::Value::String(text[..end].to_owned());
+                    }
+                }
+            }
+            record["fields"] = fields.clone();
+            record["fields"]["truncated"] = true.into();
+            bytes = serde_json::to_vec(&record)?;
+            if limit == 0 && bytes.len() >= MAX_BYTES {
+                return Err(io::Error::other(
+                    "Diagnostic metadata exceeds log size limit",
+                ));
+            }
+            limit /= 2;
+        }
+        bytes.push(b'\n');
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (done, receiver) = mpsc::sync_channel(1);
+        let mut message = Message::Durable(bytes, done);
+        loop {
+            match self.sender.try_send(message) {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Full(returned)) if Instant::now() < deadline => {
+                    message = returned;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return Err(io::Error::other("Diagnostic log queue unavailable")),
+            }
+        }
+        receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| io::Error::other("Diagnostic log flush did not complete"))?
+    }
 }
 
 impl<'a> MakeWriter<'a> for LogWriter {
@@ -86,6 +145,12 @@ pub fn start(directory: &Path) -> Result<(LogWriter, LogGuard)> {
             while let Ok(message) = receiver.recv() {
                 match message {
                     Message::Shutdown => break,
+                    Message::Durable(record, done) => {
+                        let result = log.append(&record).and_then(|()| {
+                            OpenOptions::new().write(true).open(&log.path)?.sync_all()
+                        });
+                        let _ = done.send(result);
+                    }
                     Message::Record(record) => {
                         if let Err(error) = log.append(&record) {
                             eprintln!("Gopher log write failed: {error}");
@@ -189,6 +254,42 @@ fn bounded_line(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostics_bypass_filters_and_flush_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let (writer, _guard) = start(dir.path()).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter("off")
+            .with_writer(writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(event = "filtered_out");
+            writer
+                .diagnostic("INFO", serde_json::json!({"event":"app_stopped"}))
+                .unwrap();
+        });
+        // Read before dropping the log guard: the diagnostic itself must flush.
+        let text = std::fs::read_to_string(dir.path().join("gopher.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        let entry: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(entry["fields"]["event"], "app_stopped");
+    }
+
+    #[test]
+    fn diagnostic_disk_errors_are_returned_to_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let (writer, _guard) = start(dir.path()).unwrap();
+        let path = dir.path().join("gopher.jsonl");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(path).unwrap();
+        assert!(
+            writer
+                .diagnostic("ERROR", serde_json::json!({"event":"rust_panic"}))
+                .is_err()
+        );
+    }
+
     #[test]
     fn bounds_and_recovers_logs() {
         let dir = tempfile::tempdir().unwrap();

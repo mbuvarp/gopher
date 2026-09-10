@@ -63,7 +63,7 @@ Clicking a review notification acknowledges its update without opening the brows
 
 Codex detection uses its bot reactions, commit-specific reviews, and persistent review summary. Cubic uses checks and explicit issue counts. CodeRabbit uses checks and explicit review verdicts. Successful checks alone do not establish approval. Unknown formats and reactions without a reliable commit association stay Unknown. Resolved threads alone do not establish a clean review.
 
-Reviewers are inferred from activity on each PR, including previously observed agents. Explicit subscription-limit or paused-review notices are shown as Skipped and excluded from automatic participation; an explicitly required reviewer that skips keeps the result Unknown. If a subscription or repository setup changes, use an explicit reviewer list. Polling can miss a complete rerun between polls, particularly one represented only by reactions; ambiguous evidence is intentionally conservative.
+Reviewers are inferred from activity on each PR, including previously observed agents. Explicit subscription-limit or paused-review notices are shown as Skipped and excluded from automatic participation; an explicitly required reviewer that skips keeps the result Unknown. If a skipped reviewer's activity disappears, its cached skip does not make it an unfinished participant; new activity brings it back. Missing results from other previously participating reviewers still block, with the historical participation explained in Details and logs. If a subscription or repository setup changes, use an explicit reviewer list. Polling can miss a complete rerun between polls, particularly one represented only by reactions; ambiguous evidence is intentionally conservative.
 
 ## Configuration and data
 
@@ -74,6 +74,7 @@ config.toml           Optional settings; restart to apply
 state.sqlite3         PR cache, review evidence, acknowledgements, ignored PRs, action settings, notification history
 logs/gopher.jsonl     Structured logs, at most 10,000 retained lines
 gopher.lock           Prevents concurrent app instances
+session.json          Last app session and completed shutdown, if recorded
 ```
 
 SQLite may also create `state.sqlite3-wal` and `state.sqlite3-shm`. GitHub remains authoritative. Cached data stays marked stale until successfully fetched. Changing the active GitHub account resets the active cache and acknowledgements; ignored PR flags, their archived details, and repository action settings persist across account changes. Pending actions are not restored after restart.
@@ -91,6 +92,10 @@ Gopher polls active PRs every 30 seconds and discovers new PRs every two minutes
 Polling uses `gh api`, fully paginates PR connections and checks, and checks that the head commit did not change during a fetch. Up to three PRs are fetched concurrently. Errors trigger bounded exponential backoff; **Refresh** retries immediately. Authentication and network errors remain visible in the inbox and produce a notification when the error changes.
 
 Logs include request timing at `debug`, reviewer evidence, state transitions, notification scheduling, and acknowledgement events. Failed requests include the request type, HTTP status when available, CLI exit code, and a classified cause; PR fetch failures include the repository and PR number. Tokens and full API responses are not logged. Individual records are limited to 16 KiB; oversized records are replaced with a diagnostic entry. The asynchronous log queue is bounded; overload drops entries with a stderr diagnostic. The SQLite cache does contain private PR content and should be treated accordingly.
+
+Lifecycle diagnostics are recorded even when the configured log level suppresses normal events: `app_started`, `shutdown_requested` (Quit, SIGTERM, or SIGINT), `event_loop_stopped`, `app_stopped`, and `app_failed`. Rust panics record their message, thread, source location, and backtrace as `rust_panic`. These diagnostics wait up to two seconds for a disk flush; long diagnostic text is truncated while preserving the event. Disk failures or a panic in the logging thread fall back to stderr.
+
+The session marker is completed only after the app returns through its shutdown path. A subsequent launch reports `previous_session_unclean` if completion was not recorded, including the previous PID and start time. This indicates an incomplete shutdown, not a proven crash or cause. Force kills and power loss cannot log at the moment they happen; native crashes may instead produce a report in `~/Library/Logs/DiagnosticReports`. The read-only `doctor` and `inspect` commands do not change the session marker.
 
 ## Diagnose and develop
 

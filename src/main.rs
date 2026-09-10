@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use gopher::{config::Config, github::Github, logging, reviewers};
+use gopher::{config::Config, github::Github, lifecycle, logging, reviewers};
 
 #[derive(Parser)]
 #[command(version, about = "GitHub agent reviews in your macOS menu bar")]
@@ -19,8 +19,8 @@ enum Commands {
 fn main() -> Result<()> {
     let args = Cli::parse();
     let directory = Config::directory()?;
-    let config = Config::load(&directory)?;
     if let Some(command) = args.command {
+        let config = Config::load(&directory)?;
         let runtime = tokio::runtime::Runtime::new()?;
         return runtime.block_on(async {
             let github=Github::new(&config)?;
@@ -49,16 +49,34 @@ fn main() -> Result<()> {
         .open(directory.join("gopher.lock"))?;
     fs2::FileExt::try_lock_exclusive(&lock).context("Gopher is already running")?;
     let (writer, _guard) = logging::start(&directory.join("logs"))?;
-    tracing_subscriber::fmt()
-        .json()
-        .with_ansi(false)
-        .with_env_filter(tracing_subscriber::EnvFilter::try_new(&config.log_level)?)
-        .with_writer(writer)
-        .init();
-    tracing::info!(event = "app_started", version = env!("CARGO_PKG_VERSION"));
-    #[cfg(target_os = "macos")]
-    gopher::macos::run(directory, config)?;
-    #[cfg(not(target_os = "macos"))]
-    anyhow::bail!("The menu bar app requires macOS; use doctor or inspect for diagnostics");
-    Ok(())
+    lifecycle::install_panic_hook(writer.clone());
+    let session = lifecycle::Session::start(&directory, writer.clone())?;
+    let result = (|| -> Result<&'static str> {
+        let config = Config::load(&directory)?;
+        tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::try_new(&config.log_level)?)
+            .with_writer(writer.clone())
+            .init();
+        #[cfg(target_os = "macos")]
+        return gopher::macos::run(directory, config, writer);
+        #[cfg(not(target_os = "macos"))]
+        anyhow::bail!("The menu bar app requires macOS; use doctor or inspect for diagnostics");
+    })();
+    let reason = match &result {
+        Ok(reason) => *reason,
+        Err(error) => {
+            session.record(
+                "ERROR",
+                "app_failed",
+                serde_json::json!({"error": format!("{error:#}")}),
+            );
+            "error"
+        }
+    };
+    if let Err(error) = session.finish(reason) {
+        eprintln!("Gopher could not record completed shutdown: {error:#}");
+    }
+    result.map(|_| ())
 }

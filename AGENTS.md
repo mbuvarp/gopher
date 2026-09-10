@@ -40,6 +40,8 @@ Detect participating agents per PR; subscriptions and repository settings vary. 
 
 Exclude explicit subscription-limit/paused-review skips from inferred participation, while displaying the reason. An explicitly required reviewer that skips keeps the result Unknown. Confirm actionable results across polls before notifying (30-second default).
 
+Do not infer participation solely from a cached Skipped result when that reviewer's activity disappears. Fresh activity reintroduces the reviewer; previously participating reviewers with missing results and explicitly required reviewers still block. Log when a skipped reviewer drops out, and identify historical participation in missing-evidence reasons.
+
 Keep reviewer detection in separate modules. Treat these observed conventions as evidence to validate, not guaranteed API contracts:
 
 - **Cubic:** A running PR check indicates review activity. Review summaries include `N issues found`, `No issues found`, or `0 issues found`; summaries may be edited after findings are addressed.
@@ -62,6 +64,7 @@ Keep reviewer detection in separate modules. Treat these observed conventions as
 - Keep optional settings in `config.toml`.
 - Write structured JSONL logs to `logs/gopher.jsonl` using `tracing`, retaining at most **10,000 lines across retained logs**. Bound individual entry sizes and safely replace files when trimming.
 - Log request timing/failures, detection evidence, state transitions, notifications, and acknowledgements with timestamps, severity, and PR/reviewer identifiers. Exclude credentials and full API responses by default.
+- Keep lifecycle diagnostics independent of log filters, with bounded waits for durable writes. Record Rust panics and orderly quits/signals. Maintain `session.json` only under the app instance lock, completing it explicitly after shutdown; report incomplete previous sessions without inventing a cause. CLI diagnostics must not alter it. Test crashes and signals in isolated subprocesses.
 
 ## Development guidance
 

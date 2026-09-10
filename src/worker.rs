@@ -528,6 +528,17 @@ async fn run(
                                         old.update_id != pr.update_id || old.agents != pr.agents
                                     }) {
                                         tracing::info!(event="review_state",repo=%pr.snapshot.repo,pr=pr.snapshot.number,state=?pr.state);
+                                        if let Some(old) = previous {
+                                            for agent in old.agents.iter().filter(|a| {
+                                                a.verdict == Verdict::Skipped
+                                                    && !pr
+                                                        .agents
+                                                        .iter()
+                                                        .any(|current| current.agent == a.agent)
+                                            }) {
+                                                tracing::info!(event="reviewer_not_participating",repo=%pr.snapshot.repo,pr=pr.snapshot.number,agent=?agent.agent,reason="Previously skipped reviewer has no current activity");
+                                            }
+                                        }
                                         for agent in &pr.agents {
                                             tracing::info!(event="review_evidence",repo=%pr.snapshot.repo,pr=pr.snapshot.number,agent=?agent.agent,verdict=?agent.verdict,reason=%agent.reason,run_id=%agent.run_id);
                                         }

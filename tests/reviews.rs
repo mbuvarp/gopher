@@ -526,6 +526,126 @@ fn all_skipped_does_not_approve() {
     assert_eq!(state(&s), State::Unknown);
 }
 
+fn skipped_coderabbit() -> Check {
+    Check {
+        app: "coderabbitai".into(),
+        name: "CodeRabbit".into(),
+        summary: "Review skipped: automatic reviews are disabled".into(),
+        ..check("completed")
+    }
+}
+
+#[test]
+fn disappearing_skip_does_not_block_results_across_commits_polls_or_restart() {
+    for findings in [false, true] {
+        let mut s = snapshot();
+        s.reviews.push(Review {
+            state: "APPROVED".into(),
+            ..review(Agent::Codex, "")
+        });
+        if findings {
+            s.threads.push(thread());
+        }
+        s.checks.push(skipped_coderabbit());
+        let skipped = transition(s.clone(), None, None, 100, 0);
+        assert!(
+            skipped
+                .agents
+                .iter()
+                .any(|a| a.agent == Agent::CodeRabbit && a.verdict == Verdict::Skipped)
+        );
+        s.head = "new-head".into();
+        s.reviews[0].commit = s.head.clone();
+        s.checks.clear();
+        let first = transition(s.clone(), Some(&skipped), None, 130, 30);
+        assert_eq!(first.state, State::Reviewing); // Preserve the normal settling interval.
+        let expected = if findings {
+            State::Comments
+        } else {
+            State::Approved
+        };
+        let settled = transition(s.clone(), Some(&first), None, 160, 30);
+        assert_eq!(settled.state, expected);
+        assert!(!settled.agents.iter().any(|a| a.agent == Agent::CodeRabbit));
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.save(&settled).unwrap();
+        let restored = store.load().unwrap().remove(0);
+        assert_eq!(
+            transition(s.clone(), Some(&restored), None, 190, 0).state,
+            expected
+        );
+
+        // New activity must reintroduce the previously skipped reviewer immediately.
+        s.checks.push(Check {
+            status: "in_progress".into(),
+            summary: String::new(),
+            ..skipped_coderabbit()
+        });
+        assert_eq!(
+            transition(s, Some(&settled), None, 200, 0).state,
+            State::Reviewing
+        );
+    }
+}
+
+#[test]
+fn explicitly_required_skipped_reviewer_still_blocks_after_its_check_disappears() {
+    let mut s = snapshot();
+    s.reviews.push(Review {
+        state: "APPROVED".into(),
+        ..review(Agent::Codex, "")
+    });
+    s.checks.push(skipped_coderabbit());
+    let skipped = transition(s.clone(), None, None, 100, 0);
+    s.checks.clear();
+    assert_eq!(
+        transition(
+            s,
+            Some(&skipped),
+            Some(&[Agent::Codex, Agent::CodeRabbit]),
+            130,
+            0
+        )
+        .state,
+        State::Unknown
+    );
+}
+
+#[test]
+fn missing_activity_from_actual_participants_still_blocks_with_a_history_reason() {
+    for verdict in [
+        Verdict::Running,
+        Verdict::Clean,
+        Verdict::Findings,
+        Verdict::Unknown,
+    ] {
+        let mut s = snapshot();
+        s.reviews.push(Review {
+            state: "APPROVED".into(),
+            ..review(Agent::Codex, "")
+        });
+        let mut previous = transition(s.clone(), None, None, 100, 0);
+        previous.agents.push(AgentResult {
+            agent: Agent::CodeRabbit,
+            verdict,
+            run_id: "previous-run".into(),
+            reason: "Observed reviewer".into(),
+        });
+        let current = transition(s, Some(&previous), None, 130, 0);
+        assert_eq!(current.state, State::Unknown);
+        assert!(
+            current
+                .agents
+                .iter()
+                .find(|a| a.agent == Agent::CodeRabbit)
+                .unwrap()
+                .reason
+                .starts_with("Previously participating reviewer")
+        );
+    }
+}
+
 #[test]
 fn codex_late_thumb_completes_observed_run() {
     let mut s = snapshot();

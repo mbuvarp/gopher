@@ -10,35 +10,44 @@ pub fn evaluate(
     previous: Option<&PullRequest>,
     expected: Option<&[Agent]>,
 ) -> Vec<AgentResult> {
+    let observed: BTreeSet<Agent> = snapshot
+        .reviews
+        .iter()
+        .filter_map(|r| Agent::from_login(&r.author))
+        .chain(
+            snapshot
+                .comments
+                .iter()
+                .filter_map(|c| Agent::from_login(&c.author)),
+        )
+        .chain(
+            snapshot
+                .reactions
+                .iter()
+                .filter_map(|r| Agent::from_login(&r.author)),
+        )
+        .chain(
+            snapshot
+                .checks
+                .iter()
+                .filter_map(|c| Agent::from_app(&c.app)),
+        )
+        .collect();
     let agents: BTreeSet<Agent> = if let Some(expected) = expected {
         expected.iter().copied().collect()
     } else {
-        snapshot
-            .reviews
+        observed
             .iter()
-            .filter_map(|r| Agent::from_login(&r.author))
-            .chain(
-                snapshot
-                    .comments
-                    .iter()
-                    .filter_map(|c| Agent::from_login(&c.author)),
-            )
-            .chain(
-                snapshot
-                    .reactions
-                    .iter()
-                    .filter_map(|r| Agent::from_login(&r.author)),
-            )
-            .chain(
-                snapshot
-                    .checks
-                    .iter()
-                    .filter_map(|c| Agent::from_app(&c.app)),
-            )
+            .copied()
             .chain(
                 previous
                     .into_iter()
-                    .flat_map(|p| p.agents.iter().map(|a| a.agent)),
+                    // Explicit skips are excluded from inferred participation. A
+                    // disappearing skip check must not create an unfinished review.
+                    // Keep other observed reviewers until their result is known.
+                    .flat_map(|p| p.agents.iter())
+                    .filter(|a| a.verdict != Verdict::Skipped)
+                    .map(|a| a.agent),
             )
             .collect()
     };
@@ -50,6 +59,15 @@ pub fn evaluate(
             Agent::CodeRabbit => coderabbit::detect(snapshot),
         })
         .map(|mut result| {
+            if expected.is_none()
+                && !observed.contains(&result.agent)
+                && result.verdict == Verdict::Unknown
+            {
+                result.reason = format!(
+                    "Previously participating reviewer has no current activity: {}",
+                    result.reason
+                );
+            }
             if expected.is_some() && result.verdict == Verdict::Skipped {
                 result.verdict = Verdict::Unknown;
                 result.reason = format!("Required reviewer did not run: {}", result.reason);
