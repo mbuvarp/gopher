@@ -8,7 +8,7 @@ fn mock(script: &str) -> (tempfile::TempDir, Github) {
 fn mock_with_timeout(script: &str, timeout: u64) -> (tempfile::TempDir, Github) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("gh");
-    std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{script}\n")).unwrap();
+    std::fs::write(&path, format!("#!/bin/sh\nif [ \"$1\" = auth ]; then echo test-credential; exit 0; fi\nset -eu\n{script}\n")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     let github = Github::new(&Config {
         gh_path: Some(path),
@@ -385,7 +385,7 @@ exit 1
         gh_path: Some(dir.path().join("gh")),
         ..Default::default()
     };
-    assert!(Github::cooldown(&config) >= std::time::Duration::from_secs(179));
+    assert!(Github::cooldown(&config, None) >= std::time::Duration::from_secs(179));
     let next = Github::new(&config).unwrap();
     assert!(next.repository_labels("owner/repo").await.is_err());
     assert!(
@@ -434,5 +434,123 @@ printf 'HTTP/2.0 200 OK\r\nX-RateLimit-Resource: graphql\r\nX-RateLimit-Remainin
     let expected = reset
         .saturating_sub(chrono::Utc::now().timestamp() + 1)
         .max(0) as u64;
-    assert!(Github::cooldown(&config) >= std::time::Duration::from_secs(expected));
+    assert!(Github::cooldown(&config, None) >= std::time::Duration::from_secs(expected));
+}
+
+#[tokio::test]
+async fn account_switch_escapes_old_cooldowns_and_switching_back_preserves_them() {
+    let reset = chrono::Utc::now().timestamp() + 1800;
+    // Override the standard fake credential prelude so gh auth switch is local.
+    let (dir, github) = mock("exit 1");
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = auth ]; then cat "$(dirname "$0")/account"; exit 0; fi
+cat >/dev/null
+printf '%s %s\n' "$GH_TOKEN" "$*" >> "$(dirname "$0")/calls"
+if [ "$GH_TOKEN" = alpha ]; then
+ printf 'HTTP/2.0 200 OK\r\nX-RateLimit-Resource: graphql\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {reset}\r\n\r\n{{"data":{{"viewer":{{"login":"alice"}}}}}}'
+else
+ echo '{{"data":{{"viewer":{{"login":"bob"}}}}}}'
+fi
+"#
+    );
+    std::fs::write(dir.path().join("gh"), script).unwrap();
+    std::fs::write(dir.path().join("account"), "alpha").unwrap();
+    assert_eq!(github.viewer().await.unwrap(), "alice");
+    let config = Config {
+        gh_path: Some(dir.path().join("gh")),
+        ..Default::default()
+    };
+    assert!(Github::cooldown(&config, Some("graphql")).as_secs() > 1700);
+    assert!(Github::cooldown(&config, Some("core")).is_zero());
+    std::fs::write(dir.path().join("account"), "beta").unwrap();
+    let next = Github::new(&config).unwrap();
+    assert_eq!(next.viewer().await.unwrap(), "bob");
+    assert!(Github::cooldown(&config, None).is_zero());
+    // A client already authenticated as B keeps that credential for its mutation.
+    std::fs::write(dir.path().join("account"), "alpha").unwrap();
+    next.set_label(
+        &gopher::github::PrRef {
+            id: "PR_1".into(),
+            repo: "owner/repo".into(),
+            number: 1,
+        },
+        "bug",
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(
+        std::fs::read_to_string(dir.path().join("calls"))
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("beta ")
+    );
+    // A fresh read discovers A locally, then blocks its exhausted GraphQL quota.
+    assert!(
+        Github::new(&config)
+            .unwrap()
+            .ignored_details(&["PR_1".into()])
+            .await
+            .is_err()
+    );
+    assert!(Github::cooldown(&config, Some("graphql")).as_secs() > 1700);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn graphql_limit_allows_rest_label_refresh_and_core_limit_allows_ignored_lookup() {
+    let reset = chrono::Utc::now().timestamp() + 1800;
+    let (dir, github) = mock(&format!(
+        r#"
+cat >/dev/null
+case "$*" in
+ *IgnoredPrDetails*) exit 99;;
+ *graphql*) printf 'HTTP/2.0 200 OK\r\nX-RateLimit-Resource: graphql\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {reset}\r\n\r\n{{"data":{{"viewer":{{"login":"test"}}}}}}';;
+ *'github.com user'*) echo '{{"login":"test"}}';;
+ *'/labels?'*) echo '[{{"name":"bug","color":"ff0000"}}]';;
+ *) exit 1;;
+esac
+"#
+    ));
+    github.viewer().await.unwrap();
+    let config = Config {
+        gh_path: Some(dir.path().join("gh")),
+        ..Default::default()
+    };
+    let labels = Github::new(&config).unwrap();
+    assert_eq!(labels.viewer().await.unwrap(), "test");
+    assert_eq!(
+        labels.repository_labels("owner/repo").await.unwrap()[0].name,
+        "bug"
+    );
+    assert_eq!(labels.viewer().await.unwrap(), "test");
+    assert!(Github::cooldown(&config, Some("core")).is_zero());
+
+    let (dir, github) = mock(&format!(
+        r#"
+input=$(cat)
+case "$*" in
+ *'/labels?'*) printf 'HTTP/2.0 200 OK\r\nX-RateLimit-Resource: core\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {reset}\r\n\r\n[]';;
+ *) echo '{{"data":{{"nodes":[],"viewer":{{"login":"test"}}}}}}';;
+esac
+"#
+    ));
+    github.repository_labels("owner/repo").await.unwrap();
+    let config = Config {
+        gh_path: Some(dir.path().join("gh")),
+        ..Default::default()
+    };
+    assert!(Github::cooldown(&config, Some("core")).as_secs() > 1700);
+    assert!(Github::cooldown(&config, Some("graphql")).is_zero());
+    github.ignored_details(&["PR_1".into()]).await.unwrap();
+    github.viewer().await.unwrap();
 }

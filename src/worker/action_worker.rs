@@ -30,7 +30,7 @@ pub enum ActionCommand {
     MergeChecked {
         pr: String,
         token: u64,
-        result: Result<Box<Snapshot>, String>,
+        result: Result<(Box<Snapshot>, Github), String>,
     },
     Merged {
         pr: String,
@@ -45,7 +45,7 @@ pub enum ActionCommand {
     LabelChecked {
         pr: String,
         token: u64,
-        result: Result<(), String>,
+        result: Result<Github, String>,
     },
     LabelDone {
         pr: String,
@@ -232,11 +232,11 @@ impl Coordinator {
             }
             ActionCommand::MergeChecked { pr, token, result } => {
                 if let Some(intent) = self.merges.get(&pr).filter(|i| i.token == token).cloned() {
-                    let checked = result.and_then(|snapshot| {
+                    let checked = result.and_then(|(snapshot, github)| {
                         let expected = context.config.repositories.get(&snapshot.repo).and_then(|r| r.reviewers.as_deref());
                         let fresh = transition(*snapshot, Some(&intent.pr), expected, chrono::Utc::now().timestamp(), context.config.settle_seconds);
                         if intent.valid(context, &self.state, Kind::Merge) && intent.preferences.allows(Kind::Merge, &fresh) && fresh.snapshot.head == intent.pr.snapshot.head && fresh.update_id == intent.pr.update_id {
-                            Ok(())
+                            Ok(github)
                         } else { Err("Merge cancelled: the commit, review state, or action settings changed.".into()) }
                     });
                     match checked {
@@ -244,13 +244,11 @@ impl Coordinator {
                             self.merges.remove(&pr);
                             self.state.merges.insert(pr, MergeProgress::Failed(error));
                         }
-                        Ok(()) => {
+                        Ok(github) => {
                             self.state.merges.insert(pr.clone(), MergeProgress::Merging);
-                            let config = context.config.clone();
                             let sender = context.sender.clone();
                             tokio::spawn(async move {
                                 let result = async {
-                                    let github = Github::new(&config)?;
                                     // All read requests finish before MergeChecked.
                                     // The worker's final validation authorizes submission;
                                     // do not add another await before the merge request.
@@ -337,19 +335,17 @@ impl Coordinator {
                 {
                     match result {
                         Err(error) => self.finish_label(&pr, token, Err(error), context),
-                        Ok(()) if !job.intent.valid(context, &self.state, Kind::Label) => self
+                        Ok(_) if !job.intent.valid(context, &self.state, Kind::Label) => self
                             .finish_label(
                                 &pr,
                                 token,
                                 Err("Label action cancelled: PR or settings changed.".into()),
                                 context,
                             ),
-                        Ok(()) => {
-                            let config = context.config.clone();
+                        Ok(github) => {
                             let sender = context.sender.clone();
                             tokio::spawn(async move {
                                 let result = async {
-                                    let github = Github::new(&config)?;
                                     // Authentication finished before LabelChecked; submit
                                     // directly after the worker revalidates the intent.
                                     github
@@ -493,7 +489,7 @@ impl Coordinator {
                     github.viewer().await? == intent.viewer,
                     "GitHub account changed; merge cancelled"
                 );
-                Ok(Box::new(snapshot))
+                Ok((Box::new(snapshot), github))
             }
             .await
             .map_err(|e: anyhow::Error| e.to_string());
@@ -526,11 +522,12 @@ impl Coordinator {
         }
         tokio::spawn(async move {
             let result = async {
+                let github = Github::new(&config)?;
                 ensure!(
-                    Github::new(&config)?.viewer().await? == job.intent.viewer,
+                    github.viewer().await? == job.intent.viewer,
                     "GitHub account changed; label action cancelled"
                 );
-                Ok(())
+                Ok(github)
             }
             .await
             .map_err(|e: anyhow::Error| e.to_string());

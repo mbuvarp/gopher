@@ -117,18 +117,8 @@ impl Coordinator {
             {
                 continue;
             }
-            // Respect the transport cooldown without consuming this repo's refresh interval.
-            if !Github::cooldown(context.config).is_zero() {
-                if manual {
-                    self.load_errors.insert(
-                        repo.clone(),
-                        "GitHub rate limit: label refresh is paused until the quota cooldown ends."
-                            .into(),
-                    );
-                    self.sync_labels(context);
-                }
-                continue;
-            }
+            // The request layer checks the active credential and relevant quota.
+            // Authentication can use REST while the GraphQL quota is exhausted.
             let token = self.token();
             self.loads.insert(repo.clone(), token);
             self.attempts

@@ -1,4 +1,4 @@
-//! Shared per-executable request metadata. Response bodies are bounded and never logged.
+//! Request metadata scoped to a CLI executable and credential fingerprint. Response bodies are bounded and never logged.
 use super::*;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -23,13 +23,46 @@ pub(super) struct CacheKey {
     generation: u64,
 }
 
-pub(super) fn shared(path: &std::path::Path) -> Arc<Mutex<ApiState>> {
-    static STATES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<ApiState>>>>> = OnceLock::new();
-    let mut states = STATES.get_or_init(Default::default).lock().unwrap();
-    if states.len() >= 64 {
-        states.retain(|_, state| Arc::strong_count(state) > 1);
+#[derive(Default)]
+struct Profiles {
+    active: String,
+    states: BTreeMap<String, Arc<Mutex<ApiState>>>,
+}
+fn profiles() -> &'static Mutex<BTreeMap<PathBuf, Profiles>> {
+    static PROFILES: OnceLock<Mutex<BTreeMap<PathBuf, Profiles>>> = OnceLock::new();
+    PROFILES.get_or_init(Default::default)
+}
+pub(super) fn active(path: &std::path::Path) -> Option<Arc<Mutex<ApiState>>> {
+    let profiles = profiles().lock().unwrap();
+    let profiles = profiles.get(path)?;
+    profiles.states.get(&profiles.active).cloned()
+}
+pub(super) fn credential(path: &std::path::Path, fingerprint: &str) -> Arc<Mutex<ApiState>> {
+    let mut profiles = profiles().lock().unwrap();
+    if profiles.len() >= 64 {
+        profiles.retain(|_, profile| {
+            profile.states.values().any(|state| {
+                Arc::strong_count(state) > 1 || !state.lock().unwrap().delay(None).is_zero()
+            })
+        });
     }
-    states.entry(path.to_owned()).or_default().clone()
+    let profile = profiles.entry(path.to_owned()).or_default();
+    if profile.active != fingerprint {
+        if let Some(previous) = profile.states.get(&profile.active) {
+            // Keep the old credential's quota deadline for switching back, but
+            // discard its response bodies and invalidate any in-flight cache writes.
+            previous.lock().unwrap().invalidate();
+        }
+        profile.states.retain(|_, state| {
+            Arc::strong_count(state) > 1 || !state.lock().unwrap().delay(None).is_zero()
+        });
+        profile.active = fingerprint.into();
+    }
+    profile
+        .states
+        .entry(fingerprint.into())
+        .or_default()
+        .clone()
 }
 impl ApiState {
     pub fn identify(&mut self, account: &str) {
@@ -303,6 +336,7 @@ mod head_tests {
         let last = json!({"data":{"viewer":{"login":"test"},"nodes":nodes(&ids[50..])}});
         let script = format!(
             r#"#!/bin/sh
+if [ "$1" = auth ]; then echo test-credential; exit 0; fi
 input=$(cat)
 echo call >> "$(dirname "$0")/calls"
 case "$input" in *'"PR_50"'*) echo '{last}';; *) echo '{first}';; esac
@@ -333,7 +367,7 @@ case "$input" in *'"PR_50"'*) echo '{last}';; *) echo '{first}';; esac
         std::fs::write(
             &path,
             format!(
-                "#!/bin/sh\ncat >/dev/null\necho '{}'",
+                "#!/bin/sh\nif [ \"$1\" = auth ]; then echo test-credential; exit 0; fi\ncat >/dev/null\necho '{}'",
                 json!({"data":{"viewer":{"login":"test"},"nodes":[null]}})
             ),
         )

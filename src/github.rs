@@ -12,7 +12,7 @@ use tokio::{io::AsyncWriteExt, process::Command};
 pub struct Github {
     executable: PathBuf,
     timeout: Duration,
-    api: std::sync::Arc<std::sync::Mutex<cache::ApiState>>,
+    session: std::sync::Arc<std::sync::Mutex<Option<credentials::Session>>>,
     account: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 #[derive(Clone, Debug)]
@@ -44,17 +44,18 @@ impl Github {
     pub fn new(config: &Config) -> Result<Self> {
         let executable = resolve_gh(config)?;
         Ok(Self {
-            api: cache::shared(&executable),
+            session: Default::default(),
             account: Default::default(),
             executable,
             timeout: Duration::from_secs(config.request_timeout_seconds),
         })
     }
 
-    pub fn cooldown(config: &Config) -> Duration {
+    pub fn cooldown(config: &Config, resource: Option<&str>) -> Duration {
         resolve_gh(config)
             .ok()
-            .map(|path| cache::shared(&path).lock().unwrap().delay(None))
+            .and_then(|path| cache::active(&path))
+            .map(|api| api.lock().unwrap().delay(resource))
             .unwrap_or_default()
     }
 
@@ -93,7 +94,9 @@ impl Github {
         } else {
             "core"
         };
-        let delay = self.api.lock().unwrap().delay(Some(resource));
+        let session = self.session().await?;
+        let api = &session.api;
+        let delay = api.lock().unwrap().delay(Some(resource));
         ensure!(
             delay.is_zero(),
             "GitHub rate limit: requests paused until the quota cooldown ends"
@@ -101,17 +104,14 @@ impl Github {
         let endpoint = args.iter().find(|a| a.starts_with("repos/"));
         let key = if payload.is_none() && !matches!(policy, ResponsePolicy::Mutation) {
             endpoint.and_then(|endpoint| {
-                self.api
-                    .lock()
+                api.lock()
                     .unwrap()
                     .key(endpoint, self.account.lock().unwrap().as_deref())
             })
         } else {
             None
         };
-        let cached = key
-            .as_ref()
-            .and_then(|key| self.api.lock().unwrap().get(key));
+        let cached = key.as_ref().and_then(|key| api.lock().unwrap().get(key));
         let mut command = Command::new(&self.executable);
         command
             .args(args)
@@ -119,6 +119,7 @@ impl Github {
             .env("GH_PROMPT_DISABLED", "1")
             .env("GH_PAGER", "cat")
             .env("GH_HOST", "github.com")
+            .env("GH_TOKEN", &session.token)
             .env_remove("GH_DEBUG")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -171,10 +172,7 @@ impl Github {
                             })
                         })
                 });
-            self.api
-                .lock()
-                .unwrap()
-                .observe(&headers, resource, limited);
+            api.lock().unwrap().observe(&headers, resource, limited);
             if limited {
                 bail!("GitHub rate limit reached; requests paused until the quota cooldown ends");
             }
@@ -182,7 +180,7 @@ impl Github {
                 let cached = cached.context("GitHub returned 304 without a cached response")?;
                 ensure!(
                     key.as_ref()
-                        .is_some_and(|key| self.api.lock().unwrap().get(key).is_some()),
+                        .is_some_and(|key| api.lock().unwrap().get(key).is_some()),
                     "GitHub response cache changed during the request; retry next poll"
                 );
                 tracing::debug!(event = "github_not_modified", resource);
@@ -219,13 +217,12 @@ impl Github {
             }
             let response = parsed.context("GitHub CLI returned invalid JSON")?;
             if matches!(policy, ResponsePolicy::Mutation) {
-                self.api.lock().unwrap().invalidate();
+                api.lock().unwrap().invalidate();
             } else if status == 200
                 && response.get("errors").is_none()
                 && let Some(key) = &key
             {
-                self.api
-                    .lock()
+                api.lock()
                     .unwrap()
                     .put(key, headers.get("etag").map(String::as_str), body);
             }
@@ -305,11 +302,25 @@ impl Github {
     }
 
     pub async fn viewer(&self) -> Result<String> {
-        let result = self
-            .graphql("query { viewer { login } }", json!({}))
-            .await?;
-        let account = required(&result["viewer"], "login")?.to_owned();
-        self.api.lock().unwrap().identify(&account);
+        // This local lookup observes gh auth switch even while the previous account
+        // is rate limited; it never sends a request to GitHub.
+        let session = self.refresh_credentials().await?;
+        let use_rest = {
+            let api = session.api.lock().unwrap();
+            !api.delay(Some("graphql")).is_zero() && api.delay(Some("core")).is_zero()
+        };
+        let account = if use_rest {
+            let result = self
+                .execute(&["api", "--hostname", "github.com", "user"], None)
+                .await?;
+            required(&result, "login")?.to_owned()
+        } else {
+            let result = self
+                .graphql("query { viewer { login } }", json!({}))
+                .await?;
+            required(&result["viewer"], "login")?.to_owned()
+        };
+        session.api.lock().unwrap().identify(&account);
         *self.account.lock().unwrap() = Some(account.clone());
         Ok(account)
     }
@@ -890,3 +901,5 @@ enum ResponsePolicy {
 }
 
 mod cache;
+
+mod credentials;

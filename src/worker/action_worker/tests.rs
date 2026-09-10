@@ -25,6 +25,7 @@ case "$input" in *viewer*) echo '{"data":{"viewer":{"login":"test"}}}'; exit 0;;
 "#,
         );
         std::fs::write(&gh, format!(r#"#!/bin/sh
+if [ "$1" = auth ]; then echo test-credential; exit 0; fi
 case "$*" in
  *'--method PUT'*) cat > "$(dirname "$0")/merge.json"; echo '{{"merged":true}}'; exit 0;;
  *'--method POST'*|*'--method DELETE'*) printf '%s\n' "$*" >> "$(dirname "$0")/labels.log"; cat >/dev/null; echo '[]'; exit 0;;
@@ -226,7 +227,7 @@ async fn fresh_validation_cannot_merge_a_changed_head_or_a_closed_pr() {
         h.handle(ActionCommand::MergeChecked {
             pr: "PR_1".into(),
             token,
-            result: Ok(Box::new(snapshot)),
+            result: Ok((Box::new(snapshot), Github::new(&h.config).unwrap())),
         });
         assert!(matches!(
             h.coordinator.state.merges["PR_1"],
@@ -421,7 +422,7 @@ async fn always_merge_rejects_changed_evidence_in_cache_or_final_snapshot() {
         h.handle(ActionCommand::MergeChecked {
             pr: "PR_1".into(),
             token,
-            result: Ok(Box::new(snapshot)),
+            result: Ok((Box::new(snapshot), Github::new(&h.config).unwrap())),
         });
         assert!(matches!(
             h.coordinator.state.merges["PR_1"],
@@ -618,6 +619,7 @@ fn catalogue(names: &[&str]) -> LabelCatalogue {
 async fn catalogue_is_shared_persisted_and_refreshed_only_when_due_or_requested() {
     let mut h = Harness::new();
     std::fs::write(h.config.gh_path.as_ref().unwrap(), r#"#!/bin/sh
+if [ "$1" = auth ]; then echo test-credential; exit 0; fi
 case "$*" in
   *graphql*) cat >/dev/null; echo '{"data":{"viewer":{"login":"test"}}}';;
   *repos/owner/repo/labels*) echo fetch >> "$(dirname "$0")/catalogue.log"; echo '[{"name":"bug","color":"ff0000"}]';;

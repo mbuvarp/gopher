@@ -77,6 +77,7 @@ pub enum Command {
     Shutdown,
     PollComplete(std::result::Result<Batch, String>),
     CheckLabels,
+    CredentialsProbed,
 }
 pub struct Batch {
     viewer: String,
@@ -269,16 +270,16 @@ async fn run(
     });
     let mut label_deadline = Instant::now();
     loop {
-        let cooldown = Github::cooldown(&config);
-        if !cooldown.is_zero() {
-            deadline = deadline.max(Instant::now() + cooldown);
-            ignored_deadline = ignored_deadline.max(Instant::now() + cooldown);
-        }
+        // Keep ordinary deadlines intact so a credential switch can lift an old
+        // quota wait. Ignored identities use GraphQL; snapshots need both quotas.
+        let poll_ready = deadline.max(Instant::now() + Github::cooldown(&config, None));
+        let ignored_ready =
+            ignored_deadline.max(Instant::now() + Github::cooldown(&config, Some("graphql")));
         let command = tokio::select! {
             _ = tokio::time::sleep_until(label_deadline.into()) => Command::CheckLabels,
             command = receiver.recv() => match command { Some(c)=>c,None=>break },
-            _ = tokio::time::sleep_until(ignored_deadline.into()), if !ignored_loading => Command::CheckIgnored,
-            _ = tokio::time::sleep_until(deadline.into()), if !polling => {
+            _ = tokio::time::sleep_until(ignored_ready.into()), if !ignored_loading => Command::CheckIgnored,
+            _ = tokio::time::sleep_until(poll_ready.into()), if !polling => {
                 polling = true;
                 sink(UiEvent::Updated {
                     prs: prs.values().cloned().collect(),
@@ -300,7 +301,23 @@ async fn run(
         };
         let mut reveal_target = None;
         match command {
+            Command::CredentialsProbed => {}
             Command::CheckLabels => {
+                if !Github::cooldown(&config, None).is_zero() {
+                    let config = config.clone();
+                    let sender = sender.clone();
+                    tokio::spawn(async move {
+                        let command = match Github::probe_credentials(&config).await {
+                            Ok(true) => Command::Refresh,
+                            Ok(false) => Command::CredentialsProbed,
+                            Err(error) => {
+                                tracing::debug!(event="credential_probe_failed",error=%error);
+                                Command::CredentialsProbed
+                            }
+                        };
+                        let _ = sender.send(command);
+                    });
+                }
                 label_deadline = Instant::now() + Duration::from_secs(30);
                 pr_actions.refresh_catalogues(
                     &action_worker::Context {
@@ -756,7 +773,13 @@ case "$input" in
   *viewer*) echo '{"data":{"viewer":{"login":"test"}}}'; exit 0 ;;
 esac
 "#);
-        std::fs::write(&path, format!("#!/bin/sh\n{script}")).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = auth ]; then echo test-credential; exit 0; fi\n{script}"
+            ),
+        )
+        .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let config = Config {
             gh_path: Some(path.clone()),
@@ -785,7 +808,7 @@ esac
         std::fs::write(
             &path,
             format!(
-                "#!/bin/sh\n{}",
+                "#!/bin/sh\nif [ \"$1\" = auth ]; then echo test-credential; exit 0; fi\n{}",
                 script.replace("\"state\":\"OPEN\"", "\"state\":\"CLOSED\"")
             ),
         )
@@ -904,7 +927,7 @@ esac
         let gh = directory.path().join("gh");
         std::fs::write(
             &gh,
-            "#!/bin/sh\ntouch \"$(dirname \"$0\")/started\"\nexec sleep 30\n",
+            "#!/bin/sh\nif [ \"$1\" = auth ]; then echo test-credential; exit 0; fi\ntouch \"$(dirname \"$0\")/started\"\nexec sleep 30\n",
         )
         .unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1003,6 +1026,7 @@ esac
         let directory = tempfile::tempdir().unwrap();
         let gh = directory.path().join("gh");
         std::fs::write(&gh, r#"#!/bin/sh
+if [ "$1" = auth ]; then echo test-credential; exit 0; fi
 payload=$(cat)
 case "$payload" in
  *IgnoredPrDetails*)
