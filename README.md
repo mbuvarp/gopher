@@ -56,20 +56,37 @@ These actions use the authenticated GitHub CLI account and require its normal re
 
 ## Run
 
-Requires macOS 13+, Rust, Xcode command-line tools, and an installed GitHub CLI authenticated with access to your repositories:
+Building requires macOS 13+, Rust with the `aarch64-apple-darwin` target, Xcode command-line tools, and Python 3. Gopher runs on Apple Silicon and requires an installed GitHub CLI authenticated with access to your repositories:
 
 ```sh
 gh auth login
 cargo run -- doctor
+rustup target add aarch64-apple-darwin
 sh scripts/bundle.sh
 mkdir -p ~/Applications
 ditto dist/Gopher.app ~/Applications/Gopher.app
 open ~/Applications/Gopher.app
 ```
 
-Allow notifications when prompted. Enable **Actions → Launch at login** to start Gopher automatically in your user session. Quit Gopher before replacing an installed build. The build script packages the application icon and uses an installed Apple Development signing identity, or `GOPHER_SIGNING_IDENTITY` if specified. Without one it falls back to ad-hoc signing and warns that notification authorization may fail. Distributing to other machines requires appropriate signing/notarization.
+Allow notifications when prompted. Enable **Actions → Launch at login** to start Gopher automatically in your user session. Quit Gopher before replacing an installed build. The build script packages the application icon and uses an installed Apple Development signing identity, or `GOPHER_SIGNING_IDENTITY` if specified. Local builds without one fall back to ad-hoc signing and warn that notification authorization may fail.
 
 `cargo run` also starts the app, but notifications and launch at login require the bundled app. No web frontend, server, webhook setup, or separate system daemon is needed.
+
+## Package a release archive
+
+```sh
+sh scripts/bundle.sh --release
+```
+
+This builds an Apple Silicon app with a macOS 13.0 deployment target, then produces `dist/Gopher.app`, `dist/Gopher-<version>-macos-arm64.zip`, and a matching `.zip.sha256` file. Only the app is inside the archive. The script verifies architecture, minimum OS, metadata, and code signature both before and after extracting the ZIP. It stages a fresh bundle so removed resources cannot linger, and replaces existing outputs only after validation succeeds.
+
+Release archives require an Apple signing identity and never fall back to ad-hoc signing. The default is the first available Apple Development identity; set `GOPHER_SIGNING_IDENTITY` to select a different certificate name or fingerprint. A missing or invalid identity fails packaging. This initial distribution is **unnotarized**: macOS may require **System Settings → Privacy & Security → Open Anyway** after the first launch attempt. Test notifications and Launch at login on another Mac before sharing widely. A checksum detects corruption; it does not replace the signed-update verification planned for the updater.
+
+`Cargo.toml` is the version source. The app's display version matches it; the numeric build version is `(major + 1).minor.patch` so that `0.1.0` sorts after the historical build number `1`. Packaging supports stable versions only, with major up to 9998 and minor/patch up to 99 to fit macOS build fields. When bumping the package version, update its `Cargo.lock` entry too; packaging uses `--locked` and does not bump versions or publish a release. Users of the packaged app need macOS 13+, Apple Silicon, and authenticated `gh`, but no Rust, Xcode, or Python installation.
+
+Verify a downloaded archive from its directory with `shasum -a 256 -c Gopher-<version>-macos-arm64.zip.sha256`, extract it, and move `Gopher.app` to `~/Applications`. Quit an existing copy first and preserve `~/.config/gopher`. A browser download on a separate Mac is needed to test the normal Gatekeeper experience; copying via SSH alone does not reproduce it.
+
+Packaging checks: `python3 -m unittest discover -s scripts -p 'test_*.py'`.
 
 ## Review behavior
 
