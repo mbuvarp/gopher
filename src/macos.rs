@@ -366,6 +366,7 @@ pub fn run(directory: PathBuf, config: Config) -> Result<()> {
             Event::UserEvent(AppEvent::NotificationError(message)) => {ui_error=Some(message);rebuild=true;}
             Event::UserEvent(AppEvent::Worker(event)) => match event {
                 UiEvent::ActionsChanged(state)=>{popover.action_state=state;rebuild=true;}
+                UiEvent::LabelRequestHandled=>{popover.label_request_handled();rebuild=true;}
                 UiEvent::IgnoredUpdated{prs:updated,error,loading}=>{ignored_prs=updated;ignored_error=error;ignored_loading=loading;rebuild=true;}
                 UiEvent::Updated{prs:updated,error,loading}=>{prs=updated;service_error=error;refreshing=loading;rebuild=true;}
                 UiEvent::Open{url,pr,update}=>{match open_and_acknowledge(&url,&pr,&update,&sender,open_url){

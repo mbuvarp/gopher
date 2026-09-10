@@ -527,3 +527,41 @@ async fn merge_rejects_unseen_same_head_evidence_before_starting_countdown() {
     );
     h.request(Request::CancelMerge("PR_1".into()));
 }
+
+#[tokio::test]
+async fn label_receipt_follows_pending_or_rejected_action_state() {
+    for accepted in [true, false] {
+        let mut h = Harness::new();
+        if accepted {
+            h.coordinator.state.labels.insert(
+                "PR_1".into(),
+                Labels {
+                    items: vec![Label {
+                        name: "one".into(),
+                        color: "ff0000".into(),
+                        selected: false,
+                    }],
+                    ..Default::default()
+                },
+            );
+        }
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        h.sink = Arc::new(move |event| captured.lock().unwrap().push(event));
+        h.request(Request::Label {
+            pr: "PR_1".into(),
+            name: "one".into(),
+            selected: true,
+        });
+        let events = events.lock().unwrap();
+        assert!(matches!(events.last(), Some(UiEvent::LabelRequestHandled)));
+        let UiEvent::ActionsChanged(state) = &events[events.len() - 2] else {
+            panic!("Receipt must follow action state");
+        };
+        if accepted {
+            assert!(state.labels["PR_1"].pending.contains("one"));
+        } else {
+            assert!(state.error.is_some());
+        }
+    }
+}

@@ -18,6 +18,8 @@ const IGNORED_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Debug)]
 pub enum UiEvent {
+    /// Sent after the action-state event for a label request, including rejection.
+    LabelRequestHandled,
     ActionsChanged(crate::actions::ActionState),
     IgnoredUpdated {
         prs: Vec<PullRequest>,

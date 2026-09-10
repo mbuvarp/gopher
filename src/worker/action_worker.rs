@@ -184,6 +184,7 @@ impl Coordinator {
         }
     }
     pub fn handle(&mut self, command: ActionCommand, context: &Context<'_>) {
+        let label_request = matches!(&command, ActionCommand::Request(Request::Label { .. }));
         match command {
             ActionCommand::Request(request) => {
                 if let Err(error) = self.request(request, context) {
@@ -330,6 +331,9 @@ impl Coordinator {
         }
         self.reconcile(context);
         self.publish(context);
+        if label_request {
+            (context.sink)(UiEvent::LabelRequestHandled);
+        }
     }
 
     fn request(&mut self, request: Request, context: &Context<'_>) -> Result<()> {

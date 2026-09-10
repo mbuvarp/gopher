@@ -46,6 +46,7 @@ struct TargetState {
     proxy: EventLoopProxy<AppEvent>,
     actions: RefCell<HashMap<isize, AppEvent>>,
     next_tag: std::cell::Cell<isize>,
+    pending_label_requests: std::cell::Cell<usize>,
     sender: UnboundedSender<Command>,
 }
 
@@ -71,8 +72,19 @@ define_class!(
                         }
                         _ => {}
                     }
+                    // Hold navigation immediately, before worker state reaches the UI.
+                    // Its acknowledgement follows the corresponding ActionsChanged event.
+                    let label_request = matches!(&request, Request::Label { .. });
+                    if label_request {
+                        let pending = &self.ivars().pending_label_requests;
+                        pending.set(pending.get() + 1);
+                        let _ = self.ivars().proxy.send_event(AppEvent::RefreshPopover);
+                    }
                     // Direct dispatch also works while AppKit tracks a menu.
-                    let _ = self.ivars().sender.send(Command::PrAction(ActionCommand::Request(request)));
+                    if self.ivars().sender.send(Command::PrAction(ActionCommand::Request(request))).is_err() && label_request {
+                        let pending = &self.ivars().pending_label_requests;
+                        pending.set(pending.get().saturating_sub(1));
+                    }
                 } else { let _ = self.ivars().proxy.send_event(event); }
             }
         }
@@ -88,6 +100,7 @@ impl ActionTarget {
             proxy,
             actions: RefCell::new(HashMap::new()),
             next_tag: std::cell::Cell::new(1),
+            pending_label_requests: std::cell::Cell::new(0),
             sender,
         });
         unsafe { msg_send![super(this), init] }
@@ -609,7 +622,21 @@ impl ReviewPopover {
     pub(super) fn show_labels(&mut self, pr: &PullRequest) {
         self.show_detail(DetailPanel::labels(pr, &self.target));
     }
+    pub(super) fn label_request_handled(&mut self) {
+        let pending = &self.target.ivars().pending_label_requests;
+        pending.set(pending.get().saturating_sub(1));
+    }
+    fn labels_saving(&self) -> bool {
+        self.target.ivars().pending_label_requests.get() > 0
+            || self
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.labels_saving(&self.action_state))
+    }
     pub(super) fn back(&mut self) {
+        if self.labels_saving() {
+            return;
+        }
         if let Some(detail) = self.detail.take() {
             detail.remove(&self.target);
             self.scroll.setDocumentView(Some(&self.document));
@@ -630,6 +657,7 @@ impl ReviewPopover {
         if self.rows.values().any(|row| row.actions.is_tracking()) {
             return;
         }
+        self.back.setEnabled(!self.labels_saving());
         let mtm = MainThreadMarker::new().unwrap();
         if let Some(detail) = &mut self.detail {
             self.refresh.setHidden(true);

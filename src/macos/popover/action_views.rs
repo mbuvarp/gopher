@@ -533,6 +533,15 @@ impl DetailPanel {
             Self::Labels(picker) => picker.title.clone(),
         }
     }
+    pub fn labels_saving(&self, state: &ActionState) -> bool {
+        match self {
+            Self::Labels(picker) => state
+                .labels
+                .get(&picker.id)
+                .is_some_and(|labels| !labels.pending.is_empty()),
+            Self::Configuration(_) => false,
+        }
+    }
     pub fn subtitle(&self) -> &'static str {
         match self {
             Self::Configuration(_) => "Changes save automatically for this repository.",

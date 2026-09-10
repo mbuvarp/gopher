@@ -25,7 +25,7 @@ Choose **Actions → Configure** on any active PR to configure actions for its r
 Conditions are **Always**, **Reviewing**, **Comments**, and **Approved**. Enabled actions remain visible but disabled when their condition is not met or PR data is stale. Draft PRs cannot be merged.
 
 - **Merge** offers Merge commit, Squash, or Rebase. Clicking it replaces the dropdown with **Cancel (5s)**, counting down before attempting the merge. Closing the menu/popover or navigating elsewhere does not cancel it; quitting Gopher does. Gopher rechecks the PR and targets the selected commit. GitHub blockers appear beneath the PR; Gopher does not enable auto-merge, join a merge queue, bypass protection, or retry automatically.
-- **Label** opens a persistent picker with colored dots and checked labels. Toggle several labels without leaving the panel; each change adds or removes only that label. **Refresh labels** reloads the available and assigned labels, and **Back** returns to the PR list.
+- **Label** opens a persistent picker with colored dots and checked labels. Toggle several labels without leaving the panel; each change adds or removes only that label. **Refresh labels** reloads the available and assigned labels, and **Back** returns to the PR list once pending saves finish. Back stays disabled while saving so failures remain visible in the picker.
 
 These actions use the authenticated GitHub CLI account and require its normal repository permissions. They are available in the popover; the alternative standard menu retains its existing review controls.
 
