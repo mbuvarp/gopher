@@ -18,6 +18,98 @@ fn mock_with_timeout(script: &str, timeout: u64) -> (tempfile::TempDir, Github) 
     .unwrap();
     (dir, github)
 }
+
+#[tokio::test]
+async fn merging_sends_the_exact_head_and_selected_method_and_reports_blockers() {
+    use gopher::{actions::MergeMethod, github::PrRef};
+    let pr = PrRef {
+        id: "PR_1".into(),
+        repo: "owner/repo".into(),
+        number: 42,
+    };
+    for method in MergeMethod::ALL {
+        let (_dir, gh) = mock(&format!(
+            r#"
+case "$*" in *'--method PUT repos/owner/repo/pulls/42/merge --input -'*) ;; *) exit 1;; esac
+input=$(cat)
+case "$input" in *'"merge_method":"{}"'*'"sha":"expected-head"'*) echo '{{"merged":true}}';; *) exit 1;; esac
+"#,
+            method.api_name()
+        ));
+        gh.merge_pr(&pr, "expected-head", method).await.unwrap();
+        assert!(gh.merge_pr(&pr, "", method).await.is_err());
+    }
+    let (_dir, gh) = mock(
+        "cat >/dev/null\necho '{\"message\":\"Required status check is pending\"}'\necho 'HTTP 405 PRIVATE_STDERR' >&2\nexit 1",
+    );
+    let error = gh
+        .merge_pr(&pr, "expected-head", MergeMethod::Merge)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Required status check is pending"));
+    assert!(!error.contains("PRIVATE_STDERR"));
+    let (_dir, gh) =
+        mock("cat >/dev/null\necho '{\"merged\":false,\"message\":\"Head branch was modified\"}'");
+    assert!(
+        gh.merge_pr(&pr, "expected-head", MergeMethod::Merge)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Head branch was modified")
+    );
+}
+
+#[tokio::test]
+async fn label_changes_are_incremental_and_escape_names_as_one_path_segment() {
+    let pr = gopher::github::PrRef {
+        id: "PR_1".into(),
+        repo: "owner/repo".into(),
+        number: 42,
+    };
+    let (_dir, gh) = mock(
+        r#"
+case "$*" in
+  *'--method POST repos/owner/repo/issues/42/labels --input -'*)
+    input=$(cat)
+    [ "$input" = '{"labels":["a/b, c"]}' ] || exit 1
+    echo '[]';;
+  *'--method DELETE repos/owner/repo/issues/42/labels/a%2Fb,%20c'*) echo '[]';;
+  *) exit 1;;
+esac
+"#,
+    );
+    gh.set_label(&pr, "a/b, c", true).await.unwrap();
+    gh.set_label(&pr, "a/b, c", false).await.unwrap();
+}
+
+#[tokio::test]
+async fn repository_and_selected_labels_are_both_fully_paginated() {
+    let first: Vec<_> = (0..100)
+        .map(|i| serde_json::json!({"name":format!("label-{i:03}"),"color":"ff0011"}))
+        .collect();
+    let first = serde_json::to_string(&first).unwrap();
+    let (_dir, gh) = mock(&format!(
+        r#"
+case "$*" in
+  *'&page=1') echo '{first}';;
+  *'&page=2') echo '[{{"name":"last","color":"123456"}}]';;
+  *) exit 1;;
+esac
+"#
+    ));
+    let labels = gh
+        .labels(&gopher::github::PrRef {
+            id: "PR_1".into(),
+            repo: "owner/repo".into(),
+            number: 42,
+        })
+        .await
+        .unwrap();
+    assert_eq!(labels.len(), 101);
+    assert!(labels.iter().all(|label| label.selected));
+    assert_eq!(labels.last().unwrap().color, "123456");
+}
 #[tokio::test]
 async fn authentication_failure_is_actionable_and_does_not_leak_stderr() {
     let (_dir, gh) = mock("cat >/dev/null\necho 'bad credentials (HTTP 401) SECRET' >&2\nexit 1");
@@ -104,12 +196,20 @@ async fn snapshot_paginates_reviews_independently_and_checks_head() {
     assert_eq!(snapshot.threads.len(), 1);
     assert!(!snapshot.threads[0].resolved);
     assert_eq!(snapshot.reactions.len(), 1);
+    assert_eq!(
+        snapshot
+            .labels
+            .iter()
+            .map(|l| (l.name.as_str(), l.color.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("bug", "d73a4a"), ("ready", "008800")]
+    );
 }
 #[tokio::test]
 async fn rejects_head_changes_during_pagination() {
     let script = include_str!("fixtures/gh-snapshot.sh").replace(
-        "\"headRefOid\":\"head\",\"reviews\":{\"nodes\":[{\"id\":\"review-2\"",
-        "\"headRefOid\":\"new-head\",\"reviews\":{\"nodes\":[{\"id\":\"review-2\"",
+        "\"headRefOid\":\"head\",\"labels\":{\"nodes\":[{\"name\":\"ready\"",
+        "\"headRefOid\":\"new-head\",\"labels\":{\"nodes\":[{\"name\":\"ready\"",
     );
     let (_dir, gh) = mock(&script);
     let pr = gopher::github::PrRef {

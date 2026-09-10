@@ -4,19 +4,30 @@ A native Rust macOS menu bar inbox for GitHub agent reviews. Tracks open PRs you
 
 ## Using Gopher
 
-**Left-click** the gopher in the menu bar to open a native, scrollable review inbox. Each PR has a status icon, title, review status, and unresolved-thread count. Unacknowledged actionable updates have **bold titles**. Click a title to acknowledge its displayed update without closing the popover; it returns to regular weight after the change is saved.
+**Left-click** the gopher in the menu bar to open a native, scrollable review inbox. Each PR has a status icon, title, review status, and unresolved-thread count, followed by compact pills in its GitHub label colors. Labels use the detail row’s font size, wrap when needed, and refresh during normal polling or after a successful label change. Unacknowledged actionable updates have **bold blue titles** and blue status icons. Click a title to acknowledge its displayed update without closing the popover; its title returns to regular weight and both title and icon return to their normal colors after the change is saved.
 
 The buttons beneath each PR let you:
 
 - **Open PR** in the browser and acknowledge the displayed update after it opens successfully.
 - Expand **Details** to inspect reviewer evidence.
-- **Ignore** the PR, hiding it from the active list, review polling, and notifications until restored.
+- Open the right-aligned **Actions** dropdown for repository configuration, enabled PR actions, and **Ignore** at the bottom. Ignore hides the PR from the active list, review polling, and notifications until restored.
 
-The header has **Refresh** and an **Actions** menu. Actions contains **Show ignored**, configuration, notification settings, logs, launch at login, and Quit Gopher. **Show ignored** replaces the active list with ignored PRs, showing **Restore** buttons and a **Back** button in the header. Restoring resumes discovery for eligible open PRs.
+The header has **Refresh** and an **Actions** menu. Refresh is disabled and reads **Refreshing...** while PRs are being fetched. Actions contains **Show ignored**, configuration, notification settings, logs, launch at login, and Quit Gopher. **Show ignored** replaces the active list with ignored PRs, showing **Restore** buttons and a **Back** button in the header. Restoring resumes discovery for eligible open PRs.
 
 The popover updates while open, retaining expanded details and each view's scroll position. Click outside to dismiss it. **Right-click** the menu bar icon for the alternative standard menu, where PR submenus include an **Acknowledge update** checkbox. Both interfaces share the same state and notification behavior.
 
 Ignored PRs are checked at startup and every 15 minutes without fetching reviews. Closed or merged PRs disappear from the ignored list, but keep their ignore flags: if reopened, they reappear there and remain ignored. Unavailable identities keep their cached state and do not block updates to accessible PRs. They can still be restored while offline.
+
+## PR actions
+
+Choose **Actions → Configure** on any active PR to configure actions for its repository. The table has **Action**, **Enabled**, **Condition**, and **Merge method** columns. Changes save immediately to SQLite and apply to every PR in that repository, without restarting. Both actions start disabled; Merge defaults to the Approved condition and Merge commit method, while Label defaults to Always.
+
+Conditions are **Always**, **Reviewing**, **Comments**, and **Approved**. Enabled actions remain visible but disabled when their condition is not met or PR data is stale. Draft PRs cannot be merged.
+
+- **Merge** offers Merge commit, Squash, or Rebase. Clicking it replaces the dropdown with **Cancel (5s)**, counting down before attempting the merge. Closing the menu/popover or navigating elsewhere does not cancel it; quitting Gopher does. Gopher rechecks the PR and targets the selected commit. GitHub blockers appear beneath the PR; Gopher does not enable auto-merge, join a merge queue, bypass protection, or retry automatically.
+- **Label** opens a persistent picker with colored dots and checked labels. Toggle several labels without leaving the panel; each change adds or removes only that label. **Refresh labels** reloads the available and assigned labels, and **Back** returns to the PR list.
+
+These actions use the authenticated GitHub CLI account and require its normal repository permissions. They are available in the popover; the alternative standard menu retains its existing review controls.
 
 ## Run
 
@@ -60,12 +71,12 @@ Everything is stored in `~/.config/gopher`:
 
 ```text
 config.toml           Optional settings; restart to apply
-state.sqlite3         Cached PRs, review evidence, acknowledgements, ignored PRs, notification history
+state.sqlite3         PR cache, review evidence, acknowledgements, ignored PRs, action settings, notification history
 logs/gopher.jsonl     Structured logs, at most 10,000 retained lines
 gopher.lock           Prevents concurrent app instances
 ```
 
-SQLite may also create `state.sqlite3-wal` and `state.sqlite3-shm`. GitHub remains authoritative. Cached data stays marked stale until successfully fetched. Changing the active GitHub account resets the active cache and acknowledgements; ignored PR flags and their archived details persist across account changes.
+SQLite may also create `state.sqlite3-wal` and `state.sqlite3-shm`. GitHub remains authoritative. Cached data stays marked stale until successfully fetched. Changing the active GitHub account resets the active cache and acknowledgements; ignored PR flags, their archived details, and repository action settings persist across account changes. Pending actions are not restored after restart.
 
 Use **Edit configuration** to create/open a configuration file, or copy [config.example.toml](config.example.toml). Settings include polling/discovery intervals, request timeout, result confirmation interval, logging verbosity, `gh_path`, notifications, and repository overrides:
 

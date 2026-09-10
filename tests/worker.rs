@@ -24,14 +24,19 @@ fn missing_cli_notifies_once_and_worker_shuts_down_cleanly() {
     )
     .unwrap();
     let mut notified = None;
+    let mut saw_refresh = false;
     loop {
         match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
             UiEvent::Notify { body, .. } => {
                 assert!(notified.replace(body).is_none());
             }
+            UiEvent::Updated { loading: true, .. } => saw_refresh = true,
             UiEvent::Updated {
-                error: Some(error), ..
+                error: Some(error),
+                loading: false,
+                ..
             } => {
+                assert!(saw_refresh);
                 assert_eq!(Some(error), notified);
                 break;
             }

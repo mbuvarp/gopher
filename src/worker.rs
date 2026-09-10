@@ -18,6 +18,7 @@ const IGNORED_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Debug)]
 pub enum UiEvent {
+    ActionsChanged(crate::actions::ActionState),
     IgnoredUpdated {
         prs: Vec<PullRequest>,
         error: Option<String>,
@@ -26,6 +27,7 @@ pub enum UiEvent {
     Updated {
         prs: Vec<PullRequest>,
         error: Option<String>,
+        loading: bool,
     },
     Notify {
         review: bool,
@@ -41,6 +43,13 @@ pub enum UiEvent {
     },
 }
 pub enum Command {
+    PrAction(ActionCommand),
+    LabelSaved {
+        pr: String,
+        viewer: String,
+        label: crate::model::PrLabel,
+        selected: bool,
+    },
     Refresh,
     Acknowledge {
         pr: String,
@@ -107,6 +116,7 @@ pub fn start(directory: PathBuf, config: Config, sink: Sink) -> Result<Worker> {
                 sink(UiEvent::Updated {
                     prs: vec![],
                     error: Some(error.to_string()),
+                    loading: false,
                 });
                 sink(UiEvent::Notify {
                     review: false,
@@ -195,6 +205,7 @@ async fn run(
     ignored_interval: Duration,
 ) -> Result<()> {
     let mut store = Store::open(&directory)?;
+    let mut pr_actions = action_worker::Coordinator::new(&store)?;
     let mut ignored = store.ignored()?;
     let mut prs: BTreeMap<_, _> = store
         .load()?
@@ -224,9 +235,11 @@ async fn run(
     let mut failures = 0_u32;
     let mut in_flight_notifications = BTreeSet::new();
     let mut dismiss_after_delivery = BTreeSet::new();
+    sink(UiEvent::ActionsChanged(pr_actions.state.clone()));
     sink(UiEvent::Updated {
         prs: prs.values().cloned().collect(),
         error: None,
+        loading: false,
     });
     loop {
         let command = tokio::select! {
@@ -234,6 +247,11 @@ async fn run(
             _ = tokio::time::sleep_until(ignored_deadline.into()), if !ignored_loading => Command::CheckIgnored,
             _ = tokio::time::sleep_until(deadline.into()), if !polling => {
                 polling = true;
+                sink(UiEvent::Updated {
+                    prs: prs.values().cloned().collect(),
+                    error: error.clone(),
+                    loading: true,
+                });
                 let config = config.clone();
                 let references = references.clone();
                 let viewer = viewer.clone();
@@ -248,6 +266,43 @@ async fn run(
             }
         };
         match command {
+            Command::LabelSaved {
+                pr: id,
+                viewer: account,
+                label,
+                selected,
+            } => {
+                if viewer.as_deref() == Some(account.as_str())
+                    && let Some(pr) = prs.get_mut(&id)
+                {
+                    pr.snapshot
+                        .labels
+                        .retain(|existing| existing.name != label.name);
+                    if selected {
+                        pr.snapshot.labels.push(label);
+                    }
+                    store.save(pr)?;
+                    // A poll started before the mutation must not replace its result.
+                    if polling {
+                        invalidated_poll_ids.insert(id);
+                        rediscover_after_poll = true;
+                    }
+                    deadline = Instant::now();
+                }
+            }
+            Command::PrAction(command) => {
+                pr_actions.handle(
+                    command,
+                    &action_worker::Context {
+                        store: &store,
+                        prs: &prs,
+                        viewer: viewer.as_deref(),
+                        config: &config,
+                        sender: &sender,
+                        sink: &sink,
+                    },
+                );
+            }
             Command::Shutdown => break,
             Command::Refresh => {
                 deadline = Instant::now();
@@ -532,9 +587,18 @@ async fn run(
                 }
             }
         }
+        pr_actions.reconcile(&action_worker::Context {
+            store: &store,
+            prs: &prs,
+            viewer: viewer.as_deref(),
+            config: &config,
+            sender: &sender,
+            sink: &sink,
+        });
         sink(UiEvent::Updated {
             prs: prs.values().cloned().collect(),
             error: error.clone(),
+            loading: polling,
         });
     }
     tracing::info!(event = "worker_stopped");
@@ -728,7 +792,7 @@ esac
             })))
             .unwrap();
         assert!(
-            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), UiEvent::Updated {prs,error:None} if prs.is_empty())
+            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), UiEvent::Updated {prs,error:None,..} if prs.is_empty())
         );
         worker
             .sender
@@ -835,12 +899,16 @@ esac
             assert!(started.elapsed() < Duration::from_secs(5));
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            UiEvent::Updated { loading: true, .. }
+        ));
         worker
             .sender
             .send(Command::PollComplete(Ok(batch())))
             .unwrap();
         assert!(
-            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(),UiEvent::Updated{prs,..} if prs.len()==1)
+            matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(),UiEvent::Updated{prs,loading:false,..} if prs.len()==1)
         );
         drop(worker);
         let store = Store::open(directory.path()).unwrap();
@@ -931,3 +999,5 @@ esac
         );
     }
 }
+mod action_worker;
+pub use action_worker::ActionCommand;

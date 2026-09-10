@@ -53,6 +53,8 @@ enum AppEvent {
     TogglePopover,
     PopoverAction(Action),
     ToggleDetails(String),
+    PrAction(crate::actions::Request),
+    RefreshPopover,
 }
 
 const REVIEW_CATEGORY: &str = "gopher.review";
@@ -153,6 +155,8 @@ enum Action {
     Restore(String),
     ShowIgnored,
     BackToActive,
+    ConfigureRepo(String),
+    Labels(String),
     Ack {
         pr: String,
         update: String,
@@ -307,7 +311,8 @@ pub fn run(directory: PathBuf, config: Config) -> Result<()> {
         delegate = Some(notification_delegate);
     }
     let pr_menu_target = PrMenuTarget::new(event_loop.create_proxy());
-    let mut popover = popover::ReviewPopover::new(event_loop.create_proxy(), bundled);
+    let mut popover =
+        popover::ReviewPopover::new(event_loop.create_proxy(), bundled, sender.clone());
     let tray_proxy = event_loop.create_proxy();
     TrayIconEvent::set_event_handler(Some(move |event| {
         if matches!(
@@ -328,6 +333,7 @@ pub fn run(directory: PathBuf, config: Config) -> Result<()> {
     let mut ignored_prs = Vec::new();
     let mut ignored_error = None;
     let mut ignored_loading = false;
+    let mut refreshing = false;
     let mut service_error = None;
     let mut ui_error = if bundled {
         None
@@ -359,8 +365,9 @@ pub fn run(directory: PathBuf, config: Config) -> Result<()> {
             }
             Event::UserEvent(AppEvent::NotificationError(message)) => {ui_error=Some(message);rebuild=true;}
             Event::UserEvent(AppEvent::Worker(event)) => match event {
+                UiEvent::ActionsChanged(state)=>{popover.action_state=state;rebuild=true;}
                 UiEvent::IgnoredUpdated{prs:updated,error,loading}=>{ignored_prs=updated;ignored_error=error;ignored_loading=loading;rebuild=true;}
-                UiEvent::Updated{prs:updated,error}=>{prs=updated;service_error=error;rebuild=true;}
+                UiEvent::Updated{prs:updated,error,loading}=>{prs=updated;service_error=error;refreshing=loading;rebuild=true;}
                 UiEvent::Open{url,pr,update}=>{match open_and_acknowledge(&url,&pr,&update,&sender,open_url){
                     Ok(())=>{}
                     Err(e)=>{ui_error=Some(e.to_string());rebuild=true;}
@@ -383,6 +390,8 @@ pub fn run(directory: PathBuf, config: Config) -> Result<()> {
                 }
             },
             Event::UserEvent(AppEvent::MenuClosed) => {}
+            Event::UserEvent(AppEvent::RefreshPopover) => {rebuild=true;}
+            Event::UserEvent(AppEvent::PrAction(request)) => {let _=sender.send(Command::PrAction(crate::worker::ActionCommand::Request(request)));}
             Event::UserEvent(AppEvent::TogglePopover) => {
                 if let Some(tray) = &tray { popover.toggle(tray); }
             }
@@ -403,7 +412,15 @@ pub fn run(directory: PathBuf, config: Config) -> Result<()> {
                             Action::Ignore(pr)=>{let _=sender.send(Command::Ignore(pr.clone()));}
                             Action::Restore(pr)=>{let _=sender.send(Command::Restore(pr.clone()));}
                             Action::ShowIgnored=>{popover.show_ignored(true);let _=sender.send(Command::ShowIgnored);rebuild=true;}
-                            Action::BackToActive=>{popover.show_ignored(false);rebuild=true;}
+                            Action::BackToActive=>{popover.back();rebuild=true;}
+                            Action::ConfigureRepo(repo)=>{popover.configure_repo(repo);rebuild=true;}
+                            Action::Labels(id)=>{
+                                if let Some(pr)=prs.iter().find(|pr|&pr.snapshot.id==id) {
+                                    popover.show_labels(pr);
+                                    let _=sender.send(Command::PrAction(crate::worker::ActionCommand::Request(crate::actions::Request::LoadLabels(id.clone()))));
+                                    rebuild=true;
+                                }
+                            }
                             Action::Ack{pr,update,checked}=>{let _=sender.send(Command::Acknowledge{pr:pr.clone(),update:update.clone(),checked:*checked});}
                             Action::Refresh=>{
                                 let _=sender.send(Command::Refresh);
@@ -447,7 +464,7 @@ pub fn run(directory: PathBuf, config: Config) -> Result<()> {
             if popover.is_showing_ignored() {
                 popover.update(&ignored_prs, ignored_error.as_deref(), bundled, ignored_loading);
             } else {
-                popover.update(&prs, service_error.as_deref().or(ui_error.as_deref()), bundled, false);
+                popover.update(&prs, service_error.as_deref().or(ui_error.as_deref()), bundled, refreshing);
             }
         }
         let update_menu = {
