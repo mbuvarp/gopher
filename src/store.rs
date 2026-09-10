@@ -20,6 +20,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, pr_id TEXT NOT NULL, update_id TEXT NOT NULL, url TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS ignored_prs (id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS ignored_pr_details (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS repository_actions (repo TEXT PRIMARY KEY, data TEXT NOT NULL);
             PRAGMA user_version=2; COMMIT;")?;
         Ok(Self { connection })
     }
@@ -29,6 +30,41 @@ impl Store {
         Ok(query
             .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn action_preferences(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, crate::actions::Preferences>> {
+        let mut query = self
+            .connection
+            .prepare("SELECT repo,data FROM repository_actions")?;
+        query
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .map(|row| {
+                let (repo, data) = row?;
+                Ok((
+                    repo,
+                    serde_json::from_str(&data).context("Invalid repository action settings")?,
+                ))
+            })
+            .collect()
+    }
+
+    pub fn save_action_preferences(
+        &self,
+        repo: &str,
+        preferences: &crate::actions::Preferences,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO repository_actions (repo,data) VALUES (?1,?2)",
+            params![
+                crate::actions::repo_key(repo),
+                serde_json::to_string(preferences)?
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn ignore(&mut self, id: &str) -> Result<Vec<String>> {

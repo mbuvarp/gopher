@@ -2,6 +2,14 @@
 //! actions capture the update displayed at activation, before entering the actor.
 use super::{Action, AppEvent, repo_heading, repo_parts};
 use crate::model::{PullRequest, State};
+use crate::{
+    actions::{ActionState, Request, Setting},
+    worker::{ActionCommand, Command},
+};
+use tokio::sync::mpsc::UnboundedSender;
+mod action_views;
+mod label_pills;
+use action_views::{DetailPanel, PrActions};
 use objc2::{
     DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained, sel,
 };
@@ -38,6 +46,8 @@ struct TargetState {
     proxy: EventLoopProxy<AppEvent>,
     actions: RefCell<HashMap<isize, AppEvent>>,
     next_tag: std::cell::Cell<isize>,
+    pending_label_requests: std::cell::Cell<usize>,
+    sender: UnboundedSender<Command>,
 }
 
 define_class!(
@@ -52,17 +62,46 @@ define_class!(
             // All callers are controls or menu items with the documented tag property.
             let tag: isize = unsafe { msg_send![sender, tag] };
             if let Some(event) = self.ivars().actions.borrow().get(&tag).cloned() {
-                let _ = self.ivars().proxy.send_event(event);
+                if let AppEvent::PrAction(mut request) = event {
+                    // Checkbox state is the user's latest click, even before the
+                    // worker has persisted an earlier click on the same control.
+                    match &mut request {
+                        Request::Configure { change: Setting::Enabled(_, value), .. } | Request::Label { selected: value, .. } => {
+                            let state: isize = unsafe { msg_send![sender, state] };
+                            *value = state == NSControlStateValueOn;
+                        }
+                        _ => {}
+                    }
+                    // Hold navigation immediately, before worker state reaches the UI.
+                    // Its acknowledgement follows the corresponding ActionsChanged event.
+                    let label_request = matches!(&request, Request::Label { .. });
+                    if label_request {
+                        let pending = &self.ivars().pending_label_requests;
+                        pending.set(pending.get() + 1);
+                        let _ = self.ivars().proxy.send_event(AppEvent::RefreshPopover);
+                    }
+                    // Direct dispatch also works while AppKit tracks a menu.
+                    if self.ivars().sender.send(Command::PrAction(ActionCommand::Request(request))).is_err() && label_request {
+                        let pending = &self.ivars().pending_label_requests;
+                        pending.set(pending.get().saturating_sub(1));
+                    }
+                } else { let _ = self.ivars().proxy.send_event(event); }
             }
         }
     }
 );
 impl ActionTarget {
-    fn new(proxy: EventLoopProxy<AppEvent>, mtm: MainThreadMarker) -> Retained<Self> {
+    fn new(
+        proxy: EventLoopProxy<AppEvent>,
+        sender: UnboundedSender<Command>,
+        mtm: MainThreadMarker,
+    ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(TargetState {
             proxy,
             actions: RefCell::new(HashMap::new()),
             next_tag: std::cell::Cell::new(1),
+            pending_label_requests: std::cell::Cell::new(0),
+            sender,
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -154,9 +193,12 @@ struct Row {
     icon: Retained<NSImageView>,
     title: Retained<NSButton>,
     status: Retained<NSTextField>,
+    labels: label_pills::LabelPills,
     open: Retained<NSButton>,
     disclosure: Retained<NSButton>,
     ignore: Retained<NSButton>,
+    actions: PrActions,
+    action_message: Retained<NSTextField>,
     details: Retained<NSTextField>,
 }
 impl Row {
@@ -173,6 +215,8 @@ impl Row {
         title.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
         title.setFrame(rect(46.0, 4.0, CONTENT_WIDTH - 46.0, 28.0));
         let status = label("", 11.0, true, mtm);
+        status.setMaximumNumberOfLines(1);
+        status.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
         status.setFrame(rect(49.0, 34.0, CONTENT_WIDTH - 52.0, 18.0));
         let open = target.button("Open PR", placeholder.clone(), mtm);
         open.setFrame(rect(0.0, 57.0, 84.0, 26.0));
@@ -181,6 +225,9 @@ impl Row {
         let ignore = target.button("Ignore", placeholder, mtm);
         ignore.setFrame(rect(196.0, 57.0, 72.0, 26.0));
         let details = label("", 12.0, true, mtm);
+        let actions = PrActions::new(pr, target, mtm);
+        let action_message = label("", 11.0, false, mtm);
+        action_message.setTextColor(Some(&NSColor::systemRedColor()));
         details.setSelectable(true);
         for child in [
             &*icon as &NSView,
@@ -190,6 +237,9 @@ impl Row {
             &*disclosure,
             &*ignore,
             &*details,
+            &*actions.button,
+            &*actions.cancel,
+            &*action_message,
         ] {
             view.addSubview(child);
         }
@@ -198,10 +248,13 @@ impl Row {
             icon,
             title,
             status,
+            labels: Default::default(),
             open,
             disclosure,
             ignore,
             details,
+            actions,
+            action_message,
         }
     }
     fn update(
@@ -210,6 +263,7 @@ impl Row {
         expanded: bool,
         ignored: bool,
         target: &ActionTarget,
+        action_state: &ActionState,
     ) -> f64 {
         let state = if pr.stale && !ignored {
             State::Unknown
@@ -217,7 +271,11 @@ impl Row {
             pr.state
         };
         self.title.setTitle(&NSString::from_str(&display_title(pr)));
-        let font = if !ignored && pr.needs_attention() {
+        let needs_attention = !ignored && pr.needs_attention();
+        let tint = needs_attention.then(NSColor::systemBlueColor);
+        self.title.setContentTintColor(tint.as_deref());
+        self.icon.setContentTintColor(tint.as_deref());
+        let font = if needs_attention {
             NSFont::boldSystemFontOfSize(13.0)
         } else {
             NSFont::systemFontOfSize(13.0)
@@ -264,6 +322,19 @@ impl Row {
                 )
             },
         );
+        let label_height = self
+            .labels
+            .update(&self.view, &self.status, &pr.snapshot.labels);
+        for button in [
+            &*self.open as &NSView,
+            &*self.disclosure,
+            &*self.ignore,
+            &*self.actions.button,
+            &*self.actions.cancel,
+        ] {
+            let frame = button.frame();
+            button.setFrameOrigin(NSPoint::new(frame.origin.x, 57.0 + label_height));
+        }
         self.title.setEnabled(!pr.stale && !ignored);
         self.open.setEnabled(!pr.snapshot.url.is_empty());
         self.ignore.setTitle(&NSString::from_str(if ignored {
@@ -271,6 +342,8 @@ impl Row {
         } else {
             "Ignore"
         }));
+        self.ignore.setHidden(!ignored);
+        self.actions.update(pr, ignored, action_state, target);
         target.bind(
             &self.title,
             AppEvent::PopoverAction(Action::Ack {
@@ -301,6 +374,30 @@ impl Row {
             "Details"
         }));
         self.details.setHidden(!expanded);
+        let action_error = if ignored {
+            None
+        } else {
+            match action_state.merges.get(&pr.snapshot.id) {
+                Some(crate::actions::MergeProgress::Failed(error)) => Some(error.as_str()),
+                _ => None,
+            }
+        };
+        self.action_message.setHidden(action_error.is_none());
+        let mut extra = label_height;
+        if let Some(error) = action_error {
+            set_text(&self.action_message, error);
+            let height = self
+                .action_message
+                .sizeThatFits(NSSize::new(CONTENT_WIDTH - 12.0, 10000.0))
+                .height;
+            self.action_message.setFrame(rect(
+                4.0,
+                88.0 + label_height,
+                CONTENT_WIDTH - 12.0,
+                height,
+            ));
+            extra += height + 8.0;
+        }
         if expanded {
             set_text(&self.details, &details(pr));
             let height = self
@@ -308,14 +405,15 @@ impl Row {
                 .sizeThatFits(NSSize::new(CONTENT_WIDTH - 12.0, 10000.0))
                 .height;
             self.details
-                .setFrame(rect(4.0, 94.0, CONTENT_WIDTH - 12.0, height));
-            106.0 + height
+                .setFrame(rect(4.0, 94.0 + extra, CONTENT_WIDTH - 12.0, height));
+            106.0 + height + extra
         } else {
-            98.0
+            98.0 + extra
         }
     }
     fn remove(&self, target: &ActionTarget) {
         self.view.removeFromSuperview();
+        self.actions.remove(target);
         for button in [&self.title, &self.open, &self.disclosure, &self.ignore] {
             target.ivars().actions.borrow_mut().remove(&button.tag());
         }
@@ -346,12 +444,18 @@ pub(super) struct ReviewPopover {
     rows: HashMap<String, Row>,
     headings: HashMap<String, RepositoryHeading>,
     expanded: [HashSet<String>; 2],
+    detail: Option<DetailPanel>,
+    pub(super) action_state: ActionState,
     target: Retained<ActionTarget>,
 }
 impl ReviewPopover {
-    pub(super) fn new(proxy: EventLoopProxy<AppEvent>, bundled: bool) -> Self {
+    pub(super) fn new(
+        proxy: EventLoopProxy<AppEvent>,
+        bundled: bool,
+        sender: UnboundedSender<Command>,
+    ) -> Self {
         let mtm = MainThreadMarker::new().expect("Popover must be created on the main thread");
-        let target = ActionTarget::new(proxy, mtm);
+        let target = ActionTarget::new(proxy, sender, mtm);
         let content = FlippedView::new(rect(0.0, 0.0, WIDTH, HEIGHT), mtm);
         let title = label("Gopher", 21.0, false, mtm);
         title.setFont(Some(&NSFont::boldSystemFontOfSize(21.0)));
@@ -361,7 +465,7 @@ impl ReviewPopover {
         summary.setFrame(rect(20.0, 48.0, 330.0, 20.0));
         content.addSubview(&summary);
         let refresh = target.button("Refresh", AppEvent::PopoverAction(Action::Refresh), mtm);
-        refresh.setFrame(rect(WIDTH - 190.0, 24.0, 82.0, 28.0));
+        refresh.setFrame(rect(WIDTH - 218.0, 24.0, 110.0, 28.0));
         content.addSubview(&refresh);
         let back = target.button("Back", AppEvent::PopoverAction(Action::BackToActive), mtm);
         back.setFrame(rect(WIDTH - 104.0, 24.0, 90.0, 28.0));
@@ -463,6 +567,8 @@ impl ReviewPopover {
             headings: HashMap::new(),
             expanded: Default::default(),
             target,
+            detail: None,
+            action_state: ActionState::default(),
         }
     }
     pub(super) fn toggle(&self, tray: &TrayIcon) {
@@ -501,6 +607,44 @@ impl ReviewPopover {
             self.restore_scroll = true;
         }
     }
+    fn show_detail(&mut self, panel: DetailPanel) {
+        self.scroll_positions[usize::from(self.showing_ignored)] =
+            self.scroll.contentView().bounds().origin;
+        self.scroll.setDocumentView(Some(panel.view()));
+        self.detail = Some(panel);
+        self.scroll
+            .contentView()
+            .scrollToPoint(NSPoint::new(0.0, 0.0));
+    }
+    pub(super) fn configure_repo(&mut self, repo: &str) {
+        self.show_detail(DetailPanel::configuration(repo, &self.target));
+    }
+    pub(super) fn show_labels(&mut self, pr: &PullRequest) {
+        self.show_detail(DetailPanel::labels(pr, &self.target));
+    }
+    pub(super) fn label_request_handled(&mut self) {
+        let pending = &self.target.ivars().pending_label_requests;
+        pending.set(pending.get().saturating_sub(1));
+    }
+    fn labels_saving(&self) -> bool {
+        self.target.ivars().pending_label_requests.get() > 0
+            || self
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.labels_saving(&self.action_state))
+    }
+    pub(super) fn back(&mut self) {
+        if self.labels_saving() {
+            return;
+        }
+        if let Some(detail) = self.detail.take() {
+            detail.remove(&self.target);
+            self.scroll.setDocumentView(Some(&self.document));
+            self.restore_scroll = true;
+        } else {
+            self.show_ignored(false);
+        }
+    }
     pub(super) fn update(
         &mut self,
         prs: &[PullRequest],
@@ -508,9 +652,43 @@ impl ReviewPopover {
         bundled: bool,
         loading: bool,
     ) {
+        // Keep rows, action bindings, headings, and layout intact while a native
+        // menu is tracking. menuDidClose requests an update with the latest state.
+        if self.rows.values().any(|row| row.actions.is_tracking()) {
+            return;
+        }
+        self.back.setEnabled(!self.labels_saving());
         let mtm = MainThreadMarker::new().unwrap();
+        if let Some(detail) = &mut self.detail {
+            self.refresh.setHidden(true);
+            self.actions.setHidden(true);
+            self.back.setHidden(false);
+            self.title.setFrame(rect(20.0, 20.0, WIDTH - 140.0, 28.0));
+            self.title
+                .setFont(Some(&NSFont::boldSystemFontOfSize(17.0)));
+            set_text(&self.title, &detail.title());
+            self.title
+                .setToolTip(Some(&NSString::from_str(&detail.title())));
+            let message = self.action_state.error.as_deref().or(error);
+            set_text(&self.summary, message.unwrap_or(detail.subtitle()));
+            self.summary
+                .setToolTip(message.map(NSString::from_str).as_deref());
+            detail.update(prs, &self.action_state, &self.target);
+            return;
+        }
+        self.title.setFrame(rect(20.0, 16.0, 200.0, 28.0));
+        self.title
+            .setFont(Some(&NSFont::boldSystemFontOfSize(21.0)));
+        self.title.setToolTip(None);
+        self.summary.setToolTip(None);
         let ignored = self.showing_ignored;
         self.refresh.setHidden(ignored);
+        self.refresh.setEnabled(!loading);
+        self.refresh.setTitle(&NSString::from_str(if loading {
+            "Refreshing..."
+        } else {
+            "Refresh"
+        }));
         self.actions.setHidden(ignored);
         self.back.setHidden(!ignored);
         set_text(&self.title, if ignored { "Ignored PRs" } else { "Gopher" });
@@ -579,6 +757,7 @@ impl ReviewPopover {
             (org.to_lowercase(), repo.to_lowercase(), pr.snapshot.number)
         });
         let mut y = 8.0;
+        let error = self.action_state.error.as_deref().or(error);
         self.banner.setHidden(error.is_none());
         if let Some(error) = error {
             set_text(&self.banner, error);
@@ -630,6 +809,7 @@ impl ReviewPopover {
                 expanded.contains(&pr.snapshot.id),
                 ignored,
                 &self.target,
+                &self.action_state,
             );
             row.view.setFrame(rect(16.0, y, CONTENT_WIDTH, height));
             y += height;

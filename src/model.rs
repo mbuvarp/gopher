@@ -119,6 +119,12 @@ pub struct Check {
     pub completed_at: String,
     pub summary: String,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrLabel {
+    pub name: String,
+    pub color: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Snapshot {
     pub id: String,
@@ -134,6 +140,8 @@ pub struct Snapshot {
     pub reactions: Vec<Reaction>,
     pub threads: Vec<Thread>,
     pub checks: Vec<Check>,
+    #[serde(default)]
+    pub labels: Vec<PrLabel>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

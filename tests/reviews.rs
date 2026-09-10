@@ -417,6 +417,34 @@ fn title_change_does_not_reset_acknowledgement() {
     assert!(!transition(s, Some(&first), None, 130, 0).needs_attention());
 }
 #[test]
+fn labels_persist_without_resetting_acknowledgement_and_legacy_cache_still_loads() {
+    let mut snapshot = snapshot();
+    snapshot
+        .reviews
+        .push(review(Agent::Cubic, "0 issues found"));
+    let mut previous = transition(snapshot.clone(), None, None, 100, 0);
+    previous.acknowledged = Some(previous.update_id.clone());
+    snapshot.labels.push(PrLabel {
+        name: "bug".into(),
+        color: "d73a4a".into(),
+    });
+    let current = transition(snapshot, Some(&previous), None, 130, 0);
+    assert_eq!(current.update_id, previous.update_id);
+    assert!(!current.needs_attention());
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    store.save(&current).unwrap();
+    assert_eq!(
+        store.load().unwrap()[0].snapshot.labels,
+        current.snapshot.labels
+    );
+    let mut legacy = serde_json::to_value(&current).unwrap();
+    legacy["snapshot"].as_object_mut().unwrap().remove("labels");
+    let restored: PullRequest = serde_json::from_value(legacy).unwrap();
+    assert!(restored.snapshot.labels.is_empty());
+    assert_eq!(restored.acknowledged, previous.acknowledged);
+}
+#[test]
 fn sqlite_persists_ack_and_deduplicates_notifications() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();

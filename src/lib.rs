@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod config;
 pub mod github;
 pub mod logging;

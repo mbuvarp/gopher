@@ -56,6 +56,24 @@ impl Github {
         payload: Option<&Value>,
         allow_missing_nodes: bool,
     ) -> Result<Value> {
+        self.execute_response(
+            args,
+            payload,
+            if allow_missing_nodes {
+                ResponsePolicy::MissingNodes
+            } else {
+                ResponsePolicy::Strict
+            },
+        )
+        .await
+    }
+
+    async fn execute_response(
+        &self,
+        args: &[&str],
+        payload: Option<&Value>,
+        policy: ResponsePolicy,
+    ) -> Result<Value> {
         let start = Instant::now();
         let request = request_kind(args, payload);
         let mut command = Command::new(&self.executable);
@@ -92,7 +110,7 @@ impl Github {
             // gh exits nonzero for GraphQL node-resolution errors, even when
             // unrelated nodes succeeded. Only the ignored-identity lookup may
             // accept these narrowly validated partial responses.
-            if allow_missing_nodes
+            if matches!(policy, ResponsePolicy::MissingNodes)
                 && let Ok(response) = serde_json::from_slice::<Value>(&output.stdout)
                 && only_missing_node_errors(&response)
             {
@@ -108,6 +126,15 @@ impl Github {
                     exit_code = output.status.code(),
                     elapsed_ms = start.elapsed().as_millis() as u64
                 );
+                if matches!(policy, ResponsePolicy::Mutation)
+                    && let Ok(response) = serde_json::from_slice::<Value>(&output.stdout)
+                    && response["message"].is_string()
+                {
+                    bail!(
+                        "GitHub: {}",
+                        actions::message(&response, "Action was rejected")
+                    );
+                }
                 bail!("{}", failure.message);
             }
             serde_json::from_slice(&output.stdout).context("GitHub CLI returned invalid JSON")
@@ -262,13 +289,19 @@ impl Github {
     #[tracing::instrument(skip_all, fields(repo=%reference.repo, pr=reference.number))]
     pub async fn snapshot(&self, reference: &PrRef) -> Result<Snapshot> {
         let start = Instant::now();
-        let mut cursors = [Value::Null, Value::Null, Value::Null, Value::Null];
-        let mut done = [false; 4];
+        let mut cursors = [
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ];
+        let mut done = [false; 5];
         let mut snapshot = Snapshot::default();
         let mut initial = true;
         // Independent connection cursors avoid truncating a busy PR or skipping nested pages.
         loop {
-            let data = self.graphql(PR_QUERY, json!({"id":reference.id,"r":cursors[0],"c":cursors[1],"t":cursors[2],"e":cursors[3],"reviews":!done[0],"comments":!done[1],"threads":!done[2],"reactions":!done[3]})).await?;
+            let data = self.graphql(PR_QUERY, json!({"id":reference.id,"r":cursors[0],"c":cursors[1],"t":cursors[2],"e":cursors[3],"reviews":!done[0],"comments":!done[1],"threads":!done[2],"reactions":!done[3],"l":cursors[4],"labels":!done[4]})).await?;
             let pr = &data["node"];
             let head = required(pr, "headRefOid")?;
             if initial {
@@ -292,9 +325,15 @@ impl Github {
                 snapshot.head == head && pr["state"] == "OPEN",
                 "PR changed during pagination; retrying next poll"
             );
-            for (index, key) in ["reviews", "comments", "reviewThreads", "reactions"]
-                .into_iter()
-                .enumerate()
+            for (index, key) in [
+                "reviews",
+                "comments",
+                "reviewThreads",
+                "reactions",
+                "labels",
+            ]
+            .into_iter()
+            .enumerate()
             {
                 if done[index] {
                     continue;
@@ -339,6 +378,10 @@ impl Github {
                             author: string(&node["user"], "login"),
                             content: string(node, "content"),
                             created_at: string(node, "createdAt"),
+                        }),
+                        4 => snapshot.labels.push(crate::model::PrLabel {
+                            name: required(node, "name")?.into(),
+                            color: required(node, "color")?.into(),
                         }),
                         _ => unreachable!(),
                     }
@@ -619,9 +662,13 @@ fn next_cursor(connection: &Value) -> Result<Option<String>> {
 }
 
 const PR_QUERY: &str = r#"
-query($id:ID!,$r:String,$c:String,$t:String,$e:String,$reviews:Boolean!,$comments:Boolean!,$threads:Boolean!,$reactions:Boolean!) {
+query($id:ID!,$r:String,$c:String,$t:String,$e:String,$reviews:Boolean!,$comments:Boolean!,$threads:Boolean!,$reactions:Boolean!,$l:String,$labels:Boolean!) {
  node(id:$id) { ... on PullRequest {
   title url state isDraft headRefOid
+  labels(first:100,after:$l) @include(if:$labels) {
+   pageInfo { hasNextPage endCursor }
+   nodes { name color }
+  }
   reviews(first:100,after:$r) @include(if:$reviews) {
    pageInfo { hasNextPage endCursor }
    nodes { id author { login } body state submittedAt commit { oid } }
@@ -693,4 +740,12 @@ mod tests {
     fn legacy_statuses_cannot_impersonate_an_agent_by_context_alone() {
         assert!(legacy_checks(&[json!({"id":1,"context":"CodeRabbit","creator":{"login":"someone"},"state":"pending"})]).is_empty());
     }
+}
+mod actions;
+
+#[derive(Clone, Copy)]
+enum ResponsePolicy {
+    Strict,
+    MissingNodes,
+    Mutation,
 }
