@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import sparkle
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -54,7 +55,7 @@ def signing_identity(release):
     return identity
 
 
-def write_info(destination, version):
+def write_info(destination, version, release=False):
     with (ROOT / "packaging/Info.plist").open("rb") as source:
         info = plistlib.load(source)
     info.update(
@@ -63,6 +64,8 @@ def write_info(destination, version):
         LSMinimumSystemVersion=MINIMUM_OS,
         GopherInstallerProtocol=1,
     )
+    if release:
+        info.update(sparkle.info())
     with destination.open("wb") as target:
         plistlib.dump(info, target, sort_keys=False)
 
@@ -82,6 +85,8 @@ def verify_bundle(bundle, version, release=False):
         "LSMinimumSystemVersion": MINIMUM_OS,
         "CFBundleIdentifier": "dev.mbuvarp.gopher",
     }
+    if release:
+        expected.update(sparkle.info())
     if any(info.get(key) != value for key, value in expected.items()):
         raise ValueError("Packaged app metadata does not match the Cargo version")
     if not os.access(binary, os.X_OK):
@@ -135,7 +140,7 @@ def build(release):
         resources = bundle / "Contents/Resources"
         resources.mkdir()
         shutil.copy2(binary, bundle / "Contents/MacOS/gopher")
-        write_info(bundle / "Contents/Info.plist", version)
+        write_info(bundle / "Contents/Info.plist", version, release=release)
         iconset = stage / "Gopher.iconset"
         iconset.mkdir()
         for size in (16, 32, 128, 256, 512):
@@ -145,6 +150,10 @@ def build(release):
                 run("sips", "-z", pixels, pixels, str(ROOT / "assets/gopher-app.png"),
                     "--out", str(iconset / f"icon_{size}x{size}{suffix}.png"), stdout=subprocess.DEVNULL)
         run("iconutil", "-c", "icns", str(iconset), "-o", str(resources / "Gopher.icns"))
+        if release:
+            sdk_context = sparkle.sdk()
+            sdk_path = Path(sdk_context.name)
+            sparkle.embed(bundle, sdk_path, identity)
         run("codesign", "--force", "--sign", identity, str(bundle))
         verify_bundle(bundle, version, release=release)
         products = [bundle]
@@ -160,7 +169,10 @@ def build(release):
                 for chunk in iter(lambda: source.read(1024 * 1024), b""):
                     digest.update(chunk)
             checksum.write_text(f"{digest.hexdigest()}  {archive.name}\n")
-            products.extend([archive, checksum])
+            feed = stage / "appcast.xml"
+            sparkle.appcast(archive, version, sdk_path, feed, os.environ.get("GOPHER_UPDATE_KEY_FILE"))
+            products.extend([archive, checksum, feed])
+            sdk_context.cleanup()
             installer = stage / "install.sh"
             shutil.copy2(ROOT / "scripts/install.sh", installer)
             products.append(installer)

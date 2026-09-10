@@ -115,6 +115,24 @@ fn matching_process(pid: u32, target: &Path) -> Result<bool> {
         && path.trim() == text(&target.join("Contents/MacOS/gopher"))?)
 }
 
+fn has_update_installer(processes: &str, uid: &str, target: &Path) -> bool {
+    let executable = target.join("Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate");
+    processes.lines().any(|line| {
+        line.trim()
+            .split_once(char::is_whitespace)
+            .is_some_and(|(owner, path)| owner == uid && Path::new(path.trim()) == executable)
+    })
+}
+
+fn ensure_no_update_installer(target: &Path) -> Result<()> {
+    let processes = command("/bin/ps", &["-axww", "-o", "uid=,comm="])?;
+    ensure!(
+        !has_update_installer(&processes, &command("/usr/bin/id", &["-u"])?, target),
+        "Gopher's in-app updater is running. Let it finish, then rerun the installer"
+    );
+    Ok(())
+}
+
 fn acquire_app_lock(lock: &File, data: &Path, target: &Path) -> Result<bool> {
     match fs2::FileExt::try_lock_exclusive(lock) {
         Ok(()) => return Ok(false),
@@ -237,7 +255,11 @@ pub fn install(no_launch: bool) -> Result<()> {
     let data = crate::config::Config::directory()?;
     fs::create_dir_all(&data)?;
     let app_lock = lock_file(&data.join("gopher.lock"))?;
+    ensure_no_update_installer(&target)?;
     let was_running = acquire_app_lock(&app_lock, &data, &target)?;
+    // A scheduled update can start between staging and the app finishing quit.
+    // Its installer runs outside the host and does not own Gopher's app lock.
+    ensure_no_update_installer(&target)?;
     let backup = stage.path().join("previous.app");
     if let Err(error) = replace(&staged_app, &target, &backup) {
         // Never let temporary-directory cleanup delete the only surviving old app.
@@ -300,6 +322,32 @@ mod tests {
         let apps = applications_directory(&home).unwrap();
         assert!(apps.is_dir());
         assert_eq!(applications_directory(&home).unwrap(), apps);
+    }
+
+    #[test]
+    fn update_installer_detection_matches_owner_and_exact_bundle_path() {
+        let target = Path::new("/Users/test/Applications/Gopher.app");
+        let helper = "/Users/test/Applications/Gopher.app/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate";
+        assert!(has_update_installer(
+            &format!(" 501 {helper}\n"),
+            "501",
+            target
+        ));
+        assert!(!has_update_installer(
+            &format!(" 502 {helper}\n"),
+            "501",
+            target
+        ));
+        assert!(!has_update_installer(
+            &format!(" 501 {helper}-other\n"),
+            "501",
+            target
+        ));
+        assert!(!has_update_installer(
+            "501 /other/Gopher.app/Autoupdate",
+            "501",
+            target
+        ));
     }
 
     #[test]

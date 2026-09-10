@@ -18,6 +18,7 @@ const IGNORED_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Debug)]
 pub enum UiEvent {
+    Stopped,
     HotkeysLoaded {
         preferences: crate::hotkeys::Preferences,
         error: Option<String>,
@@ -94,6 +95,13 @@ pub struct Batch {
 }
 pub type Sink = Arc<dyn Fn(UiEvent) + Send + Sync>;
 
+struct StopNotice(Sink);
+impl Drop for StopNotice {
+    fn drop(&mut self) {
+        (self.0)(UiEvent::Stopped);
+    }
+}
+
 pub struct Worker {
     pub sender: UnboundedSender<Command>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -113,6 +121,8 @@ pub fn start(directory: PathBuf, config: Config, sink: Sink) -> Result<Worker> {
     let thread = std::thread::Builder::new()
         .name("gopher-worker".into())
         .spawn(move || {
+            // Notify the event loop even if the worker panics while draining.
+            let _stopped = StopNotice(sink.clone());
             let run = || -> Result<()> {
                 let runtime = tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(2)

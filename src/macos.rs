@@ -43,10 +43,14 @@ use tray_icon::{
 
 mod keyboard;
 mod popover;
+mod updates;
+pub use updates::finish_native_termination;
 
 #[derive(Clone, Debug)]
 enum AppEvent {
     Worker(UiEvent),
+    UpdaterChanged,
+    UpdateEdit(updates::Edit),
     Shortcut(crate::hotkeys::HotkeyAction),
     Escape,
     GlobalShortcut(u32),
@@ -180,6 +184,7 @@ enum Action {
     Logs,
     Login,
     NotificationSettings,
+    CheckUpdates,
     Quit,
 }
 
@@ -373,20 +378,34 @@ pub fn run(
     };
     let mut pending = Vec::new();
     let proxy = event_loop.create_proxy();
+    let updater = updates::Updater::new(proxy.clone());
+    let mut shutting_down = false;
+    let mut worker_stopped = false;
     let mut exit_reason = "event_loop_returned";
     let mut startup_error = None;
     let mut pending_reveal: Option<Option<String>> = None;
     event_loop.run_return(|event,_,flow| {
         *flow=ControlFlow::Wait;
         let mut rebuild=false;
+        if shutting_down && !matches!(&event, Event::UserEvent(AppEvent::Worker(_)) | Event::LoopDestroyed | Event::UserEvent(AppEvent::Shutdown(_))) {
+            return;
+        }
         match event {
+            Event::UserEvent(AppEvent::UpdaterChanged) => { rebuild=true; }
+            Event::UserEvent(AppEvent::UpdateEdit(edit)) => { updater.edit(edit); rebuild=true; }
+            Event::UserEvent(AppEvent::Worker(UiEvent::Stopped)) => {
+                worker_stopped = true;
+                if shutting_down { *flow = ControlFlow::Exit; }
+                else { ui_error=Some("Gopher’s background worker stopped. Restart Gopher.".into()); rebuild=true; }
+            }
             Event::LoopDestroyed => {
                 if let Err(error)=log.diagnostic("INFO",serde_json::json!({"event":"event_loop_stopped","reason":exit_reason,"pid":std::process::id()})) {eprintln!("Gopher could not log event loop shutdown: {error}");}
             }
             Event::UserEvent(AppEvent::Shutdown(reason)) => {
                 exit_reason = reason;
+                shutting_down = true;
                 let _ = sender.send(Command::Shutdown);
-                *flow = ControlFlow::Exit;
+                if worker_stopped { *flow = ControlFlow::Exit; }
             }
             Event::NewEvents(StartCause::Init) => {
                 match TrayIconBuilder::new().with_menu_on_left_click(false).with_tooltip("Gopher — GitHub reviews").with_icon(icon(MenuBarState::Idle)).with_icon_as_template(true).build() {
@@ -407,6 +426,7 @@ pub fn run(
             }
             Event::UserEvent(AppEvent::NotificationError(message)) => {ui_error=Some(message);rebuild=true;}
             Event::UserEvent(AppEvent::Worker(event)) => match event {
+                UiEvent::Stopped => unreachable!(),
                 UiEvent::HotkeysLoaded {preferences,error}=>{keyboard.load(preferences,error);rebuild=true;}
                 UiEvent::HotkeysSaved(result)=>{keyboard.saved(result);rebuild=true;}
                 UiEvent::ActionsChanged(state)=>{popover.action_state=state;rebuild=true;}
@@ -515,10 +535,11 @@ pub fn run(
                                 }
                                 rebuild=true;
                             }
+                            Action::CheckUpdates=>{updater.check();}
                             Action::Quit=>{
                                 exit_reason="quit";
                                 if let Err(error)=log.diagnostic("INFO",serde_json::json!({"event":"shutdown_requested","reason":"quit","pid":std::process::id()})) {eprintln!("Gopher could not log quit: {error}");}
-                                let _=sender.send(Command::Shutdown);*flow=ControlFlow::Exit;
+                                shutting_down=true;let _=sender.send(Command::Shutdown);if worker_stopped {*flow=ControlFlow::Exit;}
                             }
                         }
                         Ok(())
@@ -528,6 +549,7 @@ pub fn run(
             }
             _=>(),
         }
+        popover.update_state = updater.state();
         let (window,inbox,settings)=popover.keyboard_context();
         keyboard.sync(window,inbox,settings);
         popover.keyboard_state=keyboard.state.borrow().clone();
@@ -556,7 +578,7 @@ pub fn run(
         if update_menu
             && let Some(tray)=&tray {
                 let error=service_error.as_deref().or(ui_error.as_deref());
-                match menu(&prs,error,bundled,&pr_menu_target) {
+                match menu(&prs,error,bundled,&pr_menu_target,&updater.state()) {
                     Ok((menu,new_actions))=>{
                         menu_observer=Some(MenuObserver::new(&menu,menu_state.clone(),proxy.clone()));
                         tray.set_menu(Some(Box::new(menu)));
@@ -710,6 +732,7 @@ fn menu(
     error: Option<&str>,
     bundled: bool,
     pr_menu_target: &PrMenuTarget,
+    update_state: &updates::State,
 ) -> Result<(Menu, HashMap<String, Action>)> {
     let menu = Menu::new();
     let mut actions = HashMap::new();
@@ -855,6 +878,9 @@ fn menu(
     actions.insert(login.id().0.clone(), Action::Login);
     actions_menu.append(&login)?;
     menu.append(&actions_menu)?;
+    let update = MenuItem::new(update_state.menu_title(), update_state.can_check, None);
+    actions.insert(update.id().0.clone(), Action::CheckUpdates);
+    menu.append(&update)?;
     let quit = MenuItem::new("Quit Gopher", true, None);
     actions.insert(quit.id().0.clone(), Action::Quit);
     menu.append(&quit)?;

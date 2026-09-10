@@ -511,6 +511,8 @@ pub(super) struct ReviewPopover {
     banner: Retained<NSTextField>,
     empty: Retained<NSTextField>,
     login: Retained<NSMenuItem>,
+    update_item: Retained<NSMenuItem>,
+    pub(super) update_state: super::updates::State,
     rows: HashMap<String, Row>,
     headings: HashMap<String, RepositoryHeading>,
     expanded: [HashSet<String>; 2],
@@ -558,6 +560,7 @@ impl ReviewPopover {
         };
         menu.addItem(&heading);
         let mut login = None;
+        let mut update_item = None;
         for entry in [
             Some(("Show ignored", Action::ShowIgnored)),
             None,
@@ -566,6 +569,7 @@ impl ReviewPopover {
             Some(("Open logs", Action::Logs)),
             None,
             Some(("Launch at login", Action::Login)),
+            Some(("Check for updates…", Action::CheckUpdates)),
             Some(("Quit Gopher", Action::Quit)),
         ] {
             let Some((title, action)) = entry else {
@@ -587,6 +591,9 @@ impl ReviewPopover {
             if title == "Launch at login" {
                 item.setEnabled(bundled);
                 login = Some(item.clone());
+            }
+            if title == "Check for updates…" {
+                update_item = Some(item.clone());
             }
             menu.addItem(&item);
         }
@@ -637,6 +644,8 @@ impl ReviewPopover {
             banner,
             empty,
             login: login.unwrap(),
+            update_item: update_item.unwrap(),
+            update_state: Default::default(),
             rows: HashMap::new(),
             headings: HashMap::new(),
             expanded: Default::default(),
@@ -896,12 +905,15 @@ impl ReviewPopover {
         if self.rows.values().any(|row| row.actions.is_tracking()) {
             return;
         }
+        self.update_item
+            .setTitle(&NSString::from_str(self.update_state.menu_title()));
+        self.update_item.setEnabled(self.update_state.can_check);
         self.back
             .setEnabled(!self.labels_saving() && !self.keyboard_state.pending);
         let mtm = MainThreadMarker::new().unwrap();
         if let Some(detail) = &mut self.detail {
             if let DetailPanel::Settings(editor) = detail {
-                editor.update(&self.keyboard_state);
+                editor.update(&self.keyboard_state, &self.update_state);
             }
             self.refresh.setHidden(true);
             self.actions.setHidden(true);

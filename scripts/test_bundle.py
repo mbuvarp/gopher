@@ -58,7 +58,7 @@ class BundleTests(unittest.TestCase):
             binary.parent.mkdir(parents=True)
             binary.write_text("fixture")
             binary.chmod(0o755)
-            bundle.write_info(app / "Contents/Info.plist", "0.1.0")
+            bundle.write_info(app / "Contents/Info.plist", "0.1.0", release=True)
 
             def verify_signature(*args, **kwargs):
                 self.assertEqual(args[0], "codesign")

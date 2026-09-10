@@ -561,7 +561,7 @@ impl DetailPanel {
         match self {
             Self::Configuration(_) => "Changes save automatically for this repository.",
             Self::Labels(_) => "Changes apply to this pull request.",
-            Self::Settings(_) => "Customize Gopher’s keyboard shortcuts.",
+            Self::Settings(_) => "Customize Gopher’s keyboard shortcuts and updates.",
         }
     }
     pub fn update(&mut self, prs: &[PullRequest], state: &ActionState, target: &ActionTarget) {

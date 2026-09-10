@@ -70,7 +70,7 @@ Keep reviewer detection in separate modules. Treat these observed conventions as
 
 ## Persistence and diagnostics
 
-- Store everything under `~/.config/gopher`; do not use macOS Application Support defaults.
+- Store Gopher data under `~/.config/gopher`; do not use macOS Application Support defaults. Sparkle is an explicit exception: let it own updater preferences in NSUserDefaults and temporary downloads in macOS caches.
 - Use `state.sqlite3` via `rusqlite` for cached PR data, reviewer evidence/runs, update identifiers, acknowledgements, ignored PR IDs, and notification history. GitHub remains authoritative; show restored data as stale until refreshed.
 - Keep optional settings in `config.toml`.
 - Write structured JSONL logs to `logs/gopher.jsonl` using `tracing`, retaining at most **10,000 lines across retained logs**. Bound individual entry sizes and safely replace files when trimming.
@@ -82,6 +82,14 @@ Keep reviewer detection in separate modules. Treat these observed conventions as
 `scripts/install.sh` is a standalone macOS Bash entry point, distributed as a release asset. Require authenticated `gh`, resolve one stable `v<version>` release, and verify its checksum, archive paths, app version, and Apple signature against the Gopher identifier and signing team before running its bundled installation helper. Do not add Python/Xcode requirements or weaken Gatekeeper. Install only into `~/Applications`; preserve `~/.config/gopher` and login preferences. Reject downgrades, unknown signatures, symlink destinations, and concurrent installers; leave equal versions unchanged. The verified Rust helper uses an installer lock and the existing app instance lock during replacement, stages before shutdown, and restores old files on replacement failure. Open fresh installs; preserve running/stopped state for upgrades; support `--no-launch`. Never force-kill an app that cannot finish shutdown. Older running apps without `GopherInstallerProtocol=1` need a manual quit.
 
 Quit/SIGTERM cancels unsubmitted merges/labels and stops accepting actions, then drains submitted mutations and persists queued label results before dropping the runtime/instance lock. Track submitted requests independently of displayed intents, which polls or account changes can invalidate. Never retry a mutation during shutdown. Test installers with simulated downloads and mutations, isolated directories, and no published test release. Leave Gopher stopped after Mac Mini testing.
+
+## In-app updates
+
+Release bundles embed checksum-pinned Sparkle 2 and its helpers; normal local builds and CLI commands never start an updater. Keep the framework self-contained and preserve symlinks/executable permissions. Sign nested code inside-out, then the host. Require signed archives before extraction and signed feeds with no expiry fallback, using the committed Ed25519 public key. Private keys belong in Keychain or protected CI secrets, never Git/logs/command-line arguments. Release feeds use immutable versioned archive URLs; publishing remains GOP-4's manual workflow responsibility.
+
+Default to daily automatic checks/downloads and installation on normal quit; never invoke an unsolicited restart. Put one Check for updates… entry immediately above Quit Gopher, changing it to Update available… when appropriate. Use Sparkle's standard dialog on explicit invocation and gentle menu-only reminders otherwise; no update notification or changed tray icon. Settings exposes immediate check/download preferences and version/status. Keep Sparkle's preferences authoritative, including changes made from its own dialog.
+
+Intercept native termination without replacing Tao's other delegate behavior. Cancel the first native quit request, drain the worker asynchronously, persist queued labels and finish lifecycle/log cleanup, then issue native termination again. Do not use NSTerminateLater: its modal loop prevents Tao from unwinding. The shell installer must refuse overlap with Sparkle's separate installation process, checking before and after host shutdown. Exercise real signed updates with an isolated app identity/data directory and fake GitHub access; `examples/update_smoke.rs` covers explicit relaunch with delayed simulated persistence. Leave Mini test apps/helpers stopped.
 
 ## Development guidance
 
