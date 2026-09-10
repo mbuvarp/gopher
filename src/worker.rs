@@ -81,6 +81,7 @@ pub enum Command {
     NotificationDelivered(String),
     NotificationFailed(String),
     Shutdown,
+    ShutdownComplete,
     PollComplete(std::result::Result<Batch, String>),
     CheckLabels,
     CredentialsProbed,
@@ -294,6 +295,7 @@ async fn run(
         }),
     }
     let mut label_deadline = Instant::now();
+    let mut shutting_down = false;
     loop {
         // Keep ordinary deadlines intact so a credential switch can lift an old
         // quota wait. Ignored identities use GraphQL; snapshots need both quotas.
@@ -301,10 +303,10 @@ async fn run(
         let ignored_ready =
             ignored_deadline.max(Instant::now() + Github::cooldown(&config, Some("graphql")));
         let command = tokio::select! {
-            _ = tokio::time::sleep_until(label_deadline.into()) => Command::CheckLabels,
+            _ = tokio::time::sleep_until(label_deadline.into()), if !shutting_down => Command::CheckLabels,
             command = receiver.recv() => match command { Some(c)=>c,None=>break },
-            _ = tokio::time::sleep_until(ignored_ready.into()), if !ignored_loading => Command::CheckIgnored,
-            _ = tokio::time::sleep_until(poll_ready.into()), if !polling => {
+            _ = tokio::time::sleep_until(ignored_ready.into()), if !shutting_down && !ignored_loading => Command::CheckIgnored,
+            _ = tokio::time::sleep_until(poll_ready.into()), if !shutting_down && !polling => {
                 polling = true;
                 sink(UiEvent::Updated {
                     prs: prs.values().cloned().collect(),
@@ -324,6 +326,19 @@ async fn run(
                 continue;
             }
         };
+        if shutting_down
+            && !matches!(
+                &command,
+                Command::Shutdown
+                    | Command::ShutdownComplete
+                    | Command::LabelSaved { .. }
+                    | Command::PrAction(
+                        ActionCommand::Merged { .. } | ActionCommand::LabelDone { .. }
+                    )
+            )
+        {
+            continue;
+        }
         let mut reveal_target = None;
         match command {
             Command::SaveHotkeys(preferences) => {
@@ -403,7 +418,22 @@ async fn run(
                     },
                 );
             }
-            Command::Shutdown => break,
+            Command::Shutdown => {
+                if !shutting_down {
+                    shutting_down = true;
+                    pr_actions.begin_shutdown();
+                    if !pr_actions.has_submissions() {
+                        let _ = sender.send(Command::ShutdownComplete);
+                    }
+                }
+                continue;
+            }
+            Command::ShutdownComplete => {
+                if shutting_down && !pr_actions.has_submissions() {
+                    break;
+                }
+                continue;
+            }
             Command::Refresh => {
                 deadline = Instant::now();
                 discovered_at = None;
@@ -702,6 +732,14 @@ async fn run(
                 }
             }
         }
+        if shutting_down {
+            if !pr_actions.has_submissions() {
+                // A LabelDone handler queues LabelSaved before this barrier.
+                // Persist that result before dropping the runtime and instance lock.
+                let _ = sender.send(Command::ShutdownComplete);
+            }
+            continue;
+        }
         pr_actions.reconcile(&action_worker::Context {
             store: &store,
             prs: &prs,
@@ -781,6 +819,65 @@ pub fn transition(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_flushes_label_saves_queued_after_the_quit_request() {
+        for account in ["test", "old-account"] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = Store::open(directory.path()).unwrap();
+            store.set_viewer("test").unwrap();
+            store
+                .save(&transition(
+                    Snapshot {
+                        id: "PR_1".into(),
+                        repo: "owner/repo".into(),
+                        open: true,
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                    100,
+                    0,
+                ))
+                .unwrap();
+            let (sender, receiver) = unbounded_channel();
+            sender.send(Command::Shutdown).unwrap();
+            sender.send(Command::Shutdown).unwrap(); // UI quit followed by Worker::drop.
+            sender
+                .send(Command::LabelSaved {
+                    pr: "PR_1".into(),
+                    viewer: account.into(),
+                    label: PrLabel {
+                        name: "saved".into(),
+                        color: "112233".into(),
+                    },
+                    selected: true,
+                })
+                .unwrap();
+            run(
+                directory.path().into(),
+                Config {
+                    gh_path: Some(directory.path().join("missing-gh")),
+                    ..Default::default()
+                },
+                receiver,
+                sender,
+                Arc::new(|_| {}),
+                IGNORED_CHECK_INTERVAL,
+            )
+            .await
+            .unwrap();
+            let labels = store.load().unwrap()[0].snapshot.labels.clone();
+            if account == "test" {
+                assert_eq!(labels[0].name, "saved");
+            } else {
+                assert!(
+                    labels.is_empty(),
+                    "An old account must not change the current cache"
+                );
+            }
+        }
+    }
 
     fn next_list_event(rx: &std::sync::mpsc::Receiver<UiEvent>) -> UiEvent {
         loop {

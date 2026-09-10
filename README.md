@@ -78,7 +78,7 @@ Allow notifications when prompted. Enable **Actions → Launch at login** to sta
 sh scripts/bundle.sh --release
 ```
 
-This builds an Apple Silicon app with a macOS 13.0 deployment target, then produces `dist/Gopher.app`, `dist/Gopher-<version>-macos-arm64.zip`, and a matching `.zip.sha256` file. Only the app is inside the archive. The script verifies architecture, minimum OS, metadata, and code signature both before and after extracting the ZIP. It stages a fresh bundle so removed resources cannot linger, and replaces existing outputs only after validation succeeds.
+This builds an Apple Silicon app with a macOS 13.0 deployment target, then produces `dist/Gopher.app`, `dist/Gopher-<version>-macos-arm64.zip`, a matching `.zip.sha256` file, and `dist/install.sh`. Only the app is inside the archive. The script verifies architecture, minimum OS, metadata, and code signature both before and after extracting the ZIP. It stages a fresh bundle so removed resources cannot linger, and replaces existing outputs only after validation succeeds.
 
 Release archives require an Apple signing identity and never fall back to ad-hoc signing. The default is the first available Apple Development identity; set `GOPHER_SIGNING_IDENTITY` to select a different certificate name or fingerprint. A missing or invalid identity fails packaging. This initial distribution is **unnotarized**: macOS may require **System Settings → Privacy & Security → Open Anyway** after the first launch attempt. Test notifications and Launch at login on another Mac before sharing widely. A checksum detects corruption; it does not replace the signed-update verification planned for the updater.
 
@@ -87,6 +87,20 @@ Release archives require an Apple signing identity and never fall back to ad-hoc
 Verify a downloaded archive from its directory with `shasum -a 256 -c Gopher-<version>-macos-arm64.zip.sha256`, extract it, and move `Gopher.app` to `~/Applications`. Quit an existing copy first and preserve `~/.config/gopher`. A browser download on a separate Mac is needed to test the normal Gatekeeper experience; copying via SSH alone does not reproduce it.
 
 Packaging checks: `python3 -m unittest discover -s scripts -p 'test_*.py'`.
+
+## Install or update
+
+Once a release is published with a `v<version>` tag and the assets above, the same command installs or updates Gopher:
+
+```sh
+curl -fsSL https://github.com/mbuvarp/gopher/releases/latest/download/install.sh | bash
+```
+
+Requires Apple Silicon, macOS 13+, and installed/authenticated `gh`. It needs no sudo, Python, Rust, or Xcode. The script resolves one stable release, downloads its versioned ZIP and checksum, and validates the archive, app version, and Apple signature against Gopher's bundle identifier and signing team before invoking the verified app's installation helper. The helper installs into `~/Applications/Gopher.app`, rejects downgrades and unverifiable existing apps, and leaves an already-current installation alone.
+
+Fresh installations open automatically. Upgrades relaunch only if Gopher was running; a stopped app stays stopped. To suppress launching, use `bash -s -- --no-launch` at the end of the pipeline. Settings, cached PRs, acknowledgements, and Launch at login preferences are preserved. Gopher finishes submitted merge/label requests before exiting, cancels pending countdowns and unsent label changes, and rejects new actions while shutting down. An older running build without this shutdown support must be quit manually before its first upgrade.
+
+Downloads and staging finish before Gopher is asked to quit. Replacement holds both an installer lock and Gopher's instance lock; a failed replacement restores the previous app. Shutdown has a 150-second installer timeout and never force-kills Gopher. If macOS refuses the launch request after installation, the error identifies the installed app and retained recovery files; the installer does not roll back a version that might already have opened the database. Quarantine and Gatekeeper settings are not disabled. This remains an unnotarized build and may require **Privacy & Security → Open Anyway**.
 
 ## Review behavior
 

@@ -18,6 +18,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "sync
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tempfile = "3"
 url = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -31,9 +32,6 @@ objc2-service-management = "0.3"
 block2 = "0.6"
 png = "0.18"
 global-hotkey = "0.8"
-
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 lto = "thin"
