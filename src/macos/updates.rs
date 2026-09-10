@@ -51,7 +51,12 @@ impl DelegateState {
         let _ = self.proxy.send_event(AppEvent::UpdaterChanged);
     }
 }
-thread_local! { static NATIVE_TERMINATION: Cell<bool> = const { Cell::new(false) }; }
+thread_local! {
+    static NATIVE_TERMINATION: Cell<bool> = const { Cell::new(false) };
+    // NSApplication's delegate is weak. Keep Tao's delegate alive after its
+    // event loop is dropped, until the final native termination callbacks.
+    static TERMINATION_DELEGATE: RefCell<Option<Retained<ProtocolObject<dyn NSApplicationDelegate>>>> = const { RefCell::new(None) };
+}
 
 define_class!(
     #[unsafe(super = NSObject)]
@@ -108,7 +113,8 @@ define_class!(
         }
         #[unsafe(method(standardUserDriverWillFinishUpdateSession))]
         fn finished_session(&self) {
-            self.ivars().available.set(self.ivars().on_quit.get());
+            // Finishing/dismissing the dialog does not withdraw the update.
+            // Skip and failed/no-update checks clear it in their own callbacks.
             self.ivars().changed();
         }
         #[unsafe(method(updater:didFindValidUpdate:))]
@@ -282,6 +288,11 @@ impl Drop for Updater {
         }
         NSApplication::sharedApplication(objc2::MainThreadMarker::new().unwrap())
             .setDelegate(self.delegate.ivars().original.as_deref());
+        if NATIVE_TERMINATION.get() {
+            TERMINATION_DELEGATE.with(|original| {
+                *original.borrow_mut() = self.delegate.ivars().original.clone();
+            });
+        }
     }
 }
 /// Call after worker, session, logs and instance lock have completed cleanup.
@@ -289,7 +300,6 @@ impl Drop for Updater {
 pub fn finish_native_termination() {
     if NATIVE_TERMINATION.get() {
         let app = NSApplication::sharedApplication(objc2::MainThreadMarker::new().unwrap());
-        app.setDelegate(None);
         app.terminate(None);
     }
 }

@@ -46,6 +46,12 @@ signing and no notarization. Browser-download Gatekeeper behavior remains separa
    starts Gopher's worker or accesses GitHub. It waits for a downloaded update,
    invokes the real Install and Relaunch button, delays simulated persistence by
    three seconds, then verifies persistence and cleanup markers on relaunch.
+   Set GopherSmokeMode to `menu` to exercise the normal Quit action's drain-and-exit
+   path instead; verify the newer app is installed without relaunching. Set it to
+   `reminder` with SUAutomaticallyUpdate false to dismiss an undownloaded update
+   and verify that the menu reminder remains. Use a fresh bundle ID/data directory
+   for each scenario. The host drops Tao's event loop before final termination,
+   matching the production cleanup order.
 6. Repeat with a corrupted feed/signature, corrupted ZIP, older offered version,
    and unavailable feed. Installed files must remain usable and unchanged.
 7. Quit all test applications and helper processes and stop the loopback server.

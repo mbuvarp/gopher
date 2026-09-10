@@ -31,14 +31,14 @@ fn property(key: &str) -> String {
     let value: objc2::rc::Retained<NSString> = unsafe { msg_send![&value, description] };
     value.to_string()
 }
-fn install_button(view: &NSView) -> Option<objc2::rc::Retained<NSButton>> {
+fn find_button(view: &NSView, title: &str) -> Option<objc2::rc::Retained<NSButton>> {
     for child in view.subviews() {
         if let Some(button) = child.downcast_ref::<NSButton>()
-            && button.title().to_string() == "Install and Relaunch"
+            && button.title().to_string() == title
         {
             return Some(button.retain());
         }
-        if let Some(button) = install_button(&child) {
+        if let Some(button) = find_button(&child, title) {
             return Some(button);
         }
     }
@@ -52,6 +52,13 @@ fn main() {
     let expect_no_update = NSBundle::mainBundle()
         .objectForInfoDictionaryKey(&NSString::from_str("GopherSmokeExpectNoUpdate"))
         .is_some_and(|v| unsafe { msg_send![&v, boolValue] });
+    let mode = NSBundle::mainBundle()
+        .objectForInfoDictionaryKey(&NSString::from_str("GopherSmokeMode"))
+        .map(|v| {
+            let value: objc2::rc::Retained<NSString> = unsafe { msg_send![&v, description] };
+            value.to_string()
+        })
+        .unwrap_or_default();
     if !expect_no_update && property("CFBundleVersion") == "1.1.1" {
         assert!(directory.join("mutation-persisted").exists());
         assert!(directory.join("clean-shutdown").exists());
@@ -66,11 +73,13 @@ fn main() {
     let mut opened = false;
     let mut clicked = false;
     let mut quitting = false;
+    let mut reminder_seen = None;
+    let mut dismissed = false;
     event_loop.run_return(|event, _, flow| {
         *flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(100));
         match event {
             Event::UserEvent(AppEvent::Shutdown(reason)) => {
-                assert!(clicked, "Native quit occurred before Install and Relaunch");
+                assert!(clicked, "Quit occurred before the requested update action");
                 if !quitting {
                     quitting = true;
                     std::fs::write(directory.join("quit-request"), reason).unwrap();
@@ -90,6 +99,37 @@ fn main() {
             Event::MainEventsCleared if !quitting => {
                 let state = updater.state();
                 std::fs::write(directory.join("state"), format!("{state:?}")).unwrap();
+                if mode == "reminder" {
+                    if state.available && !state.downloads && reminder_seen.is_none() {
+                        reminder_seen = Some(Instant::now());
+                        // Exercise the actual SDK callbacks for dialog dismissal:
+                        // an undownloaded update must remain advertised afterward.
+                        updater.check();
+                    }
+                    if reminder_seen.is_some() && !dismissed {
+                        let app =
+                            NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
+                        for window in app.windows() {
+                            if let Some(view) = window.contentView()
+                                && let Some(button) = find_button(&view, "Remind Me Later")
+                            {
+                                dismissed = true;
+                                reminder_seen = Some(Instant::now());
+                                unsafe {
+                                    button.performClick(None);
+                                }
+                            }
+                        }
+                    }
+                    if dismissed
+                        && reminder_seen.is_some_and(|seen| seen.elapsed() > Duration::from_secs(3))
+                    {
+                        assert!(state.available, "Undownloaded update reminder disappeared");
+                        std::fs::write(directory.join("reminder-retained"), "done").unwrap();
+                        *flow = ControlFlow::Exit;
+                        return;
+                    }
+                }
                 if expect_no_update
                     && (state.message.starts_with("Could not complete")
                         || state.message == "Gopher is up to date.")
@@ -105,13 +145,20 @@ fn main() {
                     && !opened
                 {
                     opened = true;
-                    updater.check();
+                    if mode == "menu" {
+                        // Match Action::Quit: drain, leave Tao, then return from
+                        // main without first requesting NSApplication termination.
+                        clicked = true;
+                        proxy.send_event(AppEvent::Shutdown("quit")).unwrap();
+                    } else {
+                        updater.check();
+                    }
                 }
                 if opened && !clicked {
                     let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
                     for window in app.windows() {
                         if let Some(view) = window.contentView()
-                            && let Some(button) = install_button(&view)
+                            && let Some(button) = find_button(&view, "Install and Relaunch")
                         {
                             clicked = true;
                             unsafe {
@@ -129,6 +176,7 @@ fn main() {
         }
     });
     drop(updater);
+    drop(event_loop);
     std::fs::write(directory.join("clean-shutdown"), "done").unwrap();
     updates::finish_native_termination();
 }
