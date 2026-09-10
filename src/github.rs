@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{io::AsyncWriteExt, process::Command};
+mod check_status;
 
 #[derive(Clone)]
 pub struct Github {
@@ -567,6 +568,7 @@ impl Github {
                 break;
             }
         }
+        let mut check_state = CheckState::Green;
         let mut page = 1;
         loop {
             let endpoint = format!(
@@ -580,6 +582,7 @@ impl Github {
                 .as_array()
                 .context("Missing check runs")?;
             for check in checks {
+                check_state = check_state.max(check_status::check_run(check));
                 if Agent::from_app(&string(&check["app"], "slug")).is_none() {
                     continue;
                 }
@@ -618,6 +621,7 @@ impl Github {
             page += 1;
         }
         snapshot.checks.extend(legacy_checks(&statuses));
+        snapshot.check_state = Some(check_state.max(check_status::commit_statuses(&statuses)));
         tracing::debug!(event="snapshot_collected", repo=%reference.repo, pr=reference.number, elapsed_ms=start.elapsed().as_millis() as u64, threads=snapshot.threads.len());
         Ok(snapshot)
     }

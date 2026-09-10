@@ -1,7 +1,7 @@
 //! Native, persistent review inbox. Controls retain their identity across polls;
 //! actions capture the update displayed at activation, before entering the actor.
 use super::{Action, AppEvent, repo_heading, repo_parts};
-use crate::model::{PullRequest, State};
+use crate::model::{CheckState, PullRequest, State};
 use crate::{
     actions::{ActionState, Request, Setting},
     worker::{ActionCommand, Command},
@@ -11,10 +11,14 @@ mod action_views;
 mod label_pills;
 use action_views::{DetailPanel, PrActions};
 use objc2::{
-    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained, sel,
+    AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    rc::Retained, sel,
 };
 use objc2_app_kit::*;
-use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSRectEdge, NSSize, NSString};
+use objc2_foundation::{
+    NSMutableAttributedString, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSRectEdge,
+    NSSize, NSString,
+};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -148,6 +152,40 @@ fn set_text(field: &NSTextField, text: &str) {
     if field.stringValue().to_string() != text {
         field.setStringValue(&NSString::from_str(text));
     }
+}
+fn set_status(field: &NSTextField, text: &str, checks: Option<CheckState>) {
+    let suffix = checks
+        .map(|state| format!(" · {}", state.label()))
+        .unwrap_or_default();
+    let value = NSMutableAttributedString::initWithString(
+        NSMutableAttributedString::alloc(),
+        &NSString::from_str(&format!("{text}{suffix}")),
+    );
+    // AppKit ranges use UTF-16 offsets. Reset the base attributes on every update
+    // so a previous check color cannot spill into review text or cached states.
+    unsafe {
+        let all = NSRange::new(0, value.length());
+        value.addAttribute_value_range(NSFontAttributeName, &NSFont::systemFontOfSize(11.0), all);
+        value.addAttribute_value_range(
+            NSForegroundColorAttributeName,
+            &NSColor::secondaryLabelColor(),
+            all,
+        );
+        if let Some(state) = checks {
+            let color = match state {
+                CheckState::Running => NSColor::systemYellowColor(),
+                CheckState::Failed => NSColor::systemRedColor(),
+                CheckState::Green => NSColor::systemGreenColor(),
+            };
+            let length = state.label().encode_utf16().count();
+            value.addAttribute_value_range(
+                NSForegroundColorAttributeName,
+                &color,
+                NSRange::new(value.length() - length, length),
+            );
+        }
+    }
+    field.setAttributedStringValue(&value);
 }
 fn display_title(pr: &PullRequest) -> String {
     if pr.snapshot.number == 0 {
@@ -308,7 +346,7 @@ impl Row {
             self.icon.setImage(Some(&image));
         }
         let threads = pr.snapshot.threads.iter().filter(|t| !t.resolved).count();
-        set_text(
+        set_status(
             &self.status,
             &if ignored {
                 "Ignored · not monitored".to_owned()
@@ -320,6 +358,11 @@ impl Row {
                     if pr.snapshot.draft { " · draft" } else { "" },
                     threads
                 )
+            },
+            if ignored || pr.stale {
+                None
+            } else {
+                pr.snapshot.check_state
             },
         );
         let label_height = self

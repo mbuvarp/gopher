@@ -6,6 +6,8 @@ A native Rust macOS menu bar inbox for GitHub agent reviews. Tracks open PRs you
 
 **Left-click** the gopher in the menu bar to open a native, scrollable review inbox. Each PR has a status icon, title, review status, and unresolved-thread count, followed by compact pills in its GitHub label colors. Labels use the detail row’s font size, wrap when needed, and refresh during normal polling or after a successful label change. Unacknowledged actionable updates have **bold blue titles** and blue status icons. Click a title to acknowledge its displayed update without closing the popover; its title returns to regular weight and both title and icon return to their normal colors after the change is saved.
 
+The detail row also shows **Checks running...** in yellow, **Checks failed** in red, or **Checks green** in green. Failed checks take precedence while other checks are still running. No checks, or checks that all succeeded, were skipped, or finished neutral, count as green. This includes CI checks and the latest legacy status for each context, using the existing polling requests. The summary is hidden for stale or ignored PRs and does not affect review acknowledgements or notifications.
+
 The buttons beneath each PR let you:
 
 - **Open PR** in the browser and acknowledge the displayed update after it opens successfully.
@@ -63,7 +65,7 @@ Clicking a review notification acknowledges its update, opens the active PR list
 
 Codex detection uses its bot reactions, commit-specific reviews, and persistent review summary. Cubic uses checks and explicit issue counts. CodeRabbit uses checks and explicit review verdicts. Successful checks alone do not establish approval. Unknown formats and reactions without a reliable commit association stay Unknown. Resolved threads alone do not establish a clean review.
 
-Reviewers are inferred from activity on each PR, including previously observed agents. Explicit subscription-limit or paused-review notices are shown as Skipped and excluded from automatic participation; an explicitly required reviewer that skips keeps the result Unknown. If a skipped reviewer's activity disappears, its cached skip does not make it an unfinished participant; new activity brings it back. Missing results from other previously participating reviewers still block, with the historical participation explained in Details and logs. If a subscription or repository setup changes, use an explicit reviewer list. Polling can miss a complete rerun between polls, particularly one represented only by reactions; ambiguous evidence is intentionally conservative.
+Reviewers are inferred from activity on each PR, including previously observed agents. Explicit subscription-limit, paused-review, or Cubic branch-rewrite notices are shown as Skipped and excluded from automatic participation; an explicitly required reviewer that skips keeps the result Unknown. If a skipped reviewer's activity disappears, its cached skip does not make it an unfinished participant; new activity brings it back. Missing results from other previously participating reviewers still block, with the historical participation explained in Details and logs. If a subscription or repository setup changes, use an explicit reviewer list. Polling can miss a complete rerun between polls, particularly one represented only by reactions; ambiguous evidence is intentionally conservative.
 
 ## Configuration and data
 

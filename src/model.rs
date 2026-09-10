@@ -119,6 +119,24 @@ pub struct Check {
     pub completed_at: String,
     pub summary: String,
 }
+/// Aggregate check severity, independent of agent review verdicts.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckState {
+    #[default]
+    Green,
+    Running,
+    Failed,
+}
+impl CheckState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "Checks running...",
+            Self::Failed => "Checks failed",
+            Self::Green => "Checks green",
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrLabel {
     pub name: String,
@@ -140,6 +158,9 @@ pub struct Snapshot {
     pub reactions: Vec<Reaction>,
     pub threads: Vec<Thread>,
     pub checks: Vec<Check>,
+    /// None for older caches or identity-only snapshots, until a full fetch succeeds.
+    #[serde(default)]
+    pub check_state: Option<CheckState>,
     #[serde(default)]
     pub labels: Vec<PrLabel>,
 }

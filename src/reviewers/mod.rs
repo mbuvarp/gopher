@@ -158,7 +158,13 @@ pub(super) fn check_gate(s: &Snapshot, agent: Agent) -> Option<AgentResult> {
             "Agent check failed, was skipped, or was cancelled",
         ));
     }
-    if !checks.is_empty() && checks.iter().all(|c| explicitly_skipped(&c.summary)) {
+    let branch_rewrite_skip =
+        |c: &&Check| agent == Agent::Cubic && cubic::branch_rewrite_skip(&c.summary);
+    if !checks.is_empty()
+        && checks
+            .iter()
+            .all(|c| explicitly_skipped(&c.summary) || branch_rewrite_skip(c))
+    {
         return Some(result(
             agent,
             Verdict::Skipped,
@@ -167,7 +173,11 @@ pub(super) fn check_gate(s: &Snapshot, agent: Agent) -> Option<AgentResult> {
                 .map(|c| c.id.as_str())
                 .collect::<Vec<_>>()
                 .join(","),
-            "Review skipped — subscription limit or reviewer paused",
+            if checks.iter().any(branch_rewrite_skip) {
+                "Review skipped — branch history rewritten; Cubic requires a manual review"
+            } else {
+                "Review skipped — subscription limit or reviewer paused"
+            },
         ));
     }
     None

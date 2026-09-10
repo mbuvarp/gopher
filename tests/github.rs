@@ -184,6 +184,7 @@ async fn snapshot_paginates_reviews_independently_and_checks_head() {
         number: 1,
     };
     let snapshot = gh.snapshot(&pr).await.unwrap();
+    assert_eq!(snapshot.check_state, Some(gopher::model::CheckState::Green));
     assert_eq!(snapshot.reviews.len(), 2);
     assert_eq!(snapshot.reviews[1].id, "review-2");
     assert_eq!(snapshot.threads.len(), 1);
@@ -198,6 +199,72 @@ async fn snapshot_paginates_reviews_independently_and_checks_head() {
         vec![("bug", "d73a4a"), ("ready", "008800")]
     );
 }
+#[tokio::test]
+async fn snapshot_summarizes_all_check_pages_and_latest_legacy_contexts() {
+    use gopher::model::CheckState;
+    use serde_json::json;
+    for (status, conclusion, legacy_state, expected) in [
+        ("completed", "skipped", "success", CheckState::Green),
+        ("queued", "", "success", CheckState::Running),
+        ("completed", "failure", "pending", CheckState::Failed),
+        ("completed", "neutral", "pending", CheckState::Running),
+        ("in_progress", "", "failure", CheckState::Failed),
+    ] {
+        let first_checks: Vec<_> = (0..100)
+            .map(|id| {
+                json!({
+                    "id":id,"app":{"slug":"github-actions"},"name":format!("job-{id}"),
+                    "status":"completed","conclusion":"skipped"
+                })
+            })
+            .collect();
+        let last_checks = json!({"check_runs":[{
+            "id":100,"app":{"slug":"github-actions"},"name":"last-job",
+            "status":status,"conclusion":conclusion
+        }]});
+        // Deliberately put a newer result on the second page to ensure context
+        // deduplication spans the complete response, not just the first page.
+        let first_statuses: Vec<_> = (0..100)
+            .map(|id| {
+                json!({
+                    "id":id,"context":"CI","state":"failure","creator":{"login":"ci-bot"}
+                })
+            })
+            .collect();
+        let last_statuses =
+            json!([{"id":100,"context":"ci","state":legacy_state,"creator":{"login":"ci-bot"}}]);
+        let script = format!(
+            r#"
+printf '%s\n' "$*" >> "$(dirname "$0")/calls"
+case "$*" in
+  *check-runs*'page=2'*) echo '{last_checks}'; exit 0 ;;
+  *check-runs*) echo '{first_checks}'; exit 0 ;;
+  *statuses*'page=2'*) echo '{last_statuses}'; exit 0 ;;
+  *statuses*) echo '{first_statuses}'; exit 0 ;;
+esac
+{snapshot_script}
+"#,
+            first_checks = json!({"check_runs":first_checks}),
+            first_statuses = json!(first_statuses),
+            snapshot_script = include_str!("fixtures/gh-snapshot.sh")
+        );
+        let (dir, gh) = mock(&script);
+        let snapshot = gh
+            .snapshot(&gopher::github::PrRef {
+                id: "PR_1".into(),
+                repo: "owner/repo".into(),
+                number: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.check_state, Some(expected));
+        // CI results are summarized separately from agent review evidence.
+        assert!(snapshot.checks.is_empty());
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        assert_eq!(calls.lines().count(), 7); // Two PR pages, four check/status pages, final head.
+    }
+}
+
 #[tokio::test]
 async fn rejects_head_changes_during_pagination() {
     let script = include_str!("fixtures/gh-snapshot.sh").replace(

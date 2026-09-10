@@ -4,6 +4,12 @@ use std::sync::LazyLock;
 static COUNT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(\d+) issues? found\b").unwrap());
 
+pub(super) fn branch_rewrite_skip(summary: &str) -> bool {
+    summary.trim().to_lowercase().starts_with(
+        "this push rewrote the branch history, so cubic did not start an automatic review.",
+    )
+}
+
 fn verdict(text: &str) -> Option<Verdict> {
     // Restrict review-body interpretation to Cubic's summary, excluding quoted discussion.
     let text = text

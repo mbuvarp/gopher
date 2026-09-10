@@ -445,6 +445,36 @@ fn labels_persist_without_resetting_acknowledgement_and_legacy_cache_still_loads
     assert_eq!(restored.acknowledged, previous.acknowledged);
 }
 #[test]
+fn check_summary_persists_without_changing_reviews_or_acknowledgements() {
+    let mut snapshot = snapshot();
+    snapshot
+        .reviews
+        .push(review(Agent::Cubic, "0 issues found"));
+    let mut previous = transition(snapshot.clone(), None, None, 100, 0);
+    previous.acknowledged = Some(previous.update_id.clone());
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    store.save(&previous).unwrap();
+    let notification = store.notification(&previous).unwrap().unwrap();
+    store.mark_delivered(&notification).unwrap();
+    for state in [CheckState::Running, CheckState::Failed, CheckState::Green] {
+        snapshot.check_state = Some(state);
+        let current = transition(snapshot.clone(), Some(&previous), None, 130, 0);
+        assert_eq!(current.state, State::Approved);
+        assert_eq!(current.update_id, previous.update_id);
+        assert_eq!(current.acknowledged, previous.acknowledged);
+        assert!(!current.needs_attention());
+        store.save(&current).unwrap();
+        assert!(store.notification(&current).unwrap().is_none());
+        assert_eq!(store.load().unwrap()[0].snapshot.check_state, Some(state));
+    }
+    let mut legacy = serde_json::to_value(&snapshot).unwrap();
+    legacy.as_object_mut().unwrap().remove("check_state");
+    let restored: Snapshot = serde_json::from_value(legacy).unwrap();
+    assert_eq!(restored.check_state, None);
+}
+
+#[test]
 fn sqlite_persists_ack_and_deduplicates_notifications() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
@@ -524,6 +554,97 @@ fn all_skipped_does_not_approve() {
         ..check("completed")
     });
     assert_eq!(state(&s), State::Unknown);
+}
+
+fn cubic_branch_rewrite() -> Check {
+    Check {
+        conclusion: "neutral".into(),
+        summary: include_str!("fixtures/cubic-branch-rewrite.md").into(),
+        ..check("completed")
+    }
+}
+
+#[test]
+fn cubic_branch_rewrite_is_an_explicit_skip_but_never_an_approval() {
+    let mut s = snapshot();
+    s.checks.push(cubic_branch_rewrite());
+    let agents = reviewers::evaluate(&s, None, None);
+    assert_eq!(agents[0].verdict, Verdict::Skipped);
+    assert!(agents[0].reason.contains("branch history rewritten"));
+    assert!(agents[0].reason.contains("manual review"));
+    assert_eq!(state(&s), State::Unknown);
+
+    s.reviews.push(Review {
+        state: "APPROVED".into(),
+        ..review(Agent::Codex, "")
+    });
+    assert_eq!(state(&s), State::Approved);
+    s.threads.push(thread());
+    assert_eq!(state(&s), State::Comments);
+    let required = reviewers::evaluate(&s, None, Some(&[Agent::Codex, Agent::Cubic]));
+    assert_eq!(reviewers::aggregate(&s, &required), State::Unknown);
+    let cubic = required.iter().find(|a| a.agent == Agent::Cubic).unwrap();
+    assert_eq!(cubic.verdict, Verdict::Unknown);
+    assert!(cubic.reason.contains("Required reviewer did not run"));
+}
+
+#[test]
+fn cubic_branch_rewrite_does_not_override_running_or_failed_checks() {
+    for (status, conclusion, expected) in [
+        ("in_progress", "neutral", Verdict::Running),
+        ("completed", "failure", Verdict::Unknown),
+    ] {
+        let mut s = snapshot();
+        s.checks.push(Check {
+            status: status.into(),
+            conclusion: conclusion.into(),
+            ..cubic_branch_rewrite()
+        });
+        assert_eq!(reviewers::evaluate(&s, None, None)[0].verdict, expected);
+    }
+    // This observed wording belongs to Cubic, not another app with similar text.
+    let mut s = snapshot();
+    s.checks.push(Check {
+        app: "coderabbitai".into(),
+        ..cubic_branch_rewrite()
+    });
+    assert_eq!(
+        reviewers::evaluate(&s, None, None)[0].verdict,
+        Verdict::Unknown
+    );
+}
+
+#[test]
+fn manual_cubic_review_after_branch_rewrite_rejoins_participation() {
+    let mut s = snapshot();
+    s.checks.push(cubic_branch_rewrite());
+    s.reviews.push(Review {
+        state: "APPROVED".into(),
+        ..review(Agent::Codex, "")
+    });
+    let skipped = transition(s.clone(), None, None, 100, 0);
+    assert_eq!(skipped.state, State::Approved);
+    s.checks.push(Check {
+        id: "101".into(),
+        ..check("in_progress")
+    });
+    let running = transition(s.clone(), Some(&skipped), None, 130, 0);
+    assert_eq!(running.state, State::Reviewing);
+    s.checks[1].status = "completed".into();
+    let ambiguous = transition(s.clone(), Some(&running), None, 160, 0);
+    assert_eq!(ambiguous.state, State::Unknown);
+    s.checks[1].summary = "No issues found".into();
+    let clean = transition(s, Some(&ambiguous), None, 190, 0);
+    assert_eq!(clean.state, State::Approved);
+    assert_eq!(
+        clean
+            .agents
+            .iter()
+            .find(|a| a.agent == Agent::Cubic)
+            .unwrap()
+            .verdict,
+        Verdict::Clean
+    );
 }
 
 fn skipped_coderabbit() -> Check {
