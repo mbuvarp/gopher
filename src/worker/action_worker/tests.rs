@@ -13,6 +13,90 @@ struct Harness {
     viewer: &'static str,
     sink: Sink,
 }
+
+#[tokio::test]
+async fn shutdown_cancels_countdown_and_rejects_new_actions() {
+    let mut h = Harness::new();
+    let token = h.start_merge();
+    h.coordinator.begin_shutdown();
+    h.handle(ActionCommand::Tick {
+        pr: "PR_1".into(),
+        token,
+        remaining: 0,
+    });
+    h.request(Request::Merge {
+        pr: "PR_1".into(),
+        head: "head".into(),
+        update: h.prs["PR_1"].update_id.clone(),
+    });
+    assert!(h.coordinator.merges.is_empty());
+    assert!(!h.coordinator.has_submissions());
+    h.assert_no_merge();
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_a_submitted_merge_even_after_intent_invalidation() {
+    let mut h = Harness::new();
+    h.refresh_pr().await;
+    let token = h.start_merge();
+    h.handle(ActionCommand::Tick {
+        pr: "PR_1".into(),
+        token,
+        remaining: 0,
+    });
+    while !h.coordinator.has_submissions() {
+        h.step().await;
+    }
+    // UI/account reconciliation may already have discarded the displayed intent.
+    h.coordinator.merges.clear();
+    h.coordinator.begin_shutdown();
+    assert!(h.coordinator.has_submissions());
+    while h.coordinator.has_submissions() {
+        h.step().await;
+    }
+    assert!(h.directory.path().join("merge.json").exists());
+}
+
+#[tokio::test]
+async fn shutdown_finishes_submitted_label_but_cancels_the_queue() {
+    let mut h = Harness::new();
+    h.coordinator.state.labels.insert(
+        "PR_1".into(),
+        Labels {
+            items: ["one", "two"]
+                .into_iter()
+                .map(|name| Label {
+                    name: name.into(),
+                    color: "ff0000".into(),
+                    selected: false,
+                })
+                .collect(),
+            ..Default::default()
+        },
+    );
+    for name in ["one", "two"] {
+        h.request(Request::Label {
+            pr: "PR_1".into(),
+            name: name.into(),
+            selected: true,
+        });
+    }
+    while !h.coordinator.has_submissions() {
+        h.step().await;
+    }
+    h.coordinator.begin_shutdown();
+    assert!(h.coordinator.has_submissions());
+    while h.coordinator.has_submissions() {
+        h.step().await;
+    }
+    let mutations = std::fs::read_to_string(h.directory.path().join("labels.log")).unwrap();
+    assert_eq!(mutations.lines().count(), 1);
+    assert!(matches!(
+        h.receiver.try_recv().unwrap(),
+        Command::LabelSaved { selected: true, .. }
+    ));
+    assert!(h.coordinator.label_jobs.values().all(VecDeque::is_empty));
+}
 impl Harness {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();

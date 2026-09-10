@@ -10,6 +10,13 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
+    /// Internal helper, invoked only after install.sh verifies this app bundle.
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    Install {
+        #[arg(long)]
+        no_launch: bool,
+    },
     /// Validate configuration and GitHub authentication without starting the app.
     Doctor,
     /// Print live review evidence as JSON; does not write PR state or send notifications.
@@ -18,6 +25,10 @@ enum Commands {
 
 fn main() -> Result<()> {
     let args = Cli::parse();
+    #[cfg(target_os = "macos")]
+    if let Some(Commands::Install { no_launch }) = args.command {
+        return gopher::installer::install(no_launch);
+    }
     let directory = Config::directory()?;
     if let Some(command) = args.command {
         let config = Config::load(&directory)?;
@@ -25,6 +36,8 @@ fn main() -> Result<()> {
         return runtime.block_on(async {
             let github=Github::new(&config)?;
             match command {
+                #[cfg(target_os = "macos")]
+                Commands::Install { .. } => unreachable!(),
                 Commands::Doctor=>{
                     let login=github.viewer().await?;
                     println!("GitHub CLI: {}\nAuthenticated as: {login}\nData directory: {}\nPolling: {} seconds",gopher::github::resolve_gh(&config)?.display(),directory.display(),config.poll_seconds);

@@ -60,6 +60,7 @@ def write_info(destination, version):
         CFBundleShortVersionString=version,
         CFBundleVersion=bundle_version(version),
         LSMinimumSystemVersion=MINIMUM_OS,
+        GopherInstallerProtocol=1,
     )
     with destination.open("wb") as target:
         plistlib.dump(info, target, sort_keys=False)
@@ -158,6 +159,9 @@ def build(release):
                     digest.update(chunk)
             checksum.write_text(f"{digest.hexdigest()}  {archive.name}\n")
             products.extend([archive, checksum])
+            installer = stage / "install.sh"
+            shutil.copy2(ROOT / "scripts/install.sh", installer)
+            products.append(installer)
         publish(products, dist)
     print(f"Built {dist / 'Gopher.app'} (version {version}, build {bundle_version(version)}).")
     if release:

@@ -10,7 +10,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result, ensure};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     time::Duration,
 };
 use tokio::sync::mpsc::UnboundedSender;
@@ -111,6 +111,10 @@ pub(super) struct Coordinator {
     load_errors: BTreeMap<String, String>,
     completed_labels: BTreeMap<(String, String), bool>,
     label_jobs: BTreeMap<String, VecDeque<LabelJob>>,
+    shutting_down: bool,
+    // Independent of UI/account state: a submitted request must finish even if
+    // its intent is later invalidated by a poll or account change.
+    submissions: BTreeSet<u64>,
 }
 impl Coordinator {
     pub fn new(store: &Store) -> Result<Self> {
@@ -128,7 +132,25 @@ impl Coordinator {
             load_errors: BTreeMap::new(),
             completed_labels: BTreeMap::new(),
             label_jobs: BTreeMap::new(),
+            shutting_down: false,
+            submissions: BTreeSet::new(),
         })
+    }
+    pub fn begin_shutdown(&mut self) {
+        self.shutting_down = true;
+        self.merges
+            .retain(|_, intent| self.submissions.contains(&intent.token));
+        for jobs in self.label_jobs.values_mut() {
+            jobs.retain(|job| self.submissions.contains(&job.intent.token));
+        }
+        tracing::info!(
+            event = "mutations_draining",
+            pending = self.submissions.len()
+        );
+    }
+
+    pub fn has_submissions(&self) -> bool {
+        !self.submissions.is_empty()
     }
     fn token(&mut self) -> u64 {
         self.sequence += 1;
@@ -207,6 +229,14 @@ impl Coordinator {
         }
     }
     pub fn handle(&mut self, command: ActionCommand, context: &Context<'_>) {
+        if self.shutting_down
+            && !matches!(
+                command,
+                ActionCommand::Merged { .. } | ActionCommand::LabelDone { .. }
+            )
+        {
+            return;
+        }
         let label_request = matches!(&command, ActionCommand::Request(Request::Label { .. }));
         match command {
             ActionCommand::Request(request) => {
@@ -246,6 +276,7 @@ impl Coordinator {
                         }
                         Ok(github) => {
                             self.state.merges.insert(pr.clone(), MergeProgress::Merging);
+                            self.submissions.insert(token);
                             let sender = context.sender.clone();
                             tokio::spawn(async move {
                                 let result = async {
@@ -273,6 +304,7 @@ impl Coordinator {
                 }
             }
             ActionCommand::Merged { pr, token, result } => {
+                self.submissions.remove(&token);
                 if self.merges.get(&pr).is_some_and(|i| i.token == token) {
                     self.merges.remove(&pr);
                     match result {
@@ -343,6 +375,7 @@ impl Coordinator {
                                 context,
                             ),
                         Ok(github) => {
+                            self.submissions.insert(token);
                             let sender = context.sender.clone();
                             tokio::spawn(async move {
                                 let result = async {
@@ -365,6 +398,7 @@ impl Coordinator {
                 }
             }
             ActionCommand::LabelDone { pr, token, result } => {
+                self.submissions.remove(&token);
                 self.finish_label(&pr, token, result, context)
             }
         }
@@ -501,6 +535,9 @@ impl Coordinator {
         });
     }
     fn start_label(&mut self, pr: &str, context: &Context<'_>) {
+        if self.shutting_down {
+            return;
+        }
         let Some(job) = self
             .label_jobs
             .get(pr)
