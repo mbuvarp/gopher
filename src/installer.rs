@@ -199,6 +199,38 @@ fn launch(target: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum InstalledApp {
+    Missing,
+    Current,
+    Older,
+}
+
+fn verified_version(app: &Path) -> Result<String> {
+    verify(app).context("Existing Gopher could not be verified; leaving it unchanged")?;
+    property(app, "CFBundleShortVersionString")
+}
+
+fn inspect_target(
+    target: &Path,
+    incoming_version: &str,
+    read_verified_version: impl FnOnce(&Path) -> Result<String>,
+) -> Result<InstalledApp> {
+    ensure!(
+        !target.is_symlink(),
+        "Refusing to replace a symlink at {}",
+        target.display()
+    );
+    if !target.try_exists()? {
+        return Ok(InstalledApp::Missing);
+    }
+    match version(&read_verified_version(target)?)?.cmp(&version(incoming_version)?) {
+        std::cmp::Ordering::Equal => Ok(InstalledApp::Current),
+        std::cmp::Ordering::Greater => bail!("Installed Gopher is newer; refusing to downgrade"),
+        std::cmp::Ordering::Less => Ok(InstalledApp::Older),
+    }
+}
+
 pub fn install(no_launch: bool) -> Result<()> {
     ensure!(
         command("/usr/bin/id", &["-u"])? != "0",
@@ -225,26 +257,12 @@ pub fn install(no_launch: bool) -> Result<()> {
     let installer_lock = lock_file(&apps.join(".gopher-installer.lock"))?;
     fs2::FileExt::try_lock_exclusive(&installer_lock)
         .context("Another Gopher installer is running")?;
-    ensure!(
-        !target.is_symlink(),
-        "Refusing to replace a symlink at {}",
-        target.display()
-    );
-    let existed = target.exists();
-    if existed {
-        verify(&target).context("Existing Gopher could not be verified; leaving it unchanged")?;
-        match version(&property(&target, "CFBundleShortVersionString")?)?
-            .cmp(&version(env!("CARGO_PKG_VERSION"))?)
-        {
-            std::cmp::Ordering::Equal => {
-                println!("Gopher {} is already current.", env!("CARGO_PKG_VERSION"));
-                return Ok(());
-            }
-            std::cmp::Ordering::Greater => {
-                bail!("Installed Gopher is newer; refusing to downgrade")
-            }
-            std::cmp::Ordering::Less => {}
-        }
+    ensure_no_update_installer(&target)?;
+    if inspect_target(&target, env!("CARGO_PKG_VERSION"), verified_version)?
+        == InstalledApp::Current
+    {
+        println!("Gopher {} is already current.", env!("CARGO_PKG_VERSION"));
+        return Ok(());
     }
     let stage = tempfile::Builder::new()
         .prefix(".gopher-install-")
@@ -260,6 +278,17 @@ pub fn install(no_launch: bool) -> Result<()> {
     // A scheduled update can start between staging and the app finishing quit.
     // Its installer runs outside the host and does not own Gopher's app lock.
     ensure_no_update_installer(&target)?;
+    // Sparkle may have completed and exited since the first inspection. Never
+    // reuse the earlier existence/version decision when replacing the target.
+    let installed = inspect_target(&target, env!("CARGO_PKG_VERSION"), verified_version)?;
+    if installed == InstalledApp::Current {
+        drop(app_lock);
+        if was_running && !no_launch {
+            launch(&target)?;
+        }
+        println!("Gopher {} is already current.", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let backup = stage.path().join("previous.app");
     if let Err(error) = replace(&staged_app, &target, &backup) {
         // Never let temporary-directory cleanup delete the only surviving old app.
@@ -275,7 +304,7 @@ pub fn install(no_launch: bool) -> Result<()> {
     // Gopher must be able to acquire its own lock when it launches.
     drop(app_lock);
     if !no_launch
-        && (!existed || was_running)
+        && (installed == InstalledApp::Missing || was_running)
         && let Err(error) = launch(&target)
     {
         // Opening can fail due to desktop/Gatekeeper state. Keep the verified app
@@ -298,6 +327,60 @@ pub fn install(no_launch: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_version(app: &Path) -> Result<String> {
+        Ok(fs::read_to_string(app.join("version"))?)
+    }
+
+    #[test]
+    fn target_reinspection_rejects_update_completed_during_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("Gopher.app");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("version"), "1.0.0").unwrap();
+        assert_eq!(
+            inspect_target(&target, "2.0.0", fixture_version).unwrap(),
+            InstalledApp::Older
+        );
+        // Simulate Sparkle replacing the old bundle and exiting while the
+        // standalone installer stages its incoming v2 bundle.
+        fs::rename(&target, root.path().join("previous.app")).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("version"), "3.0.0").unwrap();
+        let error = inspect_target(&target, "2.0.0", fixture_version).unwrap_err();
+        assert!(error.to_string().contains("refusing to downgrade"));
+        assert_eq!(fixture_version(&target).unwrap(), "3.0.0");
+        fs::write(target.join("version"), "2.0.0").unwrap();
+        assert_eq!(
+            inspect_target(&target, "2.0.0", fixture_version).unwrap(),
+            InstalledApp::Current
+        );
+    }
+
+    #[test]
+    fn target_reinspection_refreshes_existence_and_requires_verification() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("Gopher.app");
+        assert_eq!(
+            inspect_target(&target, "2.0.0", fixture_version).unwrap(),
+            InstalledApp::Missing
+        );
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("version"), "2.0.0").unwrap();
+        let error = inspect_target(&target, "2.0.0", |_| bail!("invalid signature")).unwrap_err();
+        assert_eq!(error.to_string(), "invalid signature");
+        assert_eq!(
+            inspect_target(&target, "2.0.0", fixture_version).unwrap(),
+            InstalledApp::Current
+        );
+        fs::rename(&target, root.path().join("removed.app")).unwrap();
+        assert_eq!(
+            inspect_target(&target, "2.0.0", fixture_version).unwrap(),
+            InstalledApp::Missing
+        );
+        std::os::unix::fs::symlink(root.path().join("removed.app"), &target).unwrap();
+        assert!(inspect_target(&target, "2.0.0", fixture_version).is_err());
+    }
 
     #[test]
     fn applications_directory_rejects_symlinks_without_touching_the_target() {
