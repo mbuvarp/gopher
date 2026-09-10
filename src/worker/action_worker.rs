@@ -98,6 +98,7 @@ struct LabelJob {
     name: String,
     selected: bool,
     previous: bool,
+    color: String,
 }
 
 pub(super) struct Coordinator {
@@ -115,6 +116,7 @@ pub(super) struct Coordinator {
     // Independent of UI/account state: a submitted request must finish even if
     // its intent is later invalidated by a poll or account change.
     submissions: BTreeSet<u64>,
+    submitted_labels: BTreeMap<u64, LabelJob>,
 }
 impl Coordinator {
     pub fn new(store: &Store) -> Result<Self> {
@@ -134,6 +136,7 @@ impl Coordinator {
             label_jobs: BTreeMap::new(),
             shutting_down: false,
             submissions: BTreeSet::new(),
+            submitted_labels: BTreeMap::new(),
         })
     }
     pub fn begin_shutdown(&mut self) {
@@ -376,6 +379,7 @@ impl Coordinator {
                             ),
                         Ok(github) => {
                             self.submissions.insert(token);
+                            self.submitted_labels.insert(token, job.clone());
                             let sender = context.sender.clone();
                             tokio::spawn(async move {
                                 let result = async {
@@ -479,6 +483,7 @@ impl Coordinator {
                     .iter_mut()
                     .find(|label| label.name == name)
                     .context("Label no longer exists")?;
+                let color = label.color.clone();
                 let previous = label.selected;
                 if previous == selected {
                     return Ok(());
@@ -492,6 +497,7 @@ impl Coordinator {
                     name,
                     selected,
                     previous,
+                    color,
                 });
                 if jobs.len() == 1 {
                     self.start_label(&pr, context);
@@ -582,38 +588,54 @@ impl Coordinator {
         result: Result<(), String>,
         context: &Context<'_>,
     ) {
-        let Some(jobs) = self.label_jobs.get_mut(pr) else {
+        let current = self
+            .label_jobs
+            .get(pr)
+            .and_then(|jobs| jobs.front())
+            .is_some_and(|job| job.intent.token == token);
+        let queued = if current {
+            self.label_jobs.get_mut(pr).and_then(VecDeque::pop_front)
+        } else {
+            None
+        };
+        let Some(job) = self.submitted_labels.remove(&token).or(queued) else {
             return;
         };
-        if !jobs.front().is_some_and(|j| j.intent.token == token) {
-            return;
-        }
-        let job = jobs.pop_front().unwrap();
-        if let Some(labels) = self.state.labels.get_mut(pr) {
-            labels.pending.remove(&job.name);
-            if let Err(error) = result {
-                if let Some(label) = labels.items.iter_mut().find(|label| label.name == job.name) {
-                    label.selected = job.previous;
-                }
-                tracing::warn!(event="label_update_failed", pr_id=%pr, error=%error);
-                labels.error = Some(error);
-            } else {
-                self.completed_labels
-                    .insert((pr.into(), job.name.clone()), job.selected);
-                tracing::info!(event="label_updated", pr_id=%pr, label=%job.name, selected=job.selected);
-                if let Some(label) = labels.items.iter().find(|label| label.name == job.name) {
-                    let _ = context.sender.send(Command::LabelSaved {
-                        pr: pr.into(),
-                        viewer: job.intent.viewer.clone(),
-                        label: crate::model::PrLabel {
-                            name: label.name.clone(),
-                            color: label.color.clone(),
-                        },
-                        selected: job.selected,
-                    });
-                }
+        // The result outlives the UI intent. Always report it, but never mutate
+        // a new account's picker or remove its pending toggle for the same PR.
+        match &result {
+            Err(error) => {
+                tracing::warn!(event="label_update_failed", pr_id=%pr, viewer=%job.intent.viewer, error=%error)
+            }
+            Ok(()) => {
+                tracing::info!(event="label_updated", pr_id=%pr, viewer=%job.intent.viewer, label=%job.name, selected=job.selected);
+                let _ = context.sender.send(Command::LabelSaved {
+                    pr: pr.into(),
+                    viewer: job.intent.viewer.clone(),
+                    label: crate::model::PrLabel {
+                        name: job.name.clone(),
+                        color: job.color.clone(),
+                    },
+                    selected: job.selected,
+                });
             }
         }
-        self.start_label(pr, context);
+        if current && context.viewer == Some(job.intent.viewer.as_str()) {
+            if let Some(labels) = self.state.labels.get_mut(pr) {
+                labels.pending.remove(&job.name);
+                if let Err(error) = result {
+                    if let Some(label) =
+                        labels.items.iter_mut().find(|label| label.name == job.name)
+                    {
+                        label.selected = job.previous;
+                    }
+                    labels.error = Some(error);
+                } else {
+                    self.completed_labels
+                        .insert((pr.into(), job.name.clone()), job.selected);
+                }
+            }
+            self.start_label(pr, context);
+        }
     }
 }

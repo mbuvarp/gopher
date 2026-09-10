@@ -16,6 +16,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parent.parent
 TARGET = "aarch64-apple-darwin"
 MINIMUM_OS = "13.0"
+RELEASE_IDENTITY = '=anchor apple generic and identifier "dev.mbuvarp.gopher" and certificate leaf[subject.OU] = "DZ4XZQXHZ7"'
 
 
 def run(*args, **kwargs):
@@ -66,7 +67,7 @@ def write_info(destination, version):
         plistlib.dump(info, target, sort_keys=False)
 
 
-def verify_bundle(bundle, version):
+def verify_bundle(bundle, version, release=False):
     binary = bundle / "Contents/MacOS/gopher"
     if output("lipo", "-archs", str(binary)) != "arm64":
         raise ValueError("Packaged binary must contain only arm64")
@@ -85,7 +86,8 @@ def verify_bundle(bundle, version):
         raise ValueError("Packaged app metadata does not match the Cargo version")
     if not os.access(binary, os.X_OK):
         raise ValueError("Packaged binary is not executable")
-    run("codesign", "--verify", "--strict", str(bundle))
+    requirement = ["-R", RELEASE_IDENTITY] if release else []
+    run("codesign", "--verify", "--deep", "--strict", *requirement, str(bundle))
 
 
 def publish(staged, destination):
@@ -144,14 +146,14 @@ def build(release):
                     "--out", str(iconset / f"icon_{size}x{size}{suffix}.png"), stdout=subprocess.DEVNULL)
         run("iconutil", "-c", "icns", str(iconset), "-o", str(resources / "Gopher.icns"))
         run("codesign", "--force", "--sign", identity, str(bundle))
-        verify_bundle(bundle, version)
+        verify_bundle(bundle, version, release=release)
         products = [bundle]
         if release:
             archive = stage / f"Gopher-{version}-macos-arm64.zip"
             run("ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(bundle), str(archive))
             extracted = stage / "verification"
             run("ditto", "-x", "-k", str(archive), str(extracted))
-            verify_bundle(extracted / "Gopher.app", version)
+            verify_bundle(extracted / "Gopher.app", version, release=True)
             checksum = stage / (archive.name + ".sha256")
             with archive.open("rb") as source:
                 digest = hashlib.sha256()

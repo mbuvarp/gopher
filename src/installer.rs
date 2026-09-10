@@ -80,6 +80,21 @@ fn lock_file(path: &Path) -> Result<File> {
         .open(path)?)
 }
 
+fn applications_directory(home: &Path) -> Result<PathBuf> {
+    let apps = home.join("Applications");
+    // Check before create_dir_all/canonicalize can follow the destination.
+    match fs::symlink_metadata(&apps) {
+        Ok(metadata) => ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "Refusing a symlink or non-directory at {}",
+            apps.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&apps)?,
+        Err(error) => return Err(error.into()),
+    }
+    Ok(apps.canonicalize()?)
+}
+
 fn is_contended(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::WouldBlock
 }
@@ -183,9 +198,7 @@ pub fn install(no_launch: bool) -> Result<()> {
         "Downloaded version does not match its executable"
     );
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?);
-    let apps = home.join("Applications");
-    fs::create_dir_all(&apps)?;
-    let apps = apps.canonicalize()?;
+    let apps = applications_directory(&home)?;
     let target = apps.join("Gopher.app");
     ensure!(
         source.canonicalize()? != target,
@@ -263,6 +276,31 @@ pub fn install(no_launch: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applications_directory_rejects_symlinks_without_touching_the_target() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let outside = root.path().join("outside");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), "unchanged").unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("Applications")).unwrap();
+        assert!(applications_directory(&home).is_err());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+        assert_eq!(
+            fs::read_to_string(outside.join("keep")).unwrap(),
+            "unchanged"
+        );
+        fs::remove_file(home.join("Applications")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("missing"), home.join("Applications")).unwrap();
+        assert!(applications_directory(&home).is_err());
+        assert!(!root.path().join("missing").exists());
+        fs::remove_file(home.join("Applications")).unwrap();
+        let apps = applications_directory(&home).unwrap();
+        assert!(apps.is_dir());
+        assert_eq!(applications_directory(&home).unwrap(), apps);
+    }
 
     #[test]
     fn versions_are_numeric_and_reject_ambiguous_inputs() {

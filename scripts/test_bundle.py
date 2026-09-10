@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import plistlib
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -49,6 +50,29 @@ class BundleTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 bundle.signing_identity(True)
+
+    def test_release_verification_rejects_another_signing_team(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            app = Path(temporary) / "Gopher.app"
+            binary = app / "Contents/MacOS/gopher"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("fixture")
+            binary.chmod(0o755)
+            bundle.write_info(app / "Contents/Info.plist", "0.1.0")
+
+            def verify_signature(*args, **kwargs):
+                self.assertEqual(args[0], "codesign")
+                # Model an otherwise valid Apple-signed binary from another team.
+                if "-R" in args:
+                    requirement = args[args.index("-R") + 1]
+                    self.assertIn('certificate leaf[subject.OU] = "DZ4XZQXHZ7"', requirement)
+                    self.assertTrue(requirement.startswith("=anchor apple generic"))
+                    raise subprocess.CalledProcessError(1, args)
+
+            with patch.object(bundle, "output", side_effect=["arm64", "minos 13.0\n"] * 2), patch.object(bundle, "run", side_effect=verify_signature):
+                bundle.verify_bundle(app, "0.1.0", release=False)
+                with self.assertRaises(subprocess.CalledProcessError):
+                    bundle.verify_bundle(app, "0.1.0", release=True)
 
     def test_replacing_bundle_removes_stale_files(self):
         with tempfile.TemporaryDirectory() as temporary:

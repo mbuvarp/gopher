@@ -822,51 +822,61 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_flushes_label_saves_queued_after_the_quit_request() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut store = Store::open(directory.path()).unwrap();
-        store.set_viewer("test").unwrap();
-        store
-            .save(&transition(
-                Snapshot {
-                    id: "PR_1".into(),
-                    repo: "owner/repo".into(),
-                    open: true,
+        for account in ["test", "old-account"] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = Store::open(directory.path()).unwrap();
+            store.set_viewer("test").unwrap();
+            store
+                .save(&transition(
+                    Snapshot {
+                        id: "PR_1".into(),
+                        repo: "owner/repo".into(),
+                        open: true,
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                    100,
+                    0,
+                ))
+                .unwrap();
+            let (sender, receiver) = unbounded_channel();
+            sender.send(Command::Shutdown).unwrap();
+            sender.send(Command::Shutdown).unwrap(); // UI quit followed by Worker::drop.
+            sender
+                .send(Command::LabelSaved {
+                    pr: "PR_1".into(),
+                    viewer: account.into(),
+                    label: PrLabel {
+                        name: "saved".into(),
+                        color: "112233".into(),
+                    },
+                    selected: true,
+                })
+                .unwrap();
+            run(
+                directory.path().into(),
+                Config {
+                    gh_path: Some(directory.path().join("missing-gh")),
                     ..Default::default()
                 },
-                None,
-                None,
-                100,
-                0,
-            ))
+                receiver,
+                sender,
+                Arc::new(|_| {}),
+                IGNORED_CHECK_INTERVAL,
+            )
+            .await
             .unwrap();
-        let (sender, receiver) = unbounded_channel();
-        sender.send(Command::Shutdown).unwrap();
-        sender.send(Command::Shutdown).unwrap(); // UI quit followed by Worker::drop.
-        sender
-            .send(Command::LabelSaved {
-                pr: "PR_1".into(),
-                viewer: "test".into(),
-                label: PrLabel {
-                    name: "saved".into(),
-                    color: "112233".into(),
-                },
-                selected: true,
-            })
-            .unwrap();
-        run(
-            directory.path().into(),
-            Config {
-                gh_path: Some(directory.path().join("missing-gh")),
-                ..Default::default()
-            },
-            receiver,
-            sender,
-            Arc::new(|_| {}),
-            IGNORED_CHECK_INTERVAL,
-        )
-        .await
-        .unwrap();
-        assert_eq!(store.load().unwrap()[0].snapshot.labels[0].name, "saved");
+            let labels = store.load().unwrap()[0].snapshot.labels.clone();
+            if account == "test" {
+                assert_eq!(labels[0].name, "saved");
+            } else {
+                assert!(
+                    labels.is_empty(),
+                    "An old account must not change the current cache"
+                );
+            }
+        }
     }
 
     fn next_list_event(rx: &std::sync::mpsc::Receiver<UiEvent>) -> UiEvent {
