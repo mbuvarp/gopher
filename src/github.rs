@@ -209,6 +209,7 @@ impl Github {
                     event = "github_request_failed",
                     request,
                     category = failure.category,
+                    reason = failure.reason,
                     http_status = failure.http_status,
                     exit_code = output.status.code(),
                     elapsed_ms = start.elapsed().as_millis() as u64
@@ -244,6 +245,7 @@ impl Github {
                     event = "github_request_failed",
                     request,
                     category = "timeout",
+                    reason = "process_timeout",
                     elapsed_ms = start.elapsed().as_millis() as u64
                 );
                 bail!("GitHub request timed out; check connectivity")
@@ -699,6 +701,7 @@ fn legacy_checks(statuses: &[Value]) -> Vec<Check> {
 
 struct RequestFailure {
     category: &'static str,
+    reason: &'static str,
     http_status: Option<u16>,
     message: &'static str,
 }
@@ -709,28 +712,32 @@ fn classify_failure(stderr: &str) -> RequestFailure {
         std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bHTTP\s+([1-5][0-9]{2})\b").unwrap());
     let http_status = HTTP.captures(stderr).and_then(|c| c[1].parse::<u16>().ok());
     let text = stderr.to_lowercase();
-    let (category, message) = if http_status == Some(401)
+    let (category, reason, message) = if http_status == Some(401)
         || ["bad credentials", "gh auth login", "authentication"]
             .iter()
             .any(|s| text.contains(s))
     {
         (
             "authentication",
+            "authentication_failed",
             "GitHub authentication failed. Run gh auth login --hostname github.com.",
         )
     } else if http_status == Some(429) || text.contains("rate limit") {
         (
             "rate_limit",
+            "rate_limited",
             "GitHub rate limit reached; polling will back off.",
         )
     } else if matches!(http_status, Some(403 | 404)) {
         (
             "access",
+            "access_denied",
             "GitHub access denied or repository unavailable; check repository permissions and organization SSO.",
         )
     } else if http_status.is_some_and(|s| s >= 500) {
         (
             "github_server",
+            "server_error",
             "GitHub reported a server error; polling will retry automatically.",
         )
     } else if text.contains("could not resolve")
@@ -739,18 +746,36 @@ fn classify_failure(stderr: &str) -> RequestFailure {
     {
         (
             "dns",
+            "dns_resolution_failed",
             "GitHub hostname could not be resolved; check network connectivity.",
         )
-    } else if text.contains("x509") || text.contains("certificate") || text.contains("tls") {
+    } else if text.contains("tls handshake timeout") || text.contains("tls handshake timed out") {
+        (
+            "timeout",
+            "tls_handshake_timeout",
+            "GitHub secure connection timed out; try again shortly.",
+        )
+    } else if text.contains("x509") || text.contains("certificate") {
         (
             "tls",
-            "GitHub secure connection failed; check certificate and network settings.",
+            "certificate_verification_failed",
+            "GitHub certificate verification failed; check certificate and network settings.",
         )
     } else if text.contains("timeout")
         || text.contains("timed out")
         || text.contains("deadline exceeded")
     {
-        ("timeout", "GitHub request timed out; check connectivity.")
+        (
+            "timeout",
+            "request_timeout",
+            "GitHub request timed out; check connectivity.",
+        )
+    } else if text.contains("tls") {
+        (
+            "tls",
+            "tls_failure",
+            "GitHub secure connection failed; try again or check network settings.",
+        )
     } else if [
         "connection reset",
         "connection refused",
@@ -763,16 +788,19 @@ fn classify_failure(stderr: &str) -> RequestFailure {
     {
         (
             "connection",
+            "connection_interrupted",
             "GitHub connection was interrupted; polling will retry automatically.",
         )
     } else {
         (
+            "unclassified",
             "unclassified",
             "GitHub request failed; check network connectivity and gh access.",
         )
     };
     RequestFailure {
         category,
+        reason,
         http_status,
         message,
     }
@@ -882,11 +910,58 @@ mod tests {
         }
     }
     #[test]
+    fn distinguishes_tls_timeouts_certificate_failures_and_other_tls_errors() {
+        for (stderr, category, reason) in [
+            (
+                "Get https://api.github.com/private: net/http: TLS handshake timeout SECRET_TOKEN",
+                "timeout",
+                "tls_handshake_timeout",
+            ),
+            (
+                "TLS handshake timed out",
+                "timeout",
+                "tls_handshake_timeout",
+            ),
+            (
+                "TLS handshake: context deadline exceeded",
+                "timeout",
+                "request_timeout",
+            ),
+            ("dial tcp: i/o timeout", "timeout", "request_timeout"),
+            (
+                "tls: failed to verify certificate: x509: certificate signed by unknown authority SECRET_TOKEN",
+                "tls",
+                "certificate_verification_failed",
+            ),
+            (
+                "x509: certificate has expired or is not yet valid",
+                "tls",
+                "certificate_verification_failed",
+            ),
+            ("remote error: tls: handshake failure", "tls", "tls_failure"),
+            (
+                "gh: TLS handshake timeout (HTTP 502)",
+                "github_server",
+                "server_error",
+            ),
+        ] {
+            let failure = classify_failure(stderr);
+            assert_eq!(failure.category, category, "{stderr}");
+            assert_eq!(failure.reason, reason, "{stderr}");
+            assert!(!failure.message.contains("SECRET_TOKEN"));
+            assert!(!failure.message.contains("/private"));
+            if category == "timeout" || reason == "tls_failure" {
+                assert!(!failure.message.contains("certificate"));
+            }
+        }
+    }
+    #[test]
     fn arbitrary_numbers_and_secrets_are_not_interpreted_or_logged() {
         let failure = classify_failure("request 40123 failed SECRET_TOKEN");
         assert_eq!(failure.category, "unclassified");
         assert_eq!(failure.http_status, None);
         assert!(!failure.message.contains("SECRET_TOKEN"));
+        assert_eq!(failure.reason, "unclassified");
     }
     #[test]
     fn legacy_statuses_use_latest_bot_result_and_original_run_start() {
