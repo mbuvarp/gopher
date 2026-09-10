@@ -41,11 +41,18 @@ use tray_icon::{
     menu::{CheckMenuItem, ContextMenu, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
 };
 
+mod keyboard;
 mod popover;
 
 #[derive(Clone, Debug)]
 enum AppEvent {
     Worker(UiEvent),
+    Shortcut(crate::hotkeys::HotkeyAction),
+    Escape,
+    GlobalShortcut(u32),
+    HotkeyEdit(keyboard::Edit),
+    ShortcutRecorded(crate::hotkeys::HotkeyAction, crate::hotkeys::Binding),
+    HighlightPr(String),
     Menu(String),
     MenuClosed,
     Permission(bool),
@@ -169,6 +176,7 @@ enum Action {
     },
     Refresh,
     Config,
+    ConfigFile,
     Logs,
     Login,
     NotificationSettings,
@@ -335,6 +343,7 @@ pub fn run(
     let pr_menu_target = PrMenuTarget::new(event_loop.create_proxy());
     let mut popover =
         popover::ReviewPopover::new(event_loop.create_proxy(), bundled, sender.clone());
+    let mut keyboard = keyboard::Keyboard::new(event_loop.create_proxy());
     let tray_proxy = event_loop.create_proxy();
     TrayIconEvent::set_event_handler(Some(move |event| {
         if matches!(
@@ -398,6 +407,8 @@ pub fn run(
             }
             Event::UserEvent(AppEvent::NotificationError(message)) => {ui_error=Some(message);rebuild=true;}
             Event::UserEvent(AppEvent::Worker(event)) => match event {
+                UiEvent::HotkeysLoaded {preferences,error}=>{keyboard.load(preferences,error);rebuild=true;}
+                UiEvent::HotkeysSaved(result)=>{keyboard.saved(result);rebuild=true;}
                 UiEvent::ActionsChanged(state)=>{popover.action_state=state;rebuild=true;}
                 UiEvent::LabelRequestHandled=>{popover.label_request_handled();rebuild=true;}
                 UiEvent::IgnoredUpdated{prs:updated,error,loading}=>{ignored_prs=updated;ignored_error=error;ignored_loading=loading;rebuild=true;}
@@ -428,11 +439,21 @@ pub fn run(
                     else {let _=sender.send(Command::NotificationFailed(id));}
                 }
             },
+            Event::UserEvent(AppEvent::Shortcut(action)) => {rebuild=popover.shortcut(action);}
+            Event::UserEvent(AppEvent::Escape) => {popover.escape();rebuild=true;}
+            Event::UserEvent(AppEvent::GlobalShortcut(id)) => {
+                if keyboard.global_event(id,&sender) && let Some(tray)=&tray {popover.toggle(tray);}
+                rebuild=true;
+            }
+            Event::UserEvent(AppEvent::HotkeyEdit(edit)) => {keyboard.edit(edit,&sender);rebuild=true;}
+            Event::UserEvent(AppEvent::ShortcutRecorded(action,binding)) => {keyboard.recorded(action,Some(binding),&sender);rebuild=true;}
+            Event::UserEvent(AppEvent::HighlightPr(id)) => {popover.highlight(id);rebuild=true;}
             Event::UserEvent(AppEvent::MenuClosed) => {}
             Event::UserEvent(AppEvent::RefreshPopover) => {rebuild=true;}
             Event::UserEvent(AppEvent::PrAction(request)) => {let _=sender.send(Command::PrAction(crate::worker::ActionCommand::Request(request)));}
             Event::UserEvent(AppEvent::TogglePopover) => {
                 if let Some(tray) = &tray { popover.toggle(tray); }
+                rebuild=true;
             }
             Event::UserEvent(AppEvent::ToggleDetails(id)) => {
                 popover.toggle_details(&id);
@@ -469,6 +490,11 @@ pub fn run(
                                 }
                             }
                             Action::Config=>{
+                                popover.settings();
+                                if let Some(tray)=&tray {popover.show(tray);}
+                                rebuild=true;
+                            }
+                            Action::ConfigFile=>{
                                 let path=directory.join("config.toml");
                                 // File work is dispatched off the menu callback.
                                 let proxy=proxy.clone();
@@ -502,9 +528,12 @@ pub fn run(
             }
             _=>(),
         }
+        let (window,inbox,settings)=popover.keyboard_context();
+        keyboard.sync(window,inbox,settings);
+        popover.keyboard_state=keyboard.state.borrow().clone();
         if pending_reveal.is_some() && tray.is_some() && popover.prepare_notification_reveal() {
-            popover.scroll_to_pr(pending_reveal.take().flatten());
             if let Some(tray)=&tray {popover.show(tray);}
+            popover.scroll_to_pr(pending_reveal.take().flatten());
             rebuild=true;
         }
         if rebuild {
@@ -513,6 +542,11 @@ pub fn run(
             } else {
                 popover.update(&prs, service_error.as_deref().or(ui_error.as_deref()), bundled, refreshing);
             }
+        }
+        let (window,inbox,settings)=popover.keyboard_context();
+        keyboard.sync(window,inbox,settings);
+        if let Some(next)=popover.animate() && !matches!(*flow,ControlFlow::Exit) {
+            *flow=ControlFlow::WaitUntil(next);
         }
         let update_menu = {
             let mut state = menu_state.lock().unwrap();
@@ -807,7 +841,7 @@ fn menu(
     let actions_menu = Submenu::new("Actions", true);
     for (label, action) in [
         ("Refresh now", Action::Refresh),
-        ("Edit configuration… (restart to apply)", Action::Config),
+        ("Settings…", Action::Config),
         ("Open logs…", Action::Logs),
         ("Notification settings…", Action::NotificationSettings),
     ] {

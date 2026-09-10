@@ -26,6 +26,30 @@ impl Store {
         Ok(Self { connection })
     }
 
+    pub fn hotkeys(&self) -> Result<crate::hotkeys::Preferences> {
+        let data: Option<String> = self
+            .connection
+            .query_row("SELECT value FROM metadata WHERE key='hotkeys'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let preferences: crate::hotkeys::Preferences = data
+            .map(|text| serde_json::from_str(&text))
+            .transpose()?
+            .unwrap_or_default();
+        preferences.validate()?;
+        Ok(preferences)
+    }
+    pub fn save_hotkeys(&self, preferences: &crate::hotkeys::Preferences) -> Result<()> {
+        preferences.validate()?;
+        self.connection.execute(
+            "INSERT OR REPLACE INTO metadata(key,value) VALUES ('hotkeys',?1)",
+            [serde_json::to_string(preferences)?],
+        )?;
+        tracing::info!(event = "hotkeys_saved");
+        Ok(())
+    }
+
     pub fn ignored(&self) -> Result<BTreeSet<String>> {
         let mut query = self.connection.prepare("SELECT id FROM ignored_prs")?;
         Ok(query

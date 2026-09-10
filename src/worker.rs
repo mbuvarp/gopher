@@ -18,6 +18,11 @@ const IGNORED_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Debug)]
 pub enum UiEvent {
+    HotkeysLoaded {
+        preferences: crate::hotkeys::Preferences,
+        error: Option<String>,
+    },
+    HotkeysSaved(std::result::Result<(), String>),
     /// Sent after the action-state event for a label request, including rejection.
     LabelRequestHandled,
     ActionsChanged(crate::actions::ActionState),
@@ -49,6 +54,7 @@ pub enum UiEvent {
     },
 }
 pub enum Command {
+    SaveHotkeys(crate::hotkeys::Preferences),
     PrAction(ActionCommand),
     LabelSaved {
         pr: String,
@@ -277,6 +283,16 @@ async fn run(
         error: None,
         loading: false,
     });
+    match store.hotkeys() {
+        Ok(preferences) => sink(UiEvent::HotkeysLoaded {
+            preferences,
+            error: None,
+        }),
+        Err(error) => sink(UiEvent::HotkeysLoaded {
+            preferences: Default::default(),
+            error: Some(format!("Cannot load shortcuts: {error}")),
+        }),
+    }
     let mut label_deadline = Instant::now();
     loop {
         // Keep ordinary deadlines intact so a credential switch can lift an old
@@ -310,6 +326,14 @@ async fn run(
         };
         let mut reveal_target = None;
         match command {
+            Command::SaveHotkeys(preferences) => {
+                let result = store.save_hotkeys(&preferences).map_err(|e| e.to_string());
+                if let Err(error) = &result {
+                    tracing::error!(event = "hotkeys_save_failed", error);
+                }
+                sink(UiEvent::HotkeysSaved(result));
+                continue;
+            }
             Command::CredentialsProbed => {}
             Command::CheckLabels => {
                 if !Github::cooldown(&config, None).is_zero() {
