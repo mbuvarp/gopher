@@ -13,11 +13,14 @@ pub(super) struct SettingsEditor {
     reset: Retained<NSButton>,
     file: Retained<NSButton>,
     message: Retained<NSTextField>,
+    checks: Retained<NSButton>,
+    downloads: Retained<NSButton>,
+    updates_message: Retained<NSTextField>,
 }
 impl SettingsEditor {
     pub fn new(target: &ActionTarget) -> Self {
         let mtm = MainThreadMarker::new().unwrap();
-        let view = FlippedView::new(rect(0.0, 0.0, WIDTH, 480.0), mtm);
+        let view = FlippedView::new(rect(0.0, 0.0, WIDTH, 660.0), mtm);
         let heading = label("Hotkeys", 16.0, false, mtm);
         heading.setFont(Some(&NSFont::boldSystemFontOfSize(16.0)));
         heading.setFrame(rect(20.0, 10.0, 200.0, 24.0));
@@ -64,15 +67,58 @@ impl SettingsEditor {
         let message = label("", 11.0, true, mtm);
         message.setFrame(rect(20.0, 434.0, WIDTH - 40.0, 40.0));
         view.addSubview(&message);
+        let heading = label(
+            &format!("Updates · Gopher {}", env!("CARGO_PKG_VERSION")),
+            16.0,
+            false,
+            mtm,
+        );
+        heading.setFont(Some(&NSFont::boldSystemFontOfSize(16.0)));
+        heading.setFrame(rect(20.0, 490.0, WIDTH - 40.0, 24.0));
+        view.addSubview(&heading);
+        let checks = target.button(
+            "Automatically check for updates daily",
+            AppEvent::UpdateEdit(super::super::updates::Edit::Checks),
+            mtm,
+        );
+        let downloads = target.button(
+            "Download updates and install when Gopher quits",
+            AppEvent::UpdateEdit(super::super::updates::Edit::Downloads),
+            mtm,
+        );
+        for (index, button) in [&checks, &downloads].into_iter().enumerate() {
+            button.setButtonType(NSButtonType::Switch);
+            button.setFrame(rect(20.0, 525.0 + index as f64 * 30.0, WIDTH - 40.0, 26.0));
+            view.addSubview(button);
+        }
+        let updates_message = label("", 11.0, true, mtm);
+        updates_message.setFrame(rect(20.0, 592.0, WIDTH - 40.0, 52.0));
+        view.addSubview(&updates_message);
         Self {
             view,
             rows,
             reset,
             file,
             message,
+            checks,
+            downloads,
+            updates_message,
         }
     }
-    pub fn update(&self, state: &KeyboardState) {
+    pub fn update(&self, state: &KeyboardState, updates: &super::super::updates::State) {
+        self.checks.setEnabled(updates.enabled);
+        self.downloads.setEnabled(updates.enabled && updates.checks);
+        self.checks.setState(if updates.checks { 1 } else { 0 });
+        self.downloads
+            .setState(if updates.downloads { 1 } else { 0 });
+        set_text(
+            &self.updates_message,
+            if updates.message.is_empty() {
+                "Updates install on quit. Use Actions to check or install and relaunch now."
+            } else {
+                &updates.message
+            },
+        );
         for row in &self.rows {
             let binding = state.preferences.binding(row.action);
             let title = if state.recording == Some(row.action) {
@@ -110,7 +156,7 @@ impl SettingsEditor {
                 target.ivars().actions.borrow_mut().remove(&button.tag());
             }
         }
-        for button in [&self.reset, &self.file] {
+        for button in [&self.reset, &self.file, &self.checks, &self.downloads] {
             target.ivars().actions.borrow_mut().remove(&button.tag());
         }
     }

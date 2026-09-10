@@ -91,5 +91,9 @@ fn main() -> Result<()> {
     if let Err(error) = session.finish(reason) {
         eprintln!("Gopher could not record completed shutdown: {error:#}");
     }
+    drop(_guard);
+    drop(lock);
+    #[cfg(target_os = "macos")]
+    gopher::macos::finish_native_termination();
     result.map(|_| ())
 }

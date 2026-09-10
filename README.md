@@ -166,3 +166,21 @@ cargo test --locked
 `doctor` verifies configuration, CLI discovery, and authentication. `inspect` fetches live evidence and prints a JSON verdict without writing PR state or sending notifications. It does not have the running app's historical evidence and does not apply the confirmation interval.
 
 See [AGENTS.md](AGENTS.md) for project conventions. Use Conventional Commits.
+
+## In-app updates
+
+Release builds include Sparkle; no separate updater installation is needed. By default,
+Gopher checks daily, downloads updates, and installs them when you quit. It does not
+restart itself without your request. Settings has switches for automatic checks and
+downloads; changes apply immediately. Sparkle owns these preferences in macOS defaults
+and its temporary downloads in macOS caches. PR data, configuration, and Gopher logs
+remain in `~/.config/gopher`.
+
+The Actions menu entry above Quit Gopher changes from **Check for updates…** to
+**Update available…**. Open it to see release notes and install/relaunch using the
+standard update dialog. Updates wait for submitted PR actions to finish before quitting.
+Background failures are logged without repeated alerts. Local development builds do not
+check for releases or replace themselves.
+
+Update feeds will become available when the release publishing workflow ships.
+See [update maintenance and validation](docs/updates.md) for signing and testing details.
