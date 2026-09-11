@@ -118,10 +118,55 @@ class ReleaseTests(unittest.TestCase):
             directory=Path(d);self.artifacts(directory)
             api=API()
             self.assertEqual(release.publish(api,directory,VERSION,SHA,'Notes\n'),'https://example.test/release')
-            self.assertEqual(api.writes[-1][2], {'draft':False,'make_latest':'true'})
+            self.assertEqual(api.writes[-1][2], {'tag_name':'v'+VERSION,'target_commitish':SHA,
+                                               'draft':False,'make_latest':'true'})
+            for _, method, data in api.writes:
+                if method == 'PATCH':
+                    self.assertEqual(data['tag_name'], 'v'+VERSION)
+                    self.assertEqual(data['target_commitish'], SHA)
             self.assertFalse(api.releases[0]['draft'])
             with self.assertRaises(ValueError):
                 release.publish(api,directory,VERSION,SHA,'Notes\n')
+
+    def test_orphaned_workflow_draft_blocks_retry_without_creating_a_duplicate(self):
+        api=API(dict(draft(), tag_name='untagged-placeholder'))
+        with self.assertRaisesRegex(ValueError, 'unexpected tag'):
+            release.validate_remote(api, VERSION, SHA)
+        self.assertEqual(api.writes, [])
+
+    def test_unexpected_draft_tag_stops_before_upload(self):
+        with tempfile.TemporaryDirectory() as d:
+            directory=Path(d); self.artifacts(directory)
+            for stage in ('POST', 'PATCH'):
+                with self.subTest(stage=stage):
+                    api=API(); request=api.request
+                    def changed_tag(path, method='GET', data=None):
+                        result=request(path, method, data)
+                        if method == stage:
+                            api.releases[0]['tag_name']='untagged-placeholder'
+                            result=copy.deepcopy(api.releases[0])
+                        return result
+                    with patch.object(api, 'request', side_effect=changed_tag):
+                        with self.assertRaisesRegex(ValueError, 'unexpected tag'):
+                            release.publish(api, directory, VERSION, SHA, 'Notes\n')
+                    self.assertEqual(api.assets, [])
+                    self.assertTrue(api.releases[0]['draft'])
+
+    def test_publication_response_must_confirm_identity_and_immutability(self):
+        with tempfile.TemporaryDirectory() as d:
+            directory=Path(d); self.artifacts(directory)
+            for changed in ({'tag_name':'untagged-placeholder'}, {'target_commitish':'b'*40},
+                            {'immutable':False}, {'draft':True}):
+                with self.subTest(changed=changed):
+                    api=API(); request=api.request
+                    def changed_publication(path, method='GET', data=None):
+                        result=request(path, method, data)
+                        if method == 'PATCH' and data.get('draft') is False:
+                            result.update(changed)
+                        return result
+                    with patch.object(api, 'request', side_effect=changed_publication):
+                        with self.assertRaisesRegex(ValueError, 'not confirmed'):
+                            release.publish(api, directory, VERSION, SHA, 'Notes\n')
 
     def test_interrupted_and_corrupt_uploads_stay_drafts_and_are_recoverable(self):
         with tempfile.TemporaryDirectory() as d:

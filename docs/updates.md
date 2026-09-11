@@ -111,7 +111,10 @@ publish. Published archives/tags cannot be replaced; fixes need another version.
 
 A failed upload leaves an unpublished draft. Rerunning the same commit/version can
 recover a draft only if it has this workflow's marker, GitHub Actions authorship, and
-matching target commit. The workflow replaces the complete expected asset set, verifies
+matching tag and target commit. Every draft update explicitly preserves both fields
+and verifies GitHub's response. A workflow-marked draft with an unexpected tag (including
+an `untagged-...` placeholder) blocks another attempt rather than creating a duplicate.
+The workflow replaces the complete expected asset set, verifies
 it, and publishes. Unknown assets, different commits, unrelated drafts, or tag collisions
 fail for manual inspection; the workflow never deletes such releases or tags. If a code
 fix changes the commit, inspect and remove the failed unpublished draft/tag manually

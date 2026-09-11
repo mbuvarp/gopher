@@ -75,6 +75,10 @@ def marker(version, sha):
 
 def matching_draft(releases, version, sha):
     tag = "v" + version
+    for release in releases:
+        if (release["draft"] and release["tag_name"] != tag
+                and f"<!-- gopher-release:v1 {version} " in (release.get("body") or "")):
+            raise ValueError("Workflow draft has an unexpected tag; inspect it before retrying")
     matches = [r for r in releases if r["tag_name"] == tag]
     if len(matches) > 1:
         raise ValueError("Multiple releases claim this version")
@@ -86,6 +90,12 @@ def matching_draft(releases, version, sha):
             or marker(version, sha) not in (release.get("body") or "")
             or release.get("author", {}).get("login") != "github-actions[bot]"):
         raise ValueError("Version already exists or draft belongs to another commit/workflow; manual recovery required")
+    return release
+
+
+def require_draft(release, version, sha):
+    if matching_draft([release], version, sha) is None:
+        raise ValueError("GitHub returned a draft with an unexpected tag; inspect it before retrying")
     return release
 
 
@@ -161,15 +171,17 @@ def publish(api, directory, version, sha, notes):
     # Recheck the server's draft immediately before touching its assets. Never
     # replace published assets or automatically delete conflicting releases/tags.
     current = api.request(f"releases/{release_id}")
-    matching_draft([current], version, sha)
+    require_draft(current, version, sha)
     for asset in api.pages(f"releases/{release_id}/assets?per_page=100"):
         if asset["name"] not in hashes:
             raise ValueError("Unexpected draft asset; manual recovery required")
     # A rerun rebuilds signatures, so replace the complete unpublished asset set.
     for asset in api.pages(f"releases/{release_id}/assets?per_page=100"):
-        matching_draft([api.request(f"releases/{release_id}")], version, sha)
+        require_draft(api.request(f"releases/{release_id}"), version, sha)
         api.request(f"releases/assets/{asset['id']}", "DELETE")
-    api.request(f"releases/{release_id}", "PATCH", {"body": body})
+    require_draft(api.request(f"releases/{release_id}", "PATCH", {
+        "tag_name": "v" + version, "target_commitish": sha, "body": body, "draft": True,
+    }), version, sha)
     api.upload("v" + version, [directory / name for name in hashes])
     assets = api.pages(f"releases/{release_id}/assets?per_page=100")
     if (len(assets) != len(hashes) or {a["name"] for a in assets} != set(hashes)
@@ -179,9 +191,12 @@ def publish(api, directory, version, sha, notes):
     latest = validate_remote(api, version, sha)
     if latest is None or latest["id"] != release_id:
         raise ValueError("Draft changed during upload")
-    published = api.request(f"releases/{release_id}", "PATCH", {"draft": False, "make_latest": "true"})
-    if published["draft"] or not published.get("immutable"):
-        raise ValueError("Publication was not confirmed immutable; inspect the release before retrying")
+    published = api.request(f"releases/{release_id}", "PATCH", {
+        "tag_name": "v" + version, "target_commitish": sha, "draft": False, "make_latest": "true",
+    })
+    if (published["draft"] or not published.get("immutable")
+            or published["tag_name"] != "v" + version or published["target_commitish"] != sha):
+        raise ValueError("Publication identity or immutability was not confirmed; inspect the release before retrying")
     return published["html_url"]
 
 
