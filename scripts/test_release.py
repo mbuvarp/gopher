@@ -160,3 +160,16 @@ class ReleaseTests(unittest.TestCase):
         with patch.dict('os.environ',env,clear=True), patch.object(release,'run',return_value='b'*40):
             with self.assertRaisesRegex(ValueError,'Checkout'):
                 release.workflow_commit()
+
+    def test_expected_commit_is_checked_before_any_git_or_network_work(self):
+        env={'GITHUB_REPOSITORY':release.REPO,'GITHUB_REF':'refs/heads/main',
+             'GITHUB_EVENT_NAME':'workflow_dispatch','GITHUB_SHA':SHA}
+        for expected in ['b'*40, 'not-a-sha', 'a'*39, SHA.upper()]:
+            with patch.dict('os.environ',dict(env,GOPHER_EXPECTED_SHA=expected),clear=True), patch.object(release,'run') as run:
+                with self.assertRaisesRegex(ValueError,'approved expected_sha'):
+                    release.workflow_commit()
+                run.assert_not_called()
+        for expected in ['', SHA]:
+            with patch.dict('os.environ',dict(env,GOPHER_EXPECTED_SHA=expected),clear=True), patch.object(release,'run',side_effect=[SHA,'','']) as run:
+                self.assertEqual(release.workflow_commit(),SHA)
+                self.assertEqual(run.call_args_list[-1].args,('git','merge-base','--is-ancestor',SHA,'origin/main'))

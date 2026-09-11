@@ -8,6 +8,11 @@ on:
         options: [validate, publish]
         default: validate
         required: true
+      expected_sha:
+        description: Optional full commit SHA approved for this release; fail if main has advanced
+        type: string
+        default: ''
+        required: false
 
 permissions:
   contents: read
@@ -18,6 +23,7 @@ concurrency:
 env:
   GH_TOKEN: ${{ github.token }}
   GH_PROMPT_DISABLED: '1'
+  GOPHER_EXPECTED_SHA: ${{ inputs.expected_sha }}
 
 jobs:
   build:

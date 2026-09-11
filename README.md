@@ -190,3 +190,10 @@ Releases are created manually through the **Release** GitHub Actions workflow on
 **publish** explicitly to release. A newer Cargo version and matching nonempty
 `CHANGELOG.md` entry are required after the first release. See
 [release setup and recovery](docs/updates.md#manual-github-releases).
+
+Use the repository's [$release skill](.agents/skills/release/SKILL.md) to prepare a
+release. It asks for a version choice and changelog approval, then validates,
+commits, pushes directly to main when permitted, and follows the release workflow.
+It can propose the existing version for a first release, and respects requests to
+only prepare or validate. The first publication still requires GOP-7's end-to-end
+validation to be complete.
