@@ -76,7 +76,9 @@ nonempty `## [major.minor.patch] - YYYY-MM-DD` entry to CHANGELOG.md. Stable num
 versions must exceed every published stable release; drafts and prereleases do not
 establish that baseline. With no published releases, the current valid version can
 be the first release. API errors never count as an empty release history. Packaging's
-macOS version-component limits also apply. GOP-5 will guide version/changelog approval.
+macOS version-component limits also apply. The repository [release skill](../.agents/skills/release/SKILL.md) guides
+version/changelog approval. It uses normal direct pushes to main when branch rules
+permit them; protected branches follow their required PR/merge flow.
 
 All jobs check out the dispatched commit and verify it belongs to main; main advancing
 while a build runs does not change that build. Release runs are serialized. The build
@@ -117,3 +119,20 @@ modify the now-published release. Validation-only runs never change an existing 
 Before the first real publication, GOP-7 covers validation mode on GitHub and the
 colleague installation checks. Local tests use fake GitHub responses and isolated
 signed fixtures; do not publish test versions to the production release feed.
+
+### Approved commit dispatch
+
+The release skill always supplies the full approved commit as `expected_sha` when
+dispatching `release.yml` on main. The workflow compares it with GitHub's dispatched
+SHA before validation, signing, or publication. An unexpected or malformed value
+fails the run. Both build and publish jobs enforce this through `workflow_commit`.
+Manual dispatches can leave the optional field empty to retain the existing workflow
+behavior. If main changes before the skill dispatches, it must reassess the changes
+and approvals; it must not omit the guard or retry blindly.
+
+The skill has two planned approval points: version choice, then the exact changelog
+entry. During a release request the latter authorizes commit, push, and publication
+of that scope. Preparing/validating alone does not authorize a publish, and incomplete
+GOP-7 validation prevents the first publication. Failed or ambiguous dispatches are
+inspected before any user-requested retry. Follow the returned run URL, or identify
+its exact SHA/event/actor/time; do not attach to an arbitrary latest workflow run.

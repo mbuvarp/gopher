@@ -113,6 +113,9 @@ def workflow_commit():
             or os.environ.get("GITHUB_REPOSITORY") != REPO):
         raise ValueError("Release workflow must be manually dispatched on mbuvarp/gopher main")
     sha = os.environ.get("GITHUB_SHA", "")
+    expected = os.environ.get("GOPHER_EXPECTED_SHA", "")
+    if expected and (not re.fullmatch(r"[0-9a-f]{40}", expected) or expected != sha):
+        raise ValueError("Dispatched commit differs from the approved expected_sha; reassess main before retrying")
     if not re.fullmatch(r"[0-9a-f]{40}", sha) or run("git", "rev-parse", "HEAD") != sha:
         raise ValueError("Checkout does not match the dispatched commit")
     run("git", "fetch", "origin", "main")

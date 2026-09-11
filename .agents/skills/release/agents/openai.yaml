@@ -1,0 +1,4 @@
+interface:
+  display_name: "Release Gopher"
+  short_description: "Prepare and publish an approved Gopher release"
+  default_prompt: "Use $release to prepare and publish the next Gopher release."
