@@ -1,6 +1,6 @@
 use gopher::{
     actions::*,
-    model::{PullRequest, Snapshot, State},
+    model::{CheckState, PullRequest, Snapshot, State},
     store::Store,
 };
 
@@ -65,4 +65,39 @@ fn conditions_match_exact_states_and_disable_stale_closed_or_draft_merges() {
     pr.snapshot.draft = true;
     assert!(!preferences.allows(Kind::Merge, &pr));
     assert!(preferences.allows(Kind::Label, &pr));
+}
+
+#[test]
+fn conflicts_disable_merge_for_every_condition_but_allow_labels() {
+    let mut pr = PullRequest::unreviewed(Snapshot {
+        open: true,
+        ..Default::default()
+    });
+    pr.stale = false;
+    let mut preferences = Preferences::default();
+    preferences.merge.enabled = true;
+    preferences.label.enabled = true;
+    for (condition, state) in [
+        (Condition::Always, State::Unknown),
+        (Condition::Reviewing, State::Reviewing),
+        (Condition::Comments, State::Comments),
+        (Condition::Approved, State::Approved),
+    ] {
+        preferences.merge.condition = condition;
+        pr.state = state;
+        for checks in [
+            Some(CheckState::Conflicts),
+            Some(CheckState::Green),
+            Some(CheckState::Running),
+            Some(CheckState::Failed),
+            None,
+        ] {
+            pr.snapshot.check_state = checks;
+            assert_eq!(
+                preferences.allows(Kind::Merge, &pr),
+                checks != Some(CheckState::Conflicts)
+            );
+            assert!(preferences.allows(Kind::Label, &pr));
+        }
+    }
 }

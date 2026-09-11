@@ -258,6 +258,56 @@ async fn snapshot_paginates_reviews_independently_and_checks_head() {
     );
 }
 #[tokio::test]
+async fn conflicts_override_ci_and_use_latest_paginated_mergeability() {
+    use gopher::model::CheckState;
+    for (status, conclusion, ci) in [
+        ("completed", "success", CheckState::Green),
+        ("in_progress", "", CheckState::Running),
+        ("completed", "failure", CheckState::Failed),
+    ] {
+        for (first, last, expected) in [
+            ("MERGEABLE", "CONFLICTING", CheckState::Conflicts),
+            ("UNKNOWN", "CONFLICTING", CheckState::Conflicts),
+            ("CONFLICTING", "MERGEABLE", ci),
+            ("CONFLICTING", "UNKNOWN", ci),
+        ] {
+            // The fixture emits the later page first in its shell case arms.
+            let fixture = include_str!("fixtures/gh-snapshot.sh")
+                .replacen(
+                    "\"headRefOid\":\"head\"",
+                    &format!("\"headRefOid\":\"head\",\"mergeable\":\"{last}\""),
+                    1,
+                )
+                .replace(
+                    "\"isDraft\":false",
+                    &format!("\"isDraft\":false,\"mergeable\":\"{first}\""),
+                );
+            let checks = serde_json::json!({"check_runs":[{
+                "id":1,"app":{"slug":"github-actions"},"name":"CI",
+                "status":status,"conclusion":conclusion
+            }]});
+            let (_dir, gh) = mock(&format!(
+                r#"
+case "$*" in *check-runs*) echo '{checks}'; exit 0 ;; esac
+{fixture}
+"#
+            ));
+            let snapshot = gh
+                .snapshot(&gopher::github::PrRef {
+                    id: "PR_1".into(),
+                    repo: "owner/repo".into(),
+                    number: 1,
+                })
+                .await
+                .unwrap();
+            assert_eq!(snapshot.check_state, Some(expected), "{first} -> {last}");
+            assert!(snapshot.checks.is_empty());
+        }
+    }
+    assert_eq!(CheckState::Conflicts.label(), "Conflicts");
+}
+
+#[tokio::test]
 async fn snapshot_summarizes_all_check_pages_and_latest_legacy_contexts() {
     use gopher::model::CheckState;
     use serde_json::json;
