@@ -182,6 +182,7 @@ fn set_status(field: &NSTextField, text: &str, checks: Option<CheckState>) {
             let color = match state {
                 CheckState::Running => NSColor::systemYellowColor(),
                 CheckState::Failed => NSColor::systemRedColor(),
+                CheckState::Conflicts => NSColor::systemOrangeColor(),
                 CheckState::Green => NSColor::systemGreenColor(),
             };
             let length = state.label().encode_utf16().count();

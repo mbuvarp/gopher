@@ -457,7 +457,12 @@ fn check_summary_persists_without_changing_reviews_or_acknowledgements() {
     store.save(&previous).unwrap();
     let notification = store.notification(&previous).unwrap().unwrap();
     store.mark_delivered(&notification).unwrap();
-    for state in [CheckState::Running, CheckState::Failed, CheckState::Green] {
+    for state in [
+        CheckState::Running,
+        CheckState::Failed,
+        CheckState::Conflicts,
+        CheckState::Green,
+    ] {
         snapshot.check_state = Some(state);
         let current = transition(snapshot.clone(), Some(&previous), None, 130, 0);
         assert_eq!(current.state, State::Approved);

@@ -1,5 +1,5 @@
 //! Repository action preferences and worker-owned UI state.
-use crate::model::{PullRequest, State};
+use crate::model::{CheckState, PullRequest, State};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -108,7 +108,8 @@ impl Preferences {
             && !pr.stale
             && pr.snapshot.open
             && rule.condition.matches(pr.state)
-            && (kind != Kind::Merge || !pr.snapshot.draft)
+            && (kind != Kind::Merge
+                || (!pr.snapshot.draft && pr.snapshot.check_state != Some(CheckState::Conflicts)))
     }
     pub fn apply(&mut self, change: &Setting) {
         match *change {

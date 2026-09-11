@@ -499,6 +499,13 @@ impl Github {
                 snapshot.head == head && pr["state"] == "OPEN",
                 "PR changed during pagination; retrying next poll"
             );
+            // Use the latest page: GitHub may finish calculating mergeability
+            // while connections are being paginated. Unknown falls back to CI.
+            snapshot.check_state = Some(if pr["mergeable"] == "CONFLICTING" {
+                CheckState::Conflicts
+            } else {
+                CheckState::Green
+            });
             for (index, key) in [
                 "reviews",
                 "comments",
@@ -570,7 +577,7 @@ impl Github {
                 break;
             }
         }
-        let mut check_state = CheckState::Green;
+        let mut check_state = snapshot.check_state.unwrap_or_default();
         let mut page = 1;
         loop {
             let endpoint = format!(
@@ -857,7 +864,7 @@ fn next_cursor(connection: &Value) -> Result<Option<String>> {
 const PR_QUERY: &str = r#"
 query($id:ID!,$r:String,$c:String,$t:String,$e:String,$reviews:Boolean!,$comments:Boolean!,$threads:Boolean!,$reactions:Boolean!,$l:String,$labels:Boolean!) {
  node(id:$id) { ... on PullRequest {
-  title url state isDraft headRefOid
+  title url state isDraft headRefOid mergeable
   labels(first:100,after:$l) @include(if:$labels) {
    pageInfo { hasNextPage endCursor }
    nodes { name color }

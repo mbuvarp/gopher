@@ -119,7 +119,7 @@ pub struct Check {
     pub completed_at: String,
     pub summary: String,
 }
-/// Aggregate check severity, independent of agent review verdicts.
+/// Aggregate check and conflict severity, independent of agent review verdicts.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckState {
@@ -127,12 +127,14 @@ pub enum CheckState {
     Green,
     Running,
     Failed,
+    Conflicts,
 }
 impl CheckState {
     pub fn label(self) -> &'static str {
         match self {
             Self::Running => "Checks running...",
             Self::Failed => "Checks failed",
+            Self::Conflicts => "Conflicts",
             Self::Green => "Checks green",
         }
     }

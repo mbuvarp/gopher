@@ -343,8 +343,8 @@ async fn cancellation_invalidates_old_ticks_and_in_flight_validation() {
 }
 
 #[tokio::test]
-async fn changed_commit_settings_account_or_ignore_cancels_pending_merge() {
-    for case in 0..4 {
+async fn changed_commit_settings_account_ignore_or_conflicts_cancels_pending_merge() {
+    for case in 0..5 {
         let mut h = Harness::new();
         let token = h.start_merge();
         match case {
@@ -354,6 +354,10 @@ async fn changed_commit_settings_account_or_ignore_cancels_pending_merge() {
                 change: Setting::MergeMethod(MergeMethod::Squash),
             }),
             2 => h.viewer = "different-user",
+            3 => {
+                h.prs.get_mut("PR_1").unwrap().snapshot.check_state =
+                    Some(crate::model::CheckState::Conflicts)
+            }
             _ => {
                 h.prs.clear();
             }
@@ -369,15 +373,16 @@ async fn changed_commit_settings_account_or_ignore_cancels_pending_merge() {
 }
 
 #[tokio::test]
-async fn fresh_validation_cannot_merge_a_changed_head_or_a_closed_pr() {
-    for case in 0..3 {
+async fn fresh_validation_rejects_changed_head_closed_draft_or_conflicting_pr() {
+    for case in 0..4 {
         let mut h = Harness::new();
         let token = h.start_merge();
         let mut snapshot = h.prs["PR_1"].snapshot.clone();
         match case {
             0 => snapshot.head = "new-head".into(),
             1 => snapshot.open = false,
-            _ => snapshot.draft = true,
+            2 => snapshot.draft = true,
+            _ => snapshot.check_state = Some(crate::model::CheckState::Conflicts),
         }
         h.handle(ActionCommand::MergeChecked {
             pr: "PR_1".into(),
