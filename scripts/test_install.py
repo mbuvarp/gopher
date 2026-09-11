@@ -24,6 +24,9 @@ class InstallerTests(unittest.TestCase):
         self.checksum = self.root / "release.sha256"
         self.tag = "v0.1.0"
         self.sign_ok = True
+        self.auth_ok = True
+        self.download_failure = None
+        self.downloaded = self.root / "download-called"
         self.members = {
             "Gopher.app/Contents/Info.plist": plistlib.dumps({"CFBundleShortVersionString": "0.1.0", "GopherInstallerProtocol": 1}),
             "Gopher.app/Contents/MacOS/gopher": f"#!/bin/bash\nprintf '%s\\n' \"$@\" > {shlex.quote(str(self.called))}\n".encode(),
@@ -44,7 +47,7 @@ class InstallerTests(unittest.TestCase):
                 archive.writestr(info, contents)
         digest = "0" * 64 if corrupt else hashlib.sha256(self.archive.read_bytes()).hexdigest()
         self.checksum.write_text(f"{digest}  Gopher-0.1.0-macos-arm64.zip\n")
-        gh = self.executable("gh", f"if [ \"$1\" = auth ]; then exit 0; fi\nprintf '%s\\n' {shlex.quote(self.tag)}\n")
+        gh = self.executable("gh", f"if [ \"$1\" = auth ]; then exit {0 if self.auth_ok else 1}; fi\nprintf '%s\\n' {shlex.quote(self.tag)}\n")
         curl = self.executable("curl", f"""
 out=''
 source={shlex.quote(str(self.archive))}
@@ -57,6 +60,12 @@ while [ "$#" -gt 0 ]; do
     if [ "$1" = --output ]; then out=$2; shift; fi
     shift
 done
+touch {shlex.quote(str(self.downloaded))}
+if [ {shlex.quote(self.download_failure or '')} = offline ]; then exit 6; fi
+if [ {shlex.quote(self.download_failure or '')} = interrupted ]; then
+    /usr/bin/head -c 100 "$source" > "$out"
+    exit 18
+fi
 /bin/cp "$source" "$out"
 """)
         script = (ROOT / "scripts/install.sh").read_text()
@@ -87,6 +96,23 @@ exit {0 if self.sign_ok else 1}
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("checksum mismatch", result.stderr)
         self.assertFalse(self.called.exists())
+
+    def test_authentication_failure_stops_before_downloading(self):
+        self.auth_ok = False
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gh auth login", result.stderr)
+        self.assertFalse(self.downloaded.exists())
+        self.assertFalse(self.called.exists())
+
+    def test_unavailable_and_interrupted_downloads_never_invoke_the_helper(self):
+        for failure in ("offline", "interrupted"):
+            with self.subTest(failure=failure):
+                self.download_failure = failure
+                result = self.invoke()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(self.downloaded.exists())
+                self.assertFalse(self.called.exists())
 
     def test_wrong_signature_never_invokes_the_helper(self):
         self.sign_ok = False

@@ -80,11 +80,17 @@ sh scripts/bundle.sh --release
 
 This builds an Apple Silicon app with a macOS 13.0 deployment target, then produces `dist/Gopher.app`, `dist/Gopher-<version>-macos-arm64.zip`, a matching `.zip.sha256` file, and `dist/install.sh`. Only the app is inside the archive. The script verifies architecture, minimum OS, metadata, and code signature both before and after extracting the ZIP. It stages a fresh bundle so removed resources cannot linger, and replaces existing outputs only after validation succeeds.
 
-Release archives require an Apple signing identity and never fall back to ad-hoc signing. The default is the first available Apple Development identity; set `GOPHER_SIGNING_IDENTITY` to select a different certificate name or fingerprint. A missing or invalid identity fails packaging. This initial distribution is **unnotarized**: macOS may require **System Settings → Privacy & Security → Open Anyway** after the first launch attempt. Test notifications and Launch at login on another Mac before sharing widely. A checksum detects corruption; it does not replace the signed-update verification planned for the updater.
+Release archives require an Apple signing identity and never fall back to ad-hoc signing. The default is the first available Apple Development identity; set `GOPHER_SIGNING_IDENTITY` to select a different certificate name or fingerprint. A missing or invalid identity fails packaging. This initial distribution is **unnotarized**: macOS may require **System Settings → Privacy & Security → Open Anyway** after the first launch attempt. A checksum detects corruption; the installer also verifies the Apple signature, and the bundled updater verifies signed feeds and archives. Do not disable Gatekeeper or strip quarantine attributes to install Gopher.
 
 `Cargo.toml` is the version source. The app's display version matches it; the numeric build version is `(major + 1).minor.patch` so that `0.1.0` sorts after the historical build number `1`. Packaging supports stable versions only, with major up to 9998 and minor/patch up to 99 to fit macOS build fields. When bumping the package version, update its `Cargo.lock` entry too; packaging uses `--locked` and does not bump versions or publish a release. Users of the packaged app need macOS 13+, Apple Silicon, and authenticated `gh`, but no Rust, Xcode, or Python installation.
 
 Verify a downloaded archive from its directory with `shasum -a 256 -c Gopher-<version>-macos-arm64.zip.sha256`, extract it, and move `Gopher.app` to `~/Applications`. Quit an existing copy first and preserve `~/.config/gopher`. A browser download on a separate Mac is needed to test the normal Gatekeeper experience; copying via SSH alone does not reproduce it.
+
+In Finder, use **Go → Go to Folder…** and enter `~/Applications` to reach your
+user Applications folder. Moving the app there does not remove the Apple trust
+warning. If the first launch is blocked, open **System Settings → Privacy &
+Security**, choose **Open Anyway** for Gopher, and confirm the prompt. This grants
+an exception for the app without disabling macOS security protections.
 
 Packaging checks: `python3 -m unittest discover -s scripts -p 'test_*.py'`.
 
@@ -135,7 +141,7 @@ session.json          Last app session and completed shutdown, if recorded
 
 SQLite may also create `state.sqlite3-wal` and `state.sqlite3-shm`. GitHub remains authoritative. Cached data stays marked stale until successfully fetched. Changing the active GitHub account resets the active cache and acknowledgements; ignored PR flags, their archived details, and repository action settings persist across account changes. Pending actions are not restored after restart.
 
-Use **Edit configuration** to create/open a configuration file, or copy [config.example.toml](config.example.toml). Settings include polling/discovery intervals, request timeout, result confirmation interval, logging verbosity, `gh_path`, notifications, and repository overrides:
+Use **Actions → Settings → Open configuration file** to create/open a configuration file, or copy [config.example.toml](config.example.toml). Settings include polling/discovery intervals, request timeout, result confirmation interval, logging verbosity, `gh_path`, notifications, and repository overrides:
 
 ```toml
 [repositories."owner/repo"]

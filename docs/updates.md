@@ -25,6 +25,9 @@ before the appcast is signed.
 
 ## Manual isolated validation
 
+See the [first-release validation record](release-validation.md) for GOP-7's
+candidate, results, and recovery procedure.
+
 Use another Mac and separate signed test bundles, not the installed Gopher or its data.
 The initial integration was tested on the Apple Silicon Mini with Apple Development
 signing and no notarization. Browser-download Gatekeeper behavior remains separate.
