@@ -997,7 +997,8 @@ esac
             open: true,
             ..Default::default()
         };
-        let store = Store::open(directory.path()).unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        store.set_viewer("viewer").unwrap();
         let pr = transition(snapshot.clone(), None, None, 100, 0);
         store.save(&pr).unwrap();
         let notification = store.notification(&pr).unwrap().unwrap();
@@ -1024,10 +1025,12 @@ esac
             .sender
             .send(Command::Ignore(snapshot.id.clone()))
             .unwrap();
-        assert!(
-            matches!(next_list_event(&rx), UiEvent::DismissNotifications(ids) if ids==vec![notification.clone()])
-        );
-        assert!(matches!(next_list_event(&rx), UiEvent::Updated {prs,..} if prs.is_empty()));
+        // An ignored-details completion can emit list events before the delayed
+        // poll completes. Force that interleaving instead of relying on timing.
+        worker
+            .sender
+            .send(Command::IgnoredDetailsLoaded(Ok(vec![snapshot.clone()])))
+            .unwrap();
         worker
             .sender
             .send(Command::PollComplete(Ok(Batch {
@@ -1041,18 +1044,45 @@ esac
                 results: vec![(snapshot.id.clone(), Ok(snapshot.clone()))],
             })))
             .unwrap();
-        assert!(
-            matches!(next_list_event(&rx), UiEvent::Updated {prs,error:None,..} if prs.is_empty())
-        );
         worker
             .sender
             .send(Command::NotificationAction {
-                id: notification,
+                id: notification.clone(),
                 open: false,
-                reveal: false,
+                reveal: true,
             })
             .unwrap();
-        assert!(matches!(next_list_event(&rx), UiEvent::Updated {prs,..} if prs.is_empty()));
+        // Commands above share a FIFO sender. ShowPopover is emitted after the
+        // notification action's persisted UI update, so it marks completion of
+        // the whole sequence without assuming one UI event per command.
+        let mut ignored = false;
+        let mut poll_completed = false;
+        loop {
+            let event = next_list_event(&rx);
+            match event {
+                UiEvent::DismissNotifications(ids) if ids == vec![notification.clone()] => {
+                    ignored = true;
+                }
+                UiEvent::Updated { prs, error, .. } if ignored => {
+                    assert!(prs.is_empty(), "Ignored PR reappeared: {prs:?}");
+                    poll_completed |= error.is_none();
+                }
+                UiEvent::ShowPopover { pr } => {
+                    assert!(pr.is_none(), "Ignored notification must not reveal a PR");
+                    break;
+                }
+                UiEvent::Stopped => panic!("Worker stopped before completing the sequence"),
+                UiEvent::Notify { review: true, .. } if ignored => {
+                    panic!("Ignored PR generated a review notification");
+                }
+                _ => {}
+            }
+        }
+        assert!(ignored, "Ignore must dismiss the saved notification");
+        assert!(
+            poll_completed,
+            "The delayed poll must complete successfully"
+        );
         drop(worker);
         let store = Store::open(directory.path()).unwrap();
         assert!(store.load().unwrap().is_empty());
