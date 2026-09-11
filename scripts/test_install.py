@@ -39,6 +39,8 @@ class InstallerTests(unittest.TestCase):
         return shlex.quote(str(path))
 
     def invoke(self, args=(), corrupt=False):
+        self.downloaded.unlink(missing_ok=True)
+        self.called.unlink(missing_ok=True)
         with zipfile.ZipFile(self.archive, "w") as archive:
             for name, contents in self.members.items():
                 info = zipfile.ZipInfo(name)
@@ -106,11 +108,11 @@ exit {0 if self.sign_ok else 1}
         self.assertFalse(self.called.exists())
 
     def test_unavailable_and_interrupted_downloads_never_invoke_the_helper(self):
-        for failure in ("offline", "interrupted"):
+        for failure, exit_code in (("offline", 6), ("interrupted", 18)):
             with self.subTest(failure=failure):
                 self.download_failure = failure
                 result = self.invoke()
-                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.returncode, exit_code, result.stdout + result.stderr)
                 self.assertTrue(self.downloaded.exists())
                 self.assertFalse(self.called.exists())
 
