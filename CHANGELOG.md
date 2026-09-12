@@ -6,6 +6,15 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-12
+
+- Show confirmed merge conflicts in PR status and prevent conflicting merges.
+- Show source and destination branches in PR details, with clearer reviewer headings.
+- Acknowledge the displayed update when starting a merge or opening the label picker.
+- Prevent accidental selection of check-status text.
+- Use modern macOS Tahoe controls and popover styling while retaining macOS 13 support.
+- Separate local development builds as Gopher Dev, with DEV badges and independent configuration and state, so the released app can remain installed for daily use.
+
 ## [0.1.0] - 2026-09-11
 
 Initial release of Gopher for Apple Silicon Macs running macOS 13 or later. Requires an installed, authenticated GitHub CLI (`gh`).
