@@ -273,7 +273,7 @@ impl Github {
         for batch in ids.chunks(50) {
             let response = self.execute_with_missing_nodes(
                 &["api", "graphql", "--hostname", "github.com", "--input", "-"],
-                Some(&json!({"query":"query IgnoredPrDetails($ids:[ID!]!){nodes(ids:$ids){... on PullRequest{id number title url state isDraft repository{nameWithOwner}}}}", "variables":{"ids":batch}})),
+                Some(&json!({"query":"query IgnoredPrDetails($ids:[ID!]!){nodes(ids:$ids){... on PullRequest{id number title url state isDraft headRefName baseRefName isCrossRepository headRepositoryOwner{login} repository{nameWithOwner}}}}", "variables":{"ids":batch}})),
                 true,
             ).await?;
             ensure!(
@@ -298,6 +298,15 @@ impl Github {
                     repo: required(&node["repository"], "nameWithOwner")?.into(),
                     number: node["number"].as_u64().context("Missing PR number")?,
                     title: required(node, "title")?.into(),
+                    head_branch: node["headRefName"].as_str().map(str::to_owned),
+                    base_branch: node["baseRefName"].as_str().map(str::to_owned),
+                    source_owner: (node["isCrossRepository"] == true)
+                        .then(|| {
+                            node["headRepositoryOwner"]["login"]
+                                .as_str()
+                                .map(str::to_owned)
+                        })
+                        .flatten(),
                     url: required(node, "url")?.into(),
                     open: match required(node, "state")? {
                         "OPEN" => true,
@@ -484,6 +493,15 @@ impl Github {
                     repo: reference.repo.clone(),
                     number: reference.number,
                     title: required(pr, "title")?.into(),
+                    head_branch: pr["headRefName"].as_str().map(str::to_owned),
+                    base_branch: pr["baseRefName"].as_str().map(str::to_owned),
+                    source_owner: (pr["isCrossRepository"] == true)
+                        .then(|| {
+                            pr["headRepositoryOwner"]["login"]
+                                .as_str()
+                                .map(str::to_owned)
+                        })
+                        .flatten(),
                     url: required(pr, "url")?.into(),
                     head: head.into(),
                     open: pr["state"] == "OPEN",
@@ -864,7 +882,8 @@ fn next_cursor(connection: &Value) -> Result<Option<String>> {
 const PR_QUERY: &str = r#"
 query($id:ID!,$r:String,$c:String,$t:String,$e:String,$reviews:Boolean!,$comments:Boolean!,$threads:Boolean!,$reactions:Boolean!,$l:String,$labels:Boolean!) {
  node(id:$id) { ... on PullRequest {
-  title url state isDraft headRefOid mergeable
+  title url state isDraft headRefOid mergeable headRefName baseRefName isCrossRepository
+  headRepositoryOwner { login }
   labels(first:100,after:$l) @include(if:$labels) {
    pageInfo { hasNextPage endCursor }
    nodes { name color }

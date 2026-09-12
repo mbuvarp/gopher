@@ -243,6 +243,9 @@ async fn snapshot_paginates_reviews_independently_and_checks_head() {
     };
     let snapshot = gh.snapshot(&pr).await.unwrap();
     assert_eq!(snapshot.check_state, Some(gopher::model::CheckState::Green));
+    assert_eq!(snapshot.head_branch.as_deref(), Some("feature/branch"));
+    assert_eq!(snapshot.base_branch.as_deref(), Some("main"));
+    assert_eq!(snapshot.source_owner.as_deref(), Some("contributor"));
     assert_eq!(snapshot.reviews.len(), 2);
     assert_eq!(snapshot.reviews[1].id, "review-2");
     assert_eq!(snapshot.threads.len(), 1);
@@ -796,4 +799,53 @@ esac
     assert!(Github::cooldown(&config, Some("graphql")).is_zero());
     github.ignored_details(&["PR_1".into()]).await.unwrap();
     github.viewer().await.unwrap();
+}
+
+#[test]
+fn branch_metadata_is_cache_compatible_and_does_not_change_review_updates() {
+    use gopher::model::{PullRequest, Snapshot, State, fingerprint};
+    let mut snapshot = Snapshot::default();
+    let original = fingerprint(&snapshot, &[], State::Unknown);
+    let mut old = serde_json::to_value(&snapshot).unwrap();
+    for key in ["head_branch", "base_branch", "source_owner"] {
+        old.as_object_mut().unwrap().remove(key);
+    }
+    let restored: Snapshot = serde_json::from_value(old).unwrap();
+    assert!(restored.head_branch.is_none());
+    assert!(restored.base_branch.is_none());
+    assert!(restored.source_owner.is_none());
+    snapshot.id = "branches".into();
+    snapshot.open = true;
+    snapshot.head_branch = Some("feature/日本語".into());
+    snapshot.base_branch = Some("main".into());
+    snapshot.source_owner = Some("contributor".into());
+    assert_eq!(original, fingerprint(&snapshot, &[], State::Unknown));
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = gopher::store::Store::open(dir.path()).unwrap();
+    let pr = PullRequest::unreviewed(snapshot.clone());
+    store.save(&pr).unwrap();
+    store.ignore(&snapshot.id).unwrap();
+    snapshot.base_branch = Some("release".into());
+    store.update_ignored_status(&snapshot).unwrap();
+    let ignored = store.load_ignored().unwrap();
+    assert_eq!(ignored[0].snapshot.head_branch, snapshot.head_branch);
+    assert_eq!(ignored[0].snapshot.base_branch, snapshot.base_branch);
+    assert_eq!(ignored[0].snapshot.source_owner, snapshot.source_owner);
+}
+
+#[tokio::test]
+async fn same_repository_branches_do_not_include_owner() {
+    let fixture = include_str!("fixtures/gh-snapshot.sh")
+        .replace("\"isCrossRepository\":true", "\"isCrossRepository\":false");
+    let (_dir, gh) = mock(&fixture);
+    let snapshot = gh
+        .snapshot(&gopher::github::PrRef {
+            id: "PR_1".into(),
+            repo: "owner/repo".into(),
+            number: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(snapshot.head_branch.as_deref(), Some("feature/branch"));
+    assert!(snapshot.source_owner.is_none());
 }

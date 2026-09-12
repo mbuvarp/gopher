@@ -192,6 +192,9 @@ impl Store {
         pr.snapshot.number = snapshot.number;
         pr.snapshot.title.clone_from(&snapshot.title);
         pr.snapshot.url.clone_from(&snapshot.url);
+        pr.snapshot.head_branch.clone_from(&snapshot.head_branch);
+        pr.snapshot.base_branch.clone_from(&snapshot.base_branch);
+        pr.snapshot.source_owner.clone_from(&snapshot.source_owner);
         pr.snapshot.open = snapshot.open;
         pr.snapshot.draft = snapshot.draft;
         pr.stale = true;

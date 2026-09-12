@@ -153,6 +153,13 @@ pub struct Snapshot {
     pub title: String,
     pub url: String,
     pub head: String,
+    #[serde(default)]
+    pub head_branch: Option<String>,
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    /// Present only for cross-repository pull requests.
+    #[serde(default)]
+    pub source_owner: Option<String>,
     pub open: bool,
     pub draft: bool,
     pub reviews: Vec<Review>,
