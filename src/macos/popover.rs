@@ -271,6 +271,7 @@ impl Row {
         title.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
         title.setFrame(rect(46.0, 4.0, CONTENT_WIDTH - 46.0, 28.0));
         let status = label("", 11.0, true, mtm);
+        status.setSelectable(false);
         status.setMaximumNumberOfLines(1);
         status.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
         status.setFrame(rect(49.0, 34.0, CONTENT_WIDTH - 52.0, 18.0));
