@@ -87,6 +87,18 @@ All jobs check out the dispatched commit and verify it belongs to main; main adv
 while a build runs does not change that build. Release runs are serialized. The build
 job has read-only repository access; only the separate publish job has contents-write
 permission. Signing uses the main-only `release` environment and a temporary keychain.
+The release skill's version and changelog approvals are the only human release gates.
+Configure this environment with no required reviewers (`reviewers: []`), zero wait
+timer, no self-review restriction, and no custom deployment protection rules.
+Retain the selected-branches policy allowing only `main`; this is an automatic
+restriction on signing-secret access, not a manual approval. The publish job does
+not reference an environment because it uses only its scoped `github.token`.
+
+If a run waits for deployment approval with no approval rules configured, inspect
+its pending-deployments response and the environment settings. Do not assume a
+user can approve it when GitHub returns an empty reviewer list. Cancel an authorized
+stuck run before dispatching a replacement, and never remove branch restrictions
+or relocate signing secrets as an approval workaround.
 Repository release immutability must remain enabled (it is configured separately).
 GitHub restricts reading that setting to administrators, so the workflow does not
 require an admin token; it verifies the published response is immutable and reports
