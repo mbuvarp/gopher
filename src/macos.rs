@@ -172,7 +172,10 @@ enum Action {
     ShowIgnored,
     BackToActive,
     ConfigureRepo(String),
-    Labels(String),
+    Labels {
+        pr: String,
+        update: String,
+    },
     Ack {
         pr: String,
         update: String,
@@ -470,7 +473,7 @@ pub fn run(
             Event::UserEvent(AppEvent::HighlightPr(id)) => {popover.highlight(id);rebuild=true;}
             Event::UserEvent(AppEvent::MenuClosed) => {}
             Event::UserEvent(AppEvent::RefreshPopover) => {rebuild=true;}
-            Event::UserEvent(AppEvent::PrAction(request)) => {let _=sender.send(Command::PrAction(crate::worker::ActionCommand::Request(request)));}
+            Event::UserEvent(AppEvent::PrAction(request)) => {let _=dispatch_pr_action(request, &sender);}
             Event::UserEvent(AppEvent::TogglePopover) => {
                 if let Some(tray) = &tray { popover.toggle(tray); }
                 rebuild=true;
@@ -494,7 +497,8 @@ pub fn run(
                             Action::ShowIgnored=>{popover.show_ignored(true);let _=sender.send(Command::ShowIgnored);rebuild=true;}
                             Action::BackToActive=>{popover.back();rebuild=true;}
                             Action::ConfigureRepo(repo)=>{popover.configure_repo(repo);rebuild=true;}
-                            Action::Labels(id)=>{
+                            Action::Labels{pr:id,update}=>{
+                                let _=sender.send(Command::Acknowledge{pr:id.clone(),update:update.clone(),checked:true});
                                 if let Some(pr)=prs.iter().find(|pr|&pr.snapshot.id==id) {
                                     popover.show_labels(pr);
                                     rebuild=true;
@@ -654,6 +658,23 @@ fn open_url(url: &str) -> Result<()> {
         NSWorkspace::sharedWorkspace().openURL(&url),
         "Could not open the PR in your browser"
     );
+    Ok(())
+}
+
+fn dispatch_pr_action(
+    request: crate::actions::Request,
+    sender: &tokio::sync::mpsc::UnboundedSender<Command>,
+) -> Result<()> {
+    if let crate::actions::Request::Merge { pr, update, .. } = &request {
+        sender.send(Command::Acknowledge {
+            pr: pr.clone(),
+            update: update.clone(),
+            checked: true,
+        })?;
+    }
+    sender.send(Command::PrAction(crate::worker::ActionCommand::Request(
+        request,
+    )))?;
     Ok(())
 }
 
@@ -1146,6 +1167,37 @@ mod tests {
         ] {
             assert!(notification_command(action, "notice".into()).is_none());
         }
+    }
+
+    #[test]
+    fn merge_invocation_acknowledges_before_dispatch_and_cancel_does_not_acknowledge() {
+        use crate::actions::Request;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        dispatch_pr_action(
+            Request::Merge {
+                pr: "PR_1".into(),
+                head: "head".into(),
+                update: "displayed-update".into(),
+            },
+            &sender,
+        )
+        .unwrap();
+        assert!(
+            matches!(receiver.try_recv().unwrap(), Command::Acknowledge {
+            pr, update, checked: true,
+        } if pr == "PR_1" && update == "displayed-update")
+        );
+        assert!(matches!(receiver.try_recv().unwrap(), Command::PrAction(
+            crate::worker::ActionCommand::Request(Request::Merge { update, .. })
+        ) if update == "displayed-update"));
+        dispatch_pr_action(Request::CancelMerge("PR_1".into()), &sender).unwrap();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            Command::PrAction(crate::worker::ActionCommand::Request(Request::CancelMerge(
+                _
+            )))
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

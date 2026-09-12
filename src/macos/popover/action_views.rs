@@ -107,9 +107,10 @@ impl PrActions {
         );
         let labels = menu_item(
             "Label",
-            Some(AppEvent::PopoverAction(Action::Labels(
-                pr.snapshot.id.clone(),
-            ))),
+            Some(AppEvent::PopoverAction(Action::Labels {
+                pr: pr.snapshot.id.clone(),
+                update: pr.update_id.clone(),
+            })),
             target,
         );
         let ignore = menu_item(
@@ -185,6 +186,14 @@ impl PrActions {
         bind_item(
             &self.configure,
             AppEvent::PopoverAction(Action::ConfigureRepo(pr.snapshot.repo.clone())),
+            target,
+        );
+        bind_item(
+            &self.labels,
+            AppEvent::PopoverAction(Action::Labels {
+                pr: pr.snapshot.id.clone(),
+                update: pr.update_id.clone(),
+            }),
             target,
         );
         bind_item(
