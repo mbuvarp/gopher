@@ -9,18 +9,12 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
-    // Watch source files and Git metadata, including linked worktree metadata.
-    // A commit must refresh the displayed revision even without source changes.
-    if let Some(files) = git(&["ls-files", "--cached", "--others", "--exclude-standard"]) {
-        for file in files.lines() {
-            println!("cargo:rerun-if-changed={file}");
-        }
-    }
-    for name in ["HEAD", "index", "refs"] {
-        if let Some(path) = git(&["rev-parse", "--git-path", name]) {
-            println!("cargo:rerun-if-changed={path}");
-        }
-    }
+    // File lists cannot detect newly created untracked files. Intentionally watch
+    // a nonexistent path so Cargo refreshes this small Git probe on every build,
+    // without recursively scanning the repository (including target and dist).
+    let refresh = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap())
+        .join("always-refresh-git-metadata");
+    println!("cargo:rerun-if-changed={}", refresh.display());
     let revision = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
     let dirty = git(&["status", "--porcelain", "--untracked-files=normal"])
         .map(|status| {
