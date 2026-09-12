@@ -4,7 +4,7 @@ use super::{Action, AppEvent, repo_heading, repo_parts};
 use crate::model::{CheckState, PullRequest, State};
 use crate::{
     actions::{ActionState, Request, Setting},
-    worker::{ActionCommand, Command},
+    worker::Command,
 };
 use tokio::sync::mpsc::UnboundedSender;
 mod action_views;
@@ -89,7 +89,7 @@ define_class!(
                         let _ = self.ivars().proxy.send_event(AppEvent::RefreshPopover);
                     }
                     // Direct dispatch also works while AppKit tracks a menu.
-                    if self.ivars().sender.send(Command::PrAction(ActionCommand::Request(request))).is_err() && label_request {
+                    if super::dispatch_pr_action(request, &self.ivars().sender).is_err() && label_request {
                         let pending = &self.ivars().pending_label_requests;
                         pending.set(pending.get().saturating_sub(1));
                     }
