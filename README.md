@@ -56,7 +56,7 @@ These actions use the authenticated GitHub CLI account and require its normal re
 
 ## Run
 
-Building requires macOS 13+, Rust with the `aarch64-apple-darwin` target, Xcode command-line tools, and Python 3. Gopher runs on Apple Silicon and requires an installed GitHub CLI authenticated with access to your repositories:
+Building requires a Mac capable of running Xcode 26.5 or newer (macOS SDK 26.5+), Rust with the `aarch64-apple-darwin` target, and Python 3. Gopher runs on Apple Silicon and requires an installed GitHub CLI authenticated with access to your repositories:
 
 ```sh
 gh auth login
@@ -82,7 +82,7 @@ For initial setup, copy `config.toml` into the Dev directory. If copying `state.
 sh scripts/bundle.sh --release
 ```
 
-This builds an Apple Silicon app with a macOS 13.0 deployment target, then produces `dist/Gopher.app`, `dist/Gopher-<version>-macos-arm64.zip`, a matching `.zip.sha256` file, and `dist/install.sh`. Only the app is inside the archive. The script verifies architecture, minimum OS, metadata, and code signature both before and after extracting the ZIP. It stages a fresh bundle so removed resources cannot linger, and replaces existing outputs only after validation succeeds.
+This builds an Apple Silicon app with a macOS 13.0 deployment target, then produces `dist/Gopher.app`, `dist/Gopher-<version>-macos-arm64.zip`, a matching `.zip.sha256` file, and `dist/install.sh`. Only the app is inside the archive. The script selects the macOS SDK through `xcrun`, passes its path to Cargo, and requires SDK 26.5+ for both local and release bundles. It verifies the SDK recorded in the executable as well as architecture, minimum OS, metadata, and code signature both before and after extracting the ZIP. It stages a fresh bundle so removed resources cannot linger, and replaces existing outputs only after validation succeeds.
 
 Release archives require an Apple signing identity and never fall back to ad-hoc signing. The default is the first available Apple Development identity; set `GOPHER_SIGNING_IDENTITY` to select a different certificate name or fingerprint. A missing or invalid identity fails packaging. This initial distribution is **unnotarized**: macOS may require **System Settings → Privacy & Security → Open Anyway** after the first launch attempt. A checksum detects corruption; the installer also verifies the Apple signature, and the bundled updater verifies signed feeds and archives. Do not disable Gatekeeper or strip quarantine attributes to install Gopher.
 

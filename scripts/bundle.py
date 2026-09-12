@@ -17,6 +17,7 @@ import sparkle
 ROOT = Path(__file__).resolve().parent.parent
 TARGET = "aarch64-apple-darwin"
 MINIMUM_OS = "13.0"
+MINIMUM_SDK = (26, 5, 0)
 RELEASE_IDENTITY = '=anchor apple generic and identifier "dev.mbuvarp.gopher" and certificate leaf[subject.OU] = "DZ4XZQXHZ7"'
 
 
@@ -26,6 +27,33 @@ def run(*args, **kwargs):
 
 def output(*args):
     return run(*args, stdout=subprocess.PIPE, text=True).stdout.strip()
+
+
+def require_modern_sdk(version):
+    if not re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", version):
+        raise ValueError(f"Cannot determine macOS build SDK: {version!r}")
+    parts = tuple(map(int, version.split(".")))
+    if parts + (0,) * (3 - len(parts)) < MINIMUM_SDK:
+        raise ValueError("Packaging requires macOS SDK 26.5 or newer for the modern AppKit appearance; select Xcode 26.5+ with DEVELOPER_DIR")
+
+
+def build_environment():
+    version = output("xcrun", "--sdk", "macosx", "--show-sdk-version")
+    require_modern_sdk(version)
+    sdk = output("xcrun", "--sdk", "macosx", "--show-sdk-path")
+    print(f"Building with macOS SDK {version}; deployment target {MINIMUM_OS}.")
+    return {**os.environ, "SDKROOT": sdk, "MACOSX_DEPLOYMENT_TARGET": MINIMUM_OS}
+
+
+def verify_build_version(load_commands):
+    blocks = re.split(r"Load command \d+", load_commands)
+    builds = [block for block in blocks if re.search(r"\bcmd LC_BUILD_VERSION\s", block)]
+    if len(builds) != 1 or not re.search(r"\bplatform (?:1|MACOS)\s", builds[0]):
+        raise ValueError("Packaged binary must contain one macOS LC_BUILD_VERSION")
+    if not re.search(r"\bminos 13\.0(?:\.0)?\s", builds[0]):
+        raise ValueError("Packaged binary must target macOS 13.0")
+    sdk = re.search(r"\bsdk (\S+)", builds[0])
+    require_modern_sdk(sdk.group(1) if sdk else "")
 
 
 def bundle_version(version):
@@ -91,8 +119,7 @@ def verify_bundle(bundle, version, release=False):
     if output("lipo", "-archs", str(binary)) != "arm64":
         raise ValueError("Packaged binary must contain only arm64")
     load_commands = output("otool", "-l", str(binary))
-    if not re.search(r"\bminos 13\.0(?:\.0)?\s", load_commands):
-        raise ValueError("Packaged binary must target macOS 13.0")
+    verify_build_version(load_commands)
     with (bundle / "Contents/Info.plist").open("rb") as source:
         info = plistlib.load(source)
     expected = {
@@ -140,13 +167,14 @@ def publish(staged, destination):
 def build(release):
     if sys.platform != "darwin":
         raise ValueError("Gopher packaging requires macOS and Xcode command-line tools")
+    environment = build_environment()
     identity = signing_identity(release)
     metadata = json.loads(output("cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"))
     package = next(p for p in metadata["packages"] if Path(p["manifest_path"]).resolve() == ROOT / "Cargo.toml")
     version = package["version"]
     bundle_version(version)
     run(*cargo_build_command(release),
-        env={**os.environ, "MACOSX_DEPLOYMENT_TARGET": MINIMUM_OS})
+        env=environment)
     binary = Path(metadata["target_directory"]) / TARGET / "release/gopher"
     dist = ROOT / "dist"
     dist.mkdir(exist_ok=True)

@@ -10,8 +10,33 @@ from unittest.mock import patch
 
 import bundle
 
+BUILD_VERSION = "Load command 1\n cmd LC_BUILD_VERSION\n platform 1\n minos 13.0\n sdk 26.5\n"
+
 
 class BundleTests(unittest.TestCase):
+    def test_selected_sdk_is_validated_and_passed_to_cargo(self):
+        with patch.object(bundle, "output", side_effect=["26.5", "/selected/MacOSX26.5.sdk"]), patch.dict(os.environ, {"SDKROOT": "/old/sdk"}):
+            environment = bundle.build_environment()
+            self.assertEqual(environment["SDKROOT"], "/selected/MacOSX26.5.sdk")
+            self.assertEqual(environment["MACOSX_DEPLOYMENT_TARGET"], "13.0")
+        for version in ("15.5", "26.4", "", "unknown"):
+            with self.subTest(version=version), patch.object(bundle, "output", return_value=version), self.assertRaises(ValueError):
+                bundle.build_environment()
+
+    def test_binary_sdk_and_deployment_target_are_independent(self):
+        bundle.verify_build_version(BUILD_VERSION)
+        bundle.verify_build_version(BUILD_VERSION.replace("sdk 26.5", "sdk 26.5.1"))
+        for invalid in (
+            BUILD_VERSION.replace("sdk 26.5", "sdk 15.5"),
+            BUILD_VERSION.replace("sdk 26.5", "sdk 26.4"),
+            BUILD_VERSION.replace("minos 13.0", "minos 26.5"),
+            BUILD_VERSION.replace("platform 1", "platform 2"),
+            BUILD_VERSION.replace(" sdk 26.5\n", ""),
+            "cmd LC_VERSION_MIN_MACOSX\nversion 13.0\nsdk 26.5\n",
+        ):
+            with self.subTest(commands=invalid), self.assertRaises(ValueError):
+                bundle.verify_build_version(invalid)
+
     def test_build_versions_increase_across_semantic_version_boundaries(self):
         versions = ["0.1.0", "0.1.1", "0.1.99", "0.2.0", "0.99.99", "1.0.0", "2.0.0"]
         builds = [tuple(map(int, bundle.bundle_version(v).split("."))) for v in versions]
@@ -55,7 +80,7 @@ class BundleTests(unittest.TestCase):
             binary.write_text("fixture")
             binary.chmod(0o755)
             info_path = app / "Contents/Info.plist"
-            with patch.object(bundle, "output", side_effect=lambda *args: "arm64" if args[0] == "lipo" else "minos 13.0\n"), patch.object(bundle, "run"):
+            with patch.object(bundle, "output", side_effect=lambda *args: "arm64" if args[0] == "lipo" else BUILD_VERSION), patch.object(bundle, "run"):
                 bundle.write_info(info_path, "0.1.0")
                 bundle.verify_bundle(app, "0.1.0")
                 with self.assertRaises(ValueError):
@@ -104,7 +129,7 @@ class BundleTests(unittest.TestCase):
                     self.assertTrue(requirement.startswith("=anchor apple generic"))
                     raise subprocess.CalledProcessError(1, args)
 
-            with patch.object(bundle, "output", side_effect=["arm64", "minos 13.0\n"] * 2), patch.object(bundle, "run", side_effect=verify_signature):
+            with patch.object(bundle, "output", side_effect=["arm64", BUILD_VERSION] * 2), patch.object(bundle, "run", side_effect=verify_signature):
                 with self.assertRaises(subprocess.CalledProcessError):
                     bundle.verify_bundle(app, "0.1.0", release=True)
 
