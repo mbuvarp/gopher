@@ -60,17 +60,21 @@ Building requires macOS 13+, Rust with the `aarch64-apple-darwin` target, Xcode 
 
 ```sh
 gh auth login
-cargo run -- doctor
+cargo run --features dev -- doctor
 rustup target add aarch64-apple-darwin
 sh scripts/bundle.sh
 mkdir -p ~/Applications
-ditto dist/Gopher.app ~/Applications/Gopher.app
-open ~/Applications/Gopher.app
+ditto "dist/Gopher Dev.app" "$HOME/Applications/Gopher Dev.app"
+open "$HOME/Applications/Gopher Dev.app"
 ```
 
 Allow notifications when prompted. Enable **Actions → Launch at login** to start Gopher automatically in your user session. Quit Gopher before replacing an installed build. The build script packages the application icon and uses an installed Apple Development signing identity, or `GOPHER_SIGNING_IDENTITY` if specified. Local builds without one fall back to ad-hoc signing and warn that notification authorization may fail.
 
-`cargo run` also starts the app, but notifications and launch at login require the bundled app. No web frontend, server, webhook setup, or separate system daemon is needed.
+Local bundles are **Gopher Dev**, with bundle identifier `dev.mbuvarp.gopher.dev`, a DEV icon badge, and data in `~/.config/gopher-dev`. They can run alongside released Gopher and never use Sparkle. The Install Gopher Dev skill replaces only this app. Settings identifies the source commit and uncommitted changes. Dev has separate notification permissions and login registration; use different global shortcuts when running both apps.
+
+For initial setup, copy `config.toml` into the Dev directory. If copying `state.sqlite3` too, stop Gopher first or use SQLite backup; do not copy locks, logs, or `session.json`.
+
+`cargo run --features dev` also starts Dev (plain `cargo run` retains the production data path), but notifications and launch at login require the bundled app. No web frontend, server, webhook setup, or separate system daemon is needed.
 
 ## Package a release archive
 

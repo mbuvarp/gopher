@@ -192,7 +192,10 @@ impl Updater {
         let enabled = bundle
             .objectForInfoDictionaryKey(&NSString::from_str("GopherUpdatesEnabled"))
             .is_some_and(|v| unsafe { msg_send![&v, boolValue] });
-        if enabled && let Err(error) = this.start(&bundle) {
+        if !cfg!(feature = "dev")
+            && enabled
+            && let Err(error) = this.start(&bundle)
+        {
             tracing::error!(event="updater_start_failed", error=%error);
             this.disabled_reason =
                 "Updates could not start. Reinstall Gopher using the installer.".into();

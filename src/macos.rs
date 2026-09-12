@@ -411,7 +411,7 @@ pub fn run(
                 if worker_stopped { *flow = ControlFlow::Exit; }
             }
             Event::NewEvents(StartCause::Init) => {
-                match TrayIconBuilder::new().with_menu_on_left_click(false).with_tooltip("Gopher — GitHub reviews").with_icon(icon(MenuBarState::Idle)).with_icon_as_template(true).build() {
+                match TrayIconBuilder::new().with_menu_on_left_click(false).with_tooltip(format!("{} — GitHub reviews", crate::identity::NAME)).with_icon(icon(MenuBarState::Idle)).with_icon_as_template(true).build() {
                     Ok(icon)=>{tray=Some(icon);tracing::info!(event="menu_bar_created");},
                     Err(e)=>{startup_error=Some(anyhow::anyhow!("Cannot create menu bar icon: {e}"));*flow=ControlFlow::Exit;}
                 }
@@ -419,7 +419,7 @@ pub fn run(
             }
             Event::UserEvent(AppEvent::Permission(granted)) => {
                 permission=Some(granted);
-                if !granted {ui_error=Some("Notifications are disabled. Enable Gopher in System Settings → Notifications.".into());}
+                if !granted {ui_error=Some(format!("Notifications are disabled. Enable {} in System Settings → Notifications.", crate::identity::NAME));}
                 else if ui_error.as_deref().is_some_and(|e|e.starts_with("Notifications are disabled")){ui_error=None;}
                 tracing::info!(event="notification_permission",granted);
                 if granted { for (id,title,body,review) in pending.drain(..) {
@@ -595,7 +595,7 @@ pub fn run(
                 let _=tray.set_icon_with_as_template(Some(icon(state)),true);
                 // On macOS, None leaves the existing status-item title unchanged.
                 tray.set_title(Some(if error.is_some(){"!"}else{""}));
-                let _=tray.set_tooltip(Some(format!("Gopher · {} PRs · {} updates",prs.len(),attention.len())));
+                let _=tray.set_tooltip(Some(format!("{} · {} PRs · {} updates",crate::identity::NAME,prs.len(),attention.len())));
                 tracing::debug!(event="menu_updated",prs=prs.len(),updates=attention.len(),state=?state);
             }
     });
@@ -758,12 +758,12 @@ fn menu(
     let menu = Menu::new();
     let mut actions = HashMap::new();
     menu.append(&MenuItem::new(
-        format!("Gopher · {} open PRs", prs.len()),
+        format!("{} · {} open PRs", crate::identity::NAME, prs.len()),
         false,
         None,
     ))?;
     if let Some(error) = error {
-        let details = Submenu::new("⚠ Gopher needs attention", true);
+        let details = Submenu::new(format!("⚠ {} needs attention", crate::identity::NAME), true);
         for chunk in error.as_bytes().chunks(100) {
             details.append(&MenuItem::new(String::from_utf8_lossy(chunk), false, None))?;
         }
@@ -902,7 +902,7 @@ fn menu(
     let update = MenuItem::new(update_state.menu_title(), update_state.can_check, None);
     actions.insert(update.id().0.clone(), Action::CheckUpdates);
     menu.append(&update)?;
-    let quit = MenuItem::new("Quit Gopher", true, None);
+    let quit = MenuItem::new(crate::identity::QUIT, true, None);
     actions.insert(quit.id().0.clone(), Action::Quit);
     menu.append(&quit)?;
     Ok((menu, actions))
@@ -981,8 +981,7 @@ fn template_rgba(bytes: &[u8]) -> Vec<u8> {
 fn icon(state: MenuBarState) -> tray_icon::Icon {
     let state = match state {
         MenuBarState::Idle | MenuBarState::Review(State::Reviewing) => {
-            return tray_icon::Icon::from_rgba(gopher_rgba().to_vec(), 36, 36)
-                .expect("valid gopher icon");
+            return channel_icon(gopher_rgba().to_vec());
         }
         MenuBarState::Review(state) => state,
     };
@@ -1013,8 +1012,44 @@ fn icon(state: MenuBarState) -> tray_icon::Icon {
             }
         }
     }
-    tray_icon::Icon::from_rgba(rgba, 36, 36).expect("valid icon dimensions")
+    channel_icon(rgba)
 }
+// Keep the original status legible; Dev adds a small template badge beside it.
+fn channel_icon(rgba: Vec<u8>) -> tray_icon::Icon {
+    if !crate::identity::IS_DEV {
+        return tray_icon::Icon::from_rgba(rgba, 36, 36).expect("valid icon dimensions");
+    }
+    let width = 64;
+    let mut badged = vec![0; width * 36 * 4];
+    for y in 0..36 {
+        badged[y * width * 4..(y * width + 36) * 4]
+            .copy_from_slice(&rgba[y * 36 * 4..(y + 1) * 36 * 4]);
+    }
+    // 3x5 lettering, rendered at 2x for a Retina menu bar.
+    let letters = [[6, 5, 5, 5, 6], [7, 4, 6, 4, 7], [5, 5, 5, 5, 2]];
+    for y in 10..26 {
+        for x in 37..64 {
+            badged[(y * width + x) * 4 + 3] = 255;
+        }
+    }
+    for (letter, rows) in letters.iter().enumerate() {
+        for (row, bits) in rows.iter().enumerate() {
+            for col in 0..3 {
+                if bits & (1 << (2 - col)) != 0 {
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            let x = 39 + letter * 8 + col * 2 + dx;
+                            let y = 13 + row * 2 + dy;
+                            badged[(y * width + x) * 4 + 3] = 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tray_icon::Icon::from_rgba(badged, width as u32, 36).expect("valid dev icon dimensions")
+}
+
 fn distance(x: f32, y: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     let t = (((x - ax) * (bx - ax) + (y - ay) * (by - ay))
         / ((bx - ax).powi(2) + (by - ay).powi(2)))

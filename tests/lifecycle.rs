@@ -205,7 +205,7 @@ fn termination_signals_are_logged_and_allow_clean_completion() {
 #[test]
 fn invalid_configuration_is_logged_and_cli_diagnostics_do_not_change_the_session() {
     let home = tempfile::tempdir().unwrap();
-    let directory = home.path().join(".config/gopher");
+    let directory = home.path().join(gopher::identity::DATA_DIRECTORY);
     std::fs::create_dir_all(&directory).unwrap();
     std::fs::write(directory.join("config.toml"), "poll_seconds = 0").unwrap();
     let run = |args: &[&str]| {

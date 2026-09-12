@@ -581,7 +581,7 @@ impl ReviewPopover {
         let mtm = MainThreadMarker::new().expect("Popover must be created on the main thread");
         let target = ActionTarget::new(proxy, sender, mtm);
         let content = FlippedView::new(rect(0.0, 0.0, WIDTH, HEIGHT), mtm);
-        let title = label("Gopher", 21.0, false, mtm);
+        let title = label(crate::identity::HEADER, 21.0, false, mtm);
         title.setFont(Some(&NSFont::boldSystemFontOfSize(21.0)));
         title.setFrame(rect(20.0, 16.0, 200.0, 28.0));
         content.addSubview(&title);
@@ -622,7 +622,7 @@ impl ReviewPopover {
             None,
             Some(("Launch at login", Action::Login)),
             Some(("Check for updates…", Action::CheckUpdates)),
-            Some(("Quit Gopher", Action::Quit)),
+            Some((crate::identity::QUIT, Action::Quit)),
         ] {
             let Some((title, action)) = entry else {
                 menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -998,7 +998,14 @@ impl ReviewPopover {
         }));
         self.actions.setHidden(ignored);
         self.back.setHidden(!ignored);
-        set_text(&self.title, if ignored { "Ignored PRs" } else { "Gopher" });
+        set_text(
+            &self.title,
+            if ignored {
+                "Ignored PRs"
+            } else {
+                crate::identity::HEADER
+            },
+        );
         set_text(
             &self.empty,
             if ignored {

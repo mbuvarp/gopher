@@ -24,7 +24,7 @@ class BundleTests(unittest.TestCase):
     def test_generated_metadata_uses_package_version_and_keeps_app_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "Info.plist"
-            bundle.write_info(destination, "0.2.3")
+            bundle.write_info(destination, "0.2.3", release=True)
             with destination.open("rb") as source:
                 info = plistlib.load(source)
             self.assertEqual(info["CFBundleShortVersionString"], "0.2.3")
@@ -32,6 +32,41 @@ class BundleTests(unittest.TestCase):
             self.assertEqual(info["CFBundleIdentifier"], "dev.mbuvarp.gopher")
             self.assertEqual(info["LSMinimumSystemVersion"], "13.0")
             self.assertTrue(info["LSUIElement"])
+
+    def test_dev_identity_and_build_features_are_isolated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "Info.plist"
+            bundle.write_info(destination, "0.2.3")
+            info = plistlib.loads(destination.read_bytes())
+            self.assertEqual(info["CFBundleIdentifier"], "dev.mbuvarp.gopher.dev")
+            self.assertEqual(info["CFBundleName"], "Gopher Dev")
+            self.assertEqual(info["CFBundleDisplayName"], "Gopher Dev")
+            self.assertNotIn("GopherUpdatesEnabled", info)
+            self.assertNotIn("SUFeedURL", info)
+        self.assertIn("dev", bundle.cargo_build_command(False))
+        self.assertNotIn("--features", bundle.cargo_build_command(True))
+        self.assertIn("--no-default-features", bundle.cargo_build_command(True))
+
+    def test_verification_rejects_cross_channel_bundles_and_dev_updaters(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            app = Path(temporary) / "Gopher Dev.app"
+            binary = app / "Contents/MacOS/gopher"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("fixture")
+            binary.chmod(0o755)
+            info_path = app / "Contents/Info.plist"
+            with patch.object(bundle, "output", side_effect=lambda *args: "arm64" if args[0] == "lipo" else "minos 13.0\n"), patch.object(bundle, "run"):
+                bundle.write_info(info_path, "0.1.0")
+                bundle.verify_bundle(app, "0.1.0")
+                with self.assertRaises(ValueError):
+                    bundle.verify_bundle(app, "0.1.0", release=True)
+                bundle.write_info(info_path, "0.1.0", release=True)
+                with self.assertRaises(ValueError):
+                    bundle.verify_bundle(app, "0.1.0")
+                bundle.write_info(info_path, "0.1.0")
+                (app / "Contents/Frameworks/Sparkle.framework").mkdir(parents=True)
+                with self.assertRaisesRegex(ValueError, "must not include the updater"):
+                    bundle.verify_bundle(app, "0.1.0")
 
     def test_release_never_silently_falls_back_to_ad_hoc_signing(self):
         with patch.dict(os.environ, {"GOPHER_SIGNING_IDENTITY": ""}), patch.object(bundle, "output", return_value="0 valid identities found"):
@@ -70,7 +105,6 @@ class BundleTests(unittest.TestCase):
                     raise subprocess.CalledProcessError(1, args)
 
             with patch.object(bundle, "output", side_effect=["arm64", "minos 13.0\n"] * 2), patch.object(bundle, "run", side_effect=verify_signature):
-                bundle.verify_bundle(app, "0.1.0", release=False)
                 with self.assertRaises(subprocess.CalledProcessError):
                     bundle.verify_bundle(app, "0.1.0", release=True)
 

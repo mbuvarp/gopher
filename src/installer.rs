@@ -233,6 +233,10 @@ fn inspect_target(
 
 pub fn install(no_launch: bool) -> Result<()> {
     ensure!(
+        !crate::identity::IS_DEV,
+        "Use the Install Gopher Dev skill for development builds"
+    );
+    ensure!(
         command("/usr/bin/id", &["-u"])? != "0",
         "Run the installer as your normal user, without sudo"
     );
