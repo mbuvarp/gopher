@@ -142,3 +142,18 @@ of that scope. Preparing/validating alone does not authorize a publish, and inco
 GOP-7 validation prevents the first publication. Failed or ambiguous dispatches are
 inspected before any user-requested retry. Follow the returned run URL, or identify
 its exact SHA/event/actor/time; do not attach to an arbitrary latest workflow run.
+
+## Build toolchain and appearance
+
+Release and regular CI builds use the `macos-26` runner with
+`DEVELOPER_DIR=/Applications/Xcode_26.5.app/Contents/Developer`, rather than the
+runner's changing default Xcode. Xcode 26.5 ships macOS SDK 26.5, matching the Dev
+build that established the intended AppKit appearance. Update this pin deliberately.
+Packaging validates the selected SDK before compiling and the executable's
+`LC_BUILD_VERSION` before accepting either a local bundle or an extracted release
+archive. SDK 26.5+ is required; the deployment target stays macOS 13.0. The SDK
+requirement is for building, not for users running Gopher.
+
+The published v0.1.0 binary used SDK 15.5 and retains the older AppKit styling on
+Tahoe. Its appearance changes only after installing a newly built release; do not
+replace published assets to retrofit the toolchain change.

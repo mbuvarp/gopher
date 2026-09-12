@@ -4,12 +4,18 @@ permissions:
   contents: read
 jobs:
   check:
-    runs-on: macos-latest
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
+      - name: Verify build toolchain
+        run: |
+          xcodebuild -version
+          PYTHONPATH=scripts python3 -c 'import bundle; bundle.build_environment()'
       - run: rustup update stable --no-self-update
       - run: rustup component add rustfmt clippy
       - run: cargo fmt --check
