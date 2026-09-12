@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "A personal GitHub agent review inbox for the macOS menu bar"
 
+[features]
+default = []
+dev = []
+
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }

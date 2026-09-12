@@ -1,4 +1,4 @@
 interface:
   display_name: "Install Gopher Dev"
-  short_description: "Install Gopher locally from the current branch"
-  default_prompt: "Use $install-dev to build and install Gopher locally from the current git branch."
+  short_description: "Install Gopher Dev locally from the current branch"
+  default_prompt: "Use $install-dev to build and install Gopher Dev locally from the current git branch."

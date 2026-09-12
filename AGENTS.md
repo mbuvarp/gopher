@@ -70,6 +70,7 @@ Keep reviewer detection in separate modules. Treat these observed conventions as
 
 ## Persistence and diagnostics
 
+- Development bundles use the explicit Cargo `dev` feature, `Gopher Dev.app`, bundle ID `dev.mbuvarp.gopher.dev`, header `Gopher • Dev`, and DEV icon badges. They use `~/.config/gopher-dev` and never start Sparkle or install over production. Release packaging must build without the dev feature and preserve the production identity.
 - Store Gopher data under `~/.config/gopher`; do not use macOS Application Support defaults. Sparkle is an explicit exception: let it own updater preferences in NSUserDefaults and temporary downloads in macOS caches.
 - Use `state.sqlite3` via `rusqlite` for cached PR data, reviewer evidence/runs, update identifiers, acknowledgements, ignored PR IDs, and notification history. GitHub remains authoritative; show restored data as stale until refreshed.
 - Keep optional settings in `config.toml`.

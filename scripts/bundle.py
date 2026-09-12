@@ -55,6 +55,21 @@ def signing_identity(release):
     return identity
 
 
+def channel_info(release):
+    return {
+        "CFBundleIdentifier": "dev.mbuvarp.gopher" if release else "dev.mbuvarp.gopher.dev",
+        "CFBundleName": "Gopher" if release else "Gopher Dev",
+        "CFBundleDisplayName": "Gopher" if release else "Gopher Dev",
+    }
+
+
+def cargo_build_command(release):
+    command = ["cargo", "build", "--release", "--locked", "--no-default-features", "--target", TARGET]
+    if not release:
+        command.extend(["--features", "dev"])
+    return command
+
+
 def write_info(destination, version, release=False):
     with (ROOT / "packaging/Info.plist").open("rb") as source:
         info = plistlib.load(source)
@@ -64,6 +79,7 @@ def write_info(destination, version, release=False):
         LSMinimumSystemVersion=MINIMUM_OS,
         GopherInstallerProtocol=1,
     )
+    info.update(channel_info(release))
     if release:
         info.update(sparkle.info())
     with destination.open("wb") as target:
@@ -83,10 +99,12 @@ def verify_bundle(bundle, version, release=False):
         "CFBundleShortVersionString": version,
         "CFBundleVersion": bundle_version(version),
         "LSMinimumSystemVersion": MINIMUM_OS,
-        "CFBundleIdentifier": "dev.mbuvarp.gopher",
+        **channel_info(release),
     }
     if release:
         expected.update(sparkle.info())
+    if not release and (info.get("GopherUpdatesEnabled") or (bundle / "Contents/Frameworks/Sparkle.framework").exists()):
+        raise ValueError("Development bundles must not include the updater")
     if any(info.get(key) != value for key, value in expected.items()):
         raise ValueError("Packaged app metadata does not match the Cargo version")
     if not os.access(binary, os.X_OK):
@@ -127,7 +145,7 @@ def build(release):
     package = next(p for p in metadata["packages"] if Path(p["manifest_path"]).resolve() == ROOT / "Cargo.toml")
     version = package["version"]
     bundle_version(version)
-    run("cargo", "build", "--release", "--locked", "--target", TARGET,
+    run(*cargo_build_command(release),
         env={**os.environ, "MACOSX_DEPLOYMENT_TARGET": MINIMUM_OS})
     binary = Path(metadata["target_directory"]) / TARGET / "release/gopher"
     dist = ROOT / "dist"
@@ -135,19 +153,23 @@ def build(release):
     # Stage on the output filesystem so publication uses renames, never partial copies.
     with tempfile.TemporaryDirectory(prefix=".bundle-", dir=dist) as temporary:
         stage = Path(temporary)
-        bundle = stage / "Gopher.app"
+        bundle = stage / (channel_info(release)["CFBundleName"] + ".app")
         (bundle / "Contents/MacOS").mkdir(parents=True)
         resources = bundle / "Contents/Resources"
         resources.mkdir()
         shutil.copy2(binary, bundle / "Contents/MacOS/gopher")
         write_info(bundle / "Contents/Info.plist", version, release=release)
+        artwork = ROOT / "assets/gopher-app.png"
+        if not release:
+            artwork = stage / "gopher-dev-app.png"
+            run("swift", str(ROOT / "scripts/dev_icon.swift"), str(ROOT / "assets/gopher-app.png"), str(artwork))
         iconset = stage / "Gopher.iconset"
         iconset.mkdir()
         for size in (16, 32, 128, 256, 512):
             for scale in (1, 2):
                 pixels = str(size * scale)
                 suffix = "@2x" if scale == 2 else ""
-                run("sips", "-z", pixels, pixels, str(ROOT / "assets/gopher-app.png"),
+                run("sips", "-z", pixels, pixels, str(artwork),
                     "--out", str(iconset / f"icon_{size}x{size}{suffix}.png"), stdout=subprocess.DEVNULL)
         run("iconutil", "-c", "icns", str(iconset), "-o", str(resources / "Gopher.icns"))
         if release:
@@ -179,7 +201,7 @@ def build(release):
             shutil.copy2(ROOT / "scripts/install.sh", installer)
             products.append(installer)
         publish(products, dist)
-    print(f"Built {dist / 'Gopher.app'} (version {version}, build {bundle_version(version)}).")
+    print(f"Built {dist / bundle.name} (version {version}, build {bundle_version(version)}).")
     if release:
         print(f"Archive: {dist / archive.name}\nChecksum: {dist / checksum.name}")
         print("Unnotarized build: macOS may require Privacy & Security → Open Anyway.")

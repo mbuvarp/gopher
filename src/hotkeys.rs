@@ -33,7 +33,7 @@ impl HotkeyAction {
     ];
     pub fn label(self) -> &'static str {
         match self {
-            Self::OpenGopher => "Open Gopher",
+            Self::OpenGopher => crate::identity::OPEN,
             Self::Next => "Next PR",
             Self::Previous => "Previous PR",
             Self::Acknowledge => "Acknowledge",

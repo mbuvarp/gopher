@@ -2,6 +2,7 @@ pub mod actions;
 pub mod config;
 pub mod github;
 pub mod hotkeys;
+pub mod identity;
 #[cfg(target_os = "macos")]
 pub mod installer;
 pub mod lifecycle;

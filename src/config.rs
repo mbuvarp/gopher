@@ -43,7 +43,7 @@ impl Config {
     pub fn directory() -> Result<PathBuf> {
         Ok(
             PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?)
-                .join(".config/gopher"),
+                .join(crate::identity::DATA_DIRECTORY),
         )
     }
 

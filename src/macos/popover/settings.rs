@@ -67,14 +67,14 @@ impl SettingsEditor {
         let message = label("", 11.0, true, mtm);
         message.setFrame(rect(20.0, 434.0, WIDTH - 40.0, 40.0));
         view.addSubview(&message);
-        let heading = label(
-            &format!("Updates · Gopher {}", env!("CARGO_PKG_VERSION")),
-            16.0,
-            false,
-            mtm,
-        );
-        heading.setFont(Some(&NSFont::boldSystemFontOfSize(16.0)));
-        heading.setFrame(rect(20.0, 490.0, WIDTH - 40.0, 24.0));
+        let font_size = if crate::identity::IS_DEV { 13.0 } else { 16.0 };
+        let heading = label(&crate::identity::version_label(), font_size, false, mtm);
+        heading.setFont(Some(&NSFont::boldSystemFontOfSize(font_size)));
+        heading.setFrame(if crate::identity::IS_DEV {
+            rect(20.0, 480.0, WIDTH - 40.0, 40.0)
+        } else {
+            rect(20.0, 490.0, WIDTH - 40.0, 24.0)
+        });
         view.addSubview(&heading);
         let checks = target.button(
             "Automatically check for updates daily",
