@@ -207,15 +207,65 @@ fn display_title(pr: &PullRequest) -> String {
         .collect();
     format!("#{}  {}", pr.snapshot.number, title)
 }
-fn details(pr: &PullRequest) -> String {
+fn set_details(field: &NSTextField, pr: &PullRequest) {
+    let mut text = String::new();
+    let mut primary_ranges = Vec::new();
+    if let (Some(head), Some(base)) = (&pr.snapshot.head_branch, &pr.snapshot.base_branch) {
+        text.push_str("Merging ");
+        let start = text.encode_utf16().count();
+        if let Some(owner) = &pr.snapshot.source_owner {
+            text.push_str(owner);
+            text.push(':');
+        }
+        text.push_str(head);
+        primary_ranges.push(NSRange::new(start, text.encode_utf16().count() - start));
+        text.push_str(" into ");
+        let start = text.encode_utf16().count();
+        text.push_str(base);
+        primary_ranges.push(NSRange::new(start, text.encode_utf16().count() - start));
+        text.push_str("\n\n");
+    }
+    text.push_str(&details(
+        pr,
+        text.encode_utf16().count(),
+        &mut primary_ranges,
+    ));
+    let value = NSMutableAttributedString::initWithString(
+        NSMutableAttributedString::alloc(),
+        &NSString::from_str(&text),
+    );
+    unsafe {
+        let all = NSRange::new(0, value.length());
+        value.addAttribute_value_range(NSFontAttributeName, &NSFont::systemFontOfSize(12.0), all);
+        value.addAttribute_value_range(
+            NSForegroundColorAttributeName,
+            &NSColor::secondaryLabelColor(),
+            all,
+        );
+        for range in primary_ranges {
+            value.addAttribute_value_range(
+                NSForegroundColorAttributeName,
+                &NSColor::labelColor(),
+                range,
+            );
+        }
+    }
+    if !field
+        .attributedStringValue()
+        .isEqualToAttributedString(&value)
+    {
+        field.setAttributedStringValue(&value);
+    }
+}
+
+fn details(pr: &PullRequest, mut offset: usize, primary_ranges: &mut Vec<NSRange>) -> String {
     let mut lines = Vec::new();
     for agent in &pr.agents {
-        lines.push(format!(
-            "{} · {:?}\n{}",
-            agent.agent.label(),
-            agent.verdict,
-            agent.reason
-        ));
+        let heading = format!("{} · {:?}", agent.agent.label(), agent.verdict);
+        primary_ranges.push(NSRange::new(offset, heading.encode_utf16().count()));
+        let section = format!("{heading}\n{}", agent.reason);
+        offset += section.encode_utf16().count() + 2;
+        lines.push(section);
     }
     if lines.is_empty() {
         lines.push("No agent review activity detected.".into());
@@ -467,7 +517,7 @@ impl Row {
             extra += height + 8.0;
         }
         if expanded {
-            set_text(&self.details, &details(pr));
+            set_details(&self.details, pr);
             let height = self
                 .details
                 .sizeThatFits(NSSize::new(CONTENT_WIDTH - 12.0, 10000.0))
