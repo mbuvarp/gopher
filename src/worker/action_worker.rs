@@ -5,7 +5,7 @@ use crate::{
     actions::*,
     config::Config,
     github::{Github, PrRef},
-    model::{PullRequest, Snapshot},
+    model::{CheckState, PullRequest, Snapshot},
     store::Store,
 };
 use anyhow::{Context as _, Result, ensure};
@@ -69,6 +69,7 @@ struct Intent {
     pr: PullRequest,
     viewer: String,
     preferences: Preferences,
+    on_green: bool,
 }
 impl Intent {
     fn reference(&self) -> PrRef {
@@ -88,7 +89,12 @@ impl Intent {
                     && preferences.allows(kind, pr)
                     && (kind != Kind::Merge
                         || (pr.snapshot.head == self.pr.snapshot.head
-                            && pr.update_id == self.pr.update_id))
+                            && pr.update_id == self.pr.update_id
+                            && (!self.on_green
+                                || matches!(
+                                    pr.snapshot.check_state,
+                                    Some(CheckState::Running | CheckState::Green)
+                                ))))
             })
     }
 }
@@ -180,6 +186,7 @@ impl Coordinator {
                 .context("Waiting for GitHub authentication")?
                 .into(),
             preferences,
+            on_green: false,
         })
     }
     pub fn reconcile(&mut self, context: &Context<'_>) {
@@ -224,10 +231,26 @@ impl Coordinator {
                 self.state.merges.insert(
                     id,
                     MergeProgress::Failed(
-                        "Merge cancelled: the PR or action settings changed.".into(),
+                        "Merge cancelled: the PR, checks, or action settings changed.".into(),
                     ),
                 );
             }
+            self.publish(context);
+        }
+        let ready = self
+            .merges
+            .iter()
+            .filter(|(id, _)| {
+                self.state.merges.get(*id) == Some(&MergeProgress::WaitingForChecks)
+                    && context
+                        .prs
+                        .get(*id)
+                        .is_some_and(|pr| pr.snapshot.check_state == Some(CheckState::Green))
+            })
+            .map(|(id, intent)| (id.clone(), intent.token))
+            .collect::<Vec<_>>();
+        for (id, token) in ready {
+            self.start_countdown(id, token, context);
             self.publish(context);
         }
     }
@@ -253,7 +276,12 @@ impl Coordinator {
                 token,
                 remaining,
             } => {
-                if self.merges.get(&pr).is_some_and(|i| i.token == token) {
+                if self.merges.get(&pr).is_some_and(|i| i.token == token)
+                    && matches!(
+                        self.state.merges.get(&pr),
+                        Some(MergeProgress::Countdown(_))
+                    )
+                {
                     if remaining > 0 {
                         self.state
                             .merges
@@ -268,9 +296,9 @@ impl Coordinator {
                     let checked = result.and_then(|(snapshot, github)| {
                         let expected = context.config.repositories.get(&snapshot.repo).and_then(|r| r.reviewers.as_deref());
                         let fresh = transition(*snapshot, Some(&intent.pr), expected, chrono::Utc::now().timestamp(), context.config.settle_seconds);
-                        if intent.valid(context, &self.state, Kind::Merge) && intent.preferences.allows(Kind::Merge, &fresh) && fresh.snapshot.head == intent.pr.snapshot.head && fresh.update_id == intent.pr.update_id {
+                        if intent.valid(context, &self.state, Kind::Merge) && intent.preferences.allows(Kind::Merge, &fresh) && fresh.snapshot.head == intent.pr.snapshot.head && fresh.update_id == intent.pr.update_id && (!intent.on_green || (fresh.snapshot.check_state == Some(CheckState::Green) && context.prs.get(&pr).is_some_and(|current| current.snapshot.check_state == Some(CheckState::Green)))) {
                             Ok(github)
-                        } else { Err("Merge cancelled: the commit, review state, or action settings changed.".into()) }
+                        } else { Err("Merge cancelled: the commit, review state, checks, or action settings changed.".into()) }
                     });
                     match checked {
                         Err(error) => {
@@ -423,12 +451,26 @@ impl Coordinator {
                 self.state.preferences.insert(repo_key(&repo), preferences);
                 tracing::info!(event="action_settings_saved", repo=%repo);
             }
-            Request::Merge { pr, head, update } => {
+            Request::Merge {
+                pr,
+                head,
+                update,
+                on_green,
+            } => {
                 ensure!(
                     !self.merges.contains_key(&pr),
                     "A merge is already pending for this PR"
                 );
-                let intent = self.intent(&pr, Kind::Merge, context)?;
+                let mut intent = self.intent(&pr, Kind::Merge, context)?;
+                intent.on_green = on_green;
+                ensure!(
+                    !on_green
+                        || matches!(
+                            intent.pr.snapshot.check_state,
+                            Some(CheckState::Running | CheckState::Green)
+                        ),
+                    "Merge cancelled: checks are unavailable or failed"
+                );
                 ensure!(
                     head == intent.pr.snapshot.head && !head.is_empty(),
                     "The PR commit changed; refresh before merging"
@@ -439,22 +481,14 @@ impl Coordinator {
                 );
                 let token = intent.token;
                 self.merges.insert(pr.clone(), intent);
-                self.state
-                    .merges
-                    .insert(pr.clone(), MergeProgress::Countdown(5));
-                tracing::info!(event="merge_countdown_started", pr_id=%pr);
-                let sender = context.sender.clone();
-                tokio::spawn(async move {
-                    let start = tokio::time::Instant::now();
-                    for elapsed in 1..=5 {
-                        tokio::time::sleep_until(start + Duration::from_secs(elapsed)).await;
-                        let _ = sender.send(Command::PrAction(ActionCommand::Tick {
-                            pr: pr.clone(),
-                            token,
-                            remaining: (5 - elapsed) as u8,
-                        }));
-                    }
-                });
+                if on_green {
+                    tracing::info!(event="merge_waiting_for_checks", pr_id=%pr);
+                    self.state
+                        .merges
+                        .insert(pr, MergeProgress::WaitingForChecks);
+                } else {
+                    self.start_countdown(pr, token, context);
+                }
             }
             Request::CancelMerge(pr) => {
                 if self.state.merges.get(&pr) != Some(&MergeProgress::Merging) {
@@ -507,6 +541,24 @@ impl Coordinator {
         Ok(())
     }
 
+    fn start_countdown(&mut self, pr: String, token: u64, context: &Context<'_>) {
+        self.state
+            .merges
+            .insert(pr.clone(), MergeProgress::Countdown(5));
+        tracing::info!(event="merge_countdown_started", pr_id=%pr);
+        let sender = context.sender.clone();
+        tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            for elapsed in 1..=5 {
+                tokio::time::sleep_until(start + Duration::from_secs(elapsed)).await;
+                let _ = sender.send(Command::PrAction(ActionCommand::Tick {
+                    pr: pr.clone(),
+                    token,
+                    remaining: (5 - elapsed) as u8,
+                }));
+            }
+        });
+    }
     fn check_merge(&mut self, pr: &str, context: &Context<'_>) {
         let Some(intent) = self.merges.get(pr).cloned() else {
             return;

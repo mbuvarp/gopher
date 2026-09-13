@@ -99,6 +99,7 @@ impl PrActions {
         let merge = menu_item(
             "Merge",
             Some(AppEvent::PrAction(Request::Merge {
+                on_green: pr.snapshot.check_state == Some(crate::model::CheckState::Running),
                 pr: pr.snapshot.id.clone(),
                 head: pr.snapshot.head.clone(),
                 update: pr.update_id.clone(),
@@ -164,7 +165,11 @@ impl PrActions {
         self.cancel.setHidden(ignored || !busy);
         self.cancel.setEnabled(matches!(
             progress,
-            Some(MergeProgress::Countdown(_) | MergeProgress::Checking)
+            Some(
+                MergeProgress::WaitingForChecks
+                    | MergeProgress::Countdown(_)
+                    | MergeProgress::Checking
+            )
         ));
         if let Some(progress) = progress {
             self.cancel.setTitle(&NSString::from_str(
@@ -176,6 +181,13 @@ impl PrActions {
             ));
         }
         let preferences = state.preferences(&pr.snapshot.repo);
+        self.merge.setTitle(&NSString::from_str(
+            if pr.snapshot.check_state == Some(crate::model::CheckState::Running) {
+                "Merge on green checks"
+            } else {
+                "Merge"
+            },
+        ));
         self.merge.setHidden(!preferences.merge.enabled);
         self.labels.setHidden(!preferences.label.enabled);
         self.separator
@@ -199,6 +211,7 @@ impl PrActions {
         bind_item(
             &self.merge,
             AppEvent::PrAction(Request::Merge {
+                on_green: pr.snapshot.check_state == Some(crate::model::CheckState::Running),
                 pr: pr.snapshot.id.clone(),
                 head: pr.snapshot.head.clone(),
                 update: pr.update_id.clone(),

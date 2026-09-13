@@ -1210,6 +1210,7 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         dispatch_pr_action(
             Request::Merge {
+                on_green: false,
                 pr: "PR_1".into(),
                 head: "head".into(),
                 update: "displayed-update".into(),

@@ -142,6 +142,7 @@ pub enum Request {
         pr: String,
         head: String,
         update: String,
+        on_green: bool,
     },
     CancelMerge(String),
     LoadLabels(String),
@@ -169,6 +170,7 @@ pub struct Labels {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MergeProgress {
+    WaitingForChecks,
     Countdown(u8),
     Checking,
     Merging,
@@ -178,6 +180,7 @@ pub enum MergeProgress {
 impl MergeProgress {
     pub fn text(&self) -> String {
         match self {
+            Self::WaitingForChecks => "Merge pending…".into(),
             Self::Countdown(seconds) => format!("Cancel ({seconds}s)"),
             Self::Checking => "Checking merge…".into(),
             Self::Merging => "Merging…".into(),
@@ -186,7 +189,10 @@ impl MergeProgress {
         }
     }
     pub fn busy(&self) -> bool {
-        matches!(self, Self::Countdown(_) | Self::Checking | Self::Merging)
+        matches!(
+            self,
+            Self::WaitingForChecks | Self::Countdown(_) | Self::Checking | Self::Merging
+        )
     }
 }
 #[derive(Clone, Debug, Default)]

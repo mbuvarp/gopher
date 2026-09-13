@@ -25,6 +25,7 @@ async fn shutdown_cancels_countdown_and_rejects_new_actions() {
         remaining: 0,
     });
     h.request(Request::Merge {
+        on_green: false,
         pr: "PR_1".into(),
         head: "head".into(),
         update: h.prs["PR_1"].update_id.clone(),
@@ -254,6 +255,7 @@ esac
     }
     fn start_merge(&mut self) -> u64 {
         self.request(Request::Merge {
+            on_green: false,
             pr: "PR_1".into(),
             head: "head".into(),
             update: self.prs["PR_1"].update_id.clone(),
@@ -674,6 +676,7 @@ async fn merge_rejects_unseen_same_head_evidence_before_starting_countdown() {
     assert_eq!(current.snapshot.head, displayed.snapshot.head);
     h.prs.insert("PR_1".into(), current);
     h.request(Request::Merge {
+        on_green: false,
         pr: "PR_1".into(),
         head: displayed.snapshot.head,
         update: displayed.update_id,
@@ -956,4 +959,163 @@ fn catalogue_cache_and_in_flight_results_are_scoped_to_account() {
         h.store.label_catalogues("test").unwrap()["owner/repo"].labels[0].name,
         "private"
     );
+}
+
+impl Harness {
+    fn queue_merge(&mut self) -> u64 {
+        self.prs.get_mut("PR_1").unwrap().snapshot.check_state = Some(CheckState::Running);
+        self.request(Request::Merge {
+            pr: "PR_1".into(),
+            head: self.prs["PR_1"].snapshot.head.clone(),
+            update: self.prs["PR_1"].update_id.clone(),
+            on_green: true,
+        });
+        self.coordinator.merges["PR_1"].token
+    }
+}
+
+#[tokio::test]
+async fn queued_merge_waits_then_counts_down_and_merges_once() {
+    let mut h = Harness::new();
+    h.refresh_pr().await;
+    let token = h.queue_merge();
+    assert_eq!(
+        h.coordinator.state.merges["PR_1"],
+        MergeProgress::WaitingForChecks
+    );
+    h.handle(ActionCommand::Tick {
+        pr: "PR_1".into(),
+        token,
+        remaining: 0,
+    });
+    assert_eq!(
+        h.coordinator.state.merges["PR_1"],
+        MergeProgress::WaitingForChecks
+    );
+    h.assert_no_merge();
+    h.prs.get_mut("PR_1").unwrap().snapshot.check_state = Some(CheckState::Green);
+    h.handle(ActionCommand::Tick {
+        pr: "PR_1".into(),
+        token,
+        remaining: 4,
+    });
+    assert_eq!(
+        h.coordinator.state.merges["PR_1"],
+        MergeProgress::Countdown(5)
+    );
+    let snapshot = h.prs["PR_1"].snapshot.clone();
+    h.handle(ActionCommand::MergeChecked {
+        pr: "PR_1".into(),
+        token,
+        result: Ok((Box::new(snapshot), Github::new(&h.config).unwrap())),
+    });
+    while h.coordinator.has_submissions() {
+        h.step().await;
+    }
+    assert_eq!(h.coordinator.state.merges["PR_1"], MergeProgress::Complete);
+    assert!(h.directory.path().join("merge.json").exists());
+}
+
+#[tokio::test]
+async fn queued_merge_cancels_on_invalidated_evidence_and_shutdown() {
+    for case in 0..10 {
+        let mut h = Harness::new();
+        let token = h.queue_merge();
+        let pr = h.prs.get_mut("PR_1").unwrap();
+        match case {
+            0 => pr.snapshot.check_state = Some(CheckState::Failed),
+            1 => pr.snapshot.check_state = Some(CheckState::Conflicts),
+            2 => pr.snapshot.check_state = None,
+            3 => pr.stale = true,
+            4 => pr.update_id = "changed".into(),
+            5 => pr.snapshot.head = "changed".into(),
+            6 => pr.snapshot.open = false,
+            7 => h.viewer = "changed",
+            8 => h.request(Request::CancelMerge("PR_1".into())),
+            _ => h.coordinator.begin_shutdown(),
+        }
+        h.handle(ActionCommand::Tick {
+            pr: "PR_1".into(),
+            token,
+            remaining: 0,
+        });
+        assert!(h.coordinator.merges.is_empty(), "case {case}");
+        h.assert_no_merge();
+    }
+}
+
+#[tokio::test]
+async fn queued_merge_requires_green_in_final_snapshot() {
+    for check_state in [
+        None,
+        Some(CheckState::Running),
+        Some(CheckState::Failed),
+        Some(CheckState::Conflicts),
+    ] {
+        let mut h = Harness::new();
+        h.refresh_pr().await;
+        let token = h.queue_merge();
+        h.prs.get_mut("PR_1").unwrap().snapshot.check_state = Some(CheckState::Green);
+        h.handle(ActionCommand::Tick {
+            pr: "PR_1".into(),
+            token,
+            remaining: 4,
+        });
+        let mut snapshot = h.prs["PR_1"].snapshot.clone();
+        snapshot.check_state = check_state;
+        h.handle(ActionCommand::MergeChecked {
+            pr: "PR_1".into(),
+            token,
+            result: Ok((Box::new(snapshot), Github::new(&h.config).unwrap())),
+        });
+        assert!(matches!(
+            h.coordinator.state.merges["PR_1"],
+            MergeProgress::Failed(_)
+        ));
+        h.assert_no_merge();
+    }
+}
+
+#[tokio::test]
+async fn captured_queue_mode_is_preserved_when_checks_change_before_dispatch() {
+    for check_state in [CheckState::Green, CheckState::Failed] {
+        let mut h = Harness::new();
+        h.prs.get_mut("PR_1").unwrap().snapshot.check_state = Some(check_state);
+        h.request(Request::Merge {
+            pr: "PR_1".into(),
+            head: "head".into(),
+            update: h.prs["PR_1"].update_id.clone(),
+            on_green: true,
+        });
+        if check_state == CheckState::Green {
+            assert_eq!(
+                h.coordinator.state.merges["PR_1"],
+                MergeProgress::Countdown(5)
+            );
+        } else {
+            assert!(h.coordinator.merges.is_empty());
+        }
+        h.assert_no_merge();
+    }
+}
+
+#[tokio::test]
+async fn cancelled_queue_ignores_late_validation_after_requeue() {
+    let mut h = Harness::new();
+    h.refresh_pr().await;
+    let old = h.queue_merge();
+    h.request(Request::CancelMerge("PR_1".into()));
+    h.queue_merge();
+    let mut snapshot = h.prs["PR_1"].snapshot.clone();
+    snapshot.check_state = Some(CheckState::Green);
+    h.handle(ActionCommand::MergeChecked {
+        pr: "PR_1".into(),
+        token: old,
+        result: Ok((Box::new(snapshot), Github::new(&h.config).unwrap())),
+    });
+    assert_eq!(
+        h.coordinator.state.merges["PR_1"],
+        MergeProgress::WaitingForChecks
+    );
+    h.assert_no_merge();
 }
