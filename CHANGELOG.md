@@ -6,6 +6,11 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-13
+
+- Add Merge on green checks: queue an eligible PR while checks run, then start a five-second cancellation countdown when they turn green.
+- Cancel queued merges with the Merge pending… button, or automatically when checks fail, conflicts appear, PR evidence or settings change, or polling data becomes stale. Quitting Gopher also cancels queued merges.
+
 ## [0.2.0] - 2026-09-12
 
 - Show confirmed merge conflicts in PR status and prevent conflicting merges.
