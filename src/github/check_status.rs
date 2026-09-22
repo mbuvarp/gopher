@@ -1,6 +1,38 @@
 //! Summarize all CI checks using responses already fetched for reviewer detection.
 use super::*;
 
+pub(super) fn check_runs(checks: &[Value]) -> CheckState {
+    // `filter=latest` can still return older runs from separate check suites
+    // on the same commit. Select the newest run per app and check name across
+    // all pages before comparing severity. Completion time is not run order:
+    // an older run can finish after its replacement has started.
+    let mut latest: BTreeMap<(String, &str), &Value> = BTreeMap::new();
+    let mut state = CheckState::Green;
+    for check in checks {
+        let app = check["app"]["id"]
+            .as_u64()
+            .map(|id| format!("id:{id}"))
+            .or_else(|| {
+                check["app"]["slug"]
+                    .as_str()
+                    .map(|slug| format!("slug:{slug}"))
+            });
+        let (Some(app), Some(name), Some(id)) = (app, check["name"].as_str(), check["id"].as_u64())
+        else {
+            // Incomplete identity must not hide a potentially blocking check.
+            state = state.max(check_run(check));
+            continue;
+        };
+        let current = latest.entry((app, name)).or_insert(check);
+        if Some(id) > current["id"].as_u64() {
+            *current = check;
+        }
+    }
+    latest
+        .values()
+        .fold(state, |state, check| state.max(check_run(check)))
+}
+
 pub(super) fn check_run(check: &Value) -> CheckState {
     if check["status"] != "completed" {
         return CheckState::Running;
@@ -36,6 +68,41 @@ pub(super) fn commit_statuses(statuses: &[Value]) -> CheckState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn superseded_runs_do_not_override_current_results() {
+        let mut checks = vec![
+            json!({"id":1,"app":{"id":1},"name":"Redesign required","status":"completed","conclusion":"failure","check_suite":{"id":10}}),
+            json!({"id":2,"app":{"id":1},"name":"Repository format","status":"completed","conclusion":"cancelled"}),
+            json!({"id":3,"app":{"id":1},"name":"Redesign required","status":"completed","conclusion":"success","check_suite":{"id":20}}),
+            json!({"id":4,"app":{"id":1},"name":"Repository format","status":"completed","conclusion":"success"}),
+            json!({"id":5,"app":{"id":1},"name":"Admin test","status":"in_progress","conclusion":null}),
+        ];
+        assert_eq!(check_runs(&checks), CheckState::Running);
+        checks.reverse();
+        assert_eq!(check_runs(&checks), CheckState::Running);
+        checks[0]["status"] = json!("completed");
+        checks[0]["conclusion"] = json!("success");
+        assert_eq!(check_runs(&checks), CheckState::Green);
+        checks.push(json!({"id":6,"app":{"id":1},"name":"Redesign required","status":"completed","conclusion":"failure"}));
+        assert_eq!(check_runs(&checks), CheckState::Failed);
+    }
+
+    #[test]
+    fn independent_or_unidentified_failures_remain_blocking() {
+        let successful = json!({"id":3,"app":{"id":1},"name":"test","status":"completed","conclusion":"success"});
+        for failed in [
+            json!({"id":1,"app":{"id":2},"name":"test","status":"completed","conclusion":"failure"}),
+            json!({"id":1,"app":{"id":1},"name":"other test","status":"completed","conclusion":"cancelled"}),
+            json!({"app":{"id":1},"name":"test","status":"completed","conclusion":"failure"}),
+        ] {
+            assert_eq!(
+                check_runs(&[failed, successful.clone()]),
+                CheckState::Failed
+            );
+        }
+        assert_eq!(check_runs(&[]), CheckState::Green);
+    }
 
     #[test]
     fn running_and_terminal_check_states() {

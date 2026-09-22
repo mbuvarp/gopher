@@ -377,6 +377,41 @@ esac
 }
 
 #[tokio::test]
+async fn snapshot_resolves_superseded_checks_across_pages() {
+    use gopher::model::CheckState;
+    use serde_json::json;
+    for reverse in [false, true] {
+        let old = json!({"id":1,"app":{"id":1,"slug":"github-actions"},"name":"required","status":"completed","conclusion":"failure","check_suite":{"id":10}});
+        let new = json!({"id":200,"app":{"id":1,"slug":"github-actions"},"name":"required","status":"in_progress","conclusion":null,"check_suite":{"id":20}});
+        let (first, last) = if reverse { (new, old) } else { (old, new) };
+        let mut first_checks: Vec<_> = (2..101).map(|id| json!({"id":id,"app":{"id":1,"slug":"github-actions"},"name":format!("job-{id}"),"status":"completed","conclusion":"success"})).collect();
+        first_checks.push(first);
+        let (_dir, gh) = mock(&format!(
+            r#"
+case "$*" in
+  *check-runs*'page=2'*) echo '{last_checks}'; exit 0 ;;
+  *check-runs*) echo '{first_checks}'; exit 0 ;;
+esac
+{fixture}
+"#,
+            first_checks = json!({"check_runs":first_checks}),
+            last_checks = json!({"check_runs":[last]}),
+            fixture = include_str!("fixtures/gh-snapshot.sh"),
+        ));
+        let snapshot = gh
+            .snapshot(&gopher::github::PrRef {
+                id: "PR_1".into(),
+                repo: "owner/repo".into(),
+                number: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.check_state, Some(CheckState::Running));
+        assert!(snapshot.checks.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn rejects_head_changes_during_pagination() {
     let script = include_str!("fixtures/gh-snapshot.sh").replace(
         "\"headRefOid\":\"head\",\"labels\":{\"nodes\":[{\"name\":\"ready\"",
