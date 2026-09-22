@@ -6,6 +6,11 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-22
+
+- Fix incorrect “Checks failed” status when newer automatic GitHub Actions runs replace older failed or cancelled checks.
+- Preserve failures from independent workflows, separately triggered manual runs, and other CI providers.
+
 ## [0.3.0] - 2026-09-13
 
 - Add Merge on green checks: queue an eligible PR while checks run, then start a five-second cancellation countdown when they turn green.
