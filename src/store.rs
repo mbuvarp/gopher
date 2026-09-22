@@ -50,13 +50,8 @@ impl Store {
         Ok(())
     }
 
-    /// Claim the shared service-error notification slot before scheduling a banner.
-    /// Keeping the timestamp in metadata preserves the cooldown across app restarts.
-    pub fn claim_service_error_notification(
-        &self,
-        now: i64,
-        interval_seconds: i64,
-    ) -> Result<bool> {
+    /// Only successfully scheduled service-error notifications start the cooldown.
+    pub fn service_error_notification_due(&self, now: i64, interval_seconds: i64) -> Result<bool> {
         let last: Option<i64> = self
             .connection
             .query_row(
@@ -67,14 +62,16 @@ impl Store {
             .optional()?
             .map(|value| value.parse())
             .transpose()?;
-        if last.is_some_and(|last| now.saturating_sub(last) < interval_seconds) {
-            return Ok(false);
-        }
+        // A clock correction must not extend a persisted cooldown indefinitely.
+        Ok(last.is_none_or(|last| now < last || now.saturating_sub(last) >= interval_seconds))
+    }
+
+    pub fn record_service_error_notification(&self, now: i64) -> Result<()> {
         self.connection.execute(
             "INSERT OR REPLACE INTO metadata(key,value) VALUES ('last_service_error_notification',?1)",
             [now.to_string()],
         )?;
-        Ok(true)
+        Ok(())
     }
 
     pub fn ignored(&self) -> Result<BTreeSet<String>> {

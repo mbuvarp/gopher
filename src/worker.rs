@@ -279,6 +279,7 @@ async fn run(
     let mut invalidated_poll_ids = BTreeSet::new();
     let mut failures = 0_u32;
     let mut in_flight_notifications = BTreeSet::new();
+    let mut pending_service_error_notification: Option<String> = None;
     let mut dismiss_after_delivery = BTreeSet::new();
     // The first UI snapshot must include cached labels, without waiting for a poll.
     pr_actions.reconcile(&action_worker::Context {
@@ -592,6 +593,10 @@ async fn run(
                 }
             }
             Command::NotificationDelivered(id) => {
+                if pending_service_error_notification.as_deref() == Some(&id) {
+                    store.record_service_error_notification(chrono::Utc::now().timestamp())?;
+                    pending_service_error_notification = None;
+                }
                 store.mark_delivered(&id)?;
                 in_flight_notifications.remove(&id);
                 // A native add request can complete after the user dismissed its update.
@@ -600,6 +605,9 @@ async fn run(
                 }
             }
             Command::NotificationFailed(id) => {
+                if pending_service_error_notification.as_deref() == Some(&id) {
+                    pending_service_error_notification = None;
+                }
                 in_flight_notifications.remove(&id);
                 dismiss_after_delivery.remove(&id);
             }
@@ -715,13 +723,17 @@ async fn run(
                     if new_error != error {
                         tracing::error!(event="service_error",error=%message);
                     }
-                    if store.claim_service_error_notification(
-                        chrono::Utc::now().timestamp(),
-                        SERVICE_ERROR_NOTIFICATION_INTERVAL.as_secs() as i64,
-                    )? {
+                    if pending_service_error_notification.is_none()
+                        && store.service_error_notification_due(
+                            chrono::Utc::now().timestamp(),
+                            SERVICE_ERROR_NOTIFICATION_INTERVAL.as_secs() as i64,
+                        )?
+                    {
+                        let id = format!("gopher-error-{}", hash(message));
+                        pending_service_error_notification = Some(id.clone());
                         sink(UiEvent::Notify {
                             review: false,
-                            id: format!("gopher-error-{}", hash(message)),
+                            id,
                             title: "Gopher needs attention".into(),
                             body: message.clone(),
                         });

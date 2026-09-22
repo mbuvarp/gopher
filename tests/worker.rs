@@ -24,11 +24,13 @@ fn service_errors_share_a_notification_cooldown_and_worker_shuts_down_cleanly() 
     )
     .unwrap();
     let mut notified = None;
+    let mut notification_id = None;
     let mut saw_refresh = false;
     loop {
         match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
-            UiEvent::Notify { body, .. } => {
+            UiEvent::Notify { id, body, .. } => {
                 assert!(notified.replace(body).is_none());
+                assert!(notification_id.replace(id).is_none());
             }
             UiEvent::Updated { loading: true, .. } => saw_refresh = true,
             UiEvent::Updated {
@@ -41,6 +43,18 @@ fn service_errors_share_a_notification_cooldown_and_worker_shuts_down_cleanly() 
                 break;
             }
             _ => (),
+        }
+    }
+    worker
+        .sender
+        .send(Command::NotificationDelivered(notification_id.unwrap()))
+        .unwrap();
+    loop {
+        if matches!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            UiEvent::Updated { error: Some(_), .. }
+        ) {
+            break;
         }
     }
     worker
@@ -98,12 +112,13 @@ fn service_error_notification_slot_expires_after_three_hours() {
     let interval = 3 * 60 * 60;
     assert!(
         store
-            .claim_service_error_notification(1_000_000, interval)
+            .service_error_notification_due(1_000_000, interval)
             .unwrap()
     );
+    store.record_service_error_notification(1_000_000).unwrap();
     assert!(
         !store
-            .claim_service_error_notification(1_000_000 + interval - 1, interval)
+            .service_error_notification_due(1_000_000 + interval - 1, interval)
             .unwrap()
     );
     drop(store);
@@ -111,14 +126,79 @@ fn service_error_notification_slot_expires_after_three_hours() {
     let store = gopher::store::Store::open(directory.path()).unwrap();
     assert!(
         store
-            .claim_service_error_notification(1_000_000 + interval, interval)
+            .service_error_notification_due(1_000_000 + interval, interval)
+            .unwrap()
+    );
+    store
+        .record_service_error_notification(1_000_000 + interval)
+        .unwrap();
+    assert!(
+        !store
+            .service_error_notification_due(1_000_000 + interval + 1, interval)
             .unwrap()
     );
     assert!(
-        !store
-            .claim_service_error_notification(1_000_000 + interval + 1, interval)
+        store
+            .service_error_notification_due(1_000_000, interval)
             .unwrap()
     );
+}
+
+#[test]
+fn failed_service_error_notification_does_not_start_the_cooldown() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let worker = worker::start(
+        directory.path().into(),
+        Config {
+            gh_path: Some(directory.path().join("missing-gh")),
+            ..Default::default()
+        },
+        Arc::new(move |event| {
+            let _ = sender.send(event);
+        }),
+    )
+    .unwrap();
+    let first_id = loop {
+        if let UiEvent::Notify { id, .. } = receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+            break id;
+        }
+    };
+    worker
+        .sender
+        .send(Command::NotificationFailed(first_id))
+        .unwrap();
+    worker
+        .sender
+        .send(Command::PollComplete(
+            Err("GitHub request timed out".into()),
+        ))
+        .unwrap();
+    let retry_id = loop {
+        if let UiEvent::Notify { id, .. } = receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+            break id;
+        }
+    };
+    worker
+        .sender
+        .send(Command::NotificationDelivered(retry_id))
+        .unwrap();
+    worker
+        .sender
+        .send(Command::PollComplete(Err(
+            "GitHub secure connection timed out".into(),
+        )))
+        .unwrap();
+    loop {
+        match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+            UiEvent::Updated {
+                error: Some(error), ..
+            } if error.contains("secure connection") => break,
+            UiEvent::Notify { .. } => panic!("A delivered retry must start the cooldown"),
+            _ => (),
+        }
+    }
+    drop(worker);
 }
 
 #[test]
