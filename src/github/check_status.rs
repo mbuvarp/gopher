@@ -88,6 +88,12 @@ pub(super) fn check_runs(checks: &[Value], workflows: &BTreeMap<u64, WorkflowRun
     let mut latest: BTreeMap<(String, Scope, &str), RankedCheck<'_>> = BTreeMap::new();
     let mut state = CheckState::Green;
     for check in checks {
+        // Replacement semantics are specific to GitHub Actions. Other apps
+        // can publish independent checks with identical names in one suite.
+        if check["app"]["slug"] != "github-actions" {
+            state = state.max(check_run(check));
+            continue;
+        }
         let app = check["app"]["id"]
             .as_u64()
             .map(|id| format!("id:{id}"))
@@ -105,9 +111,7 @@ pub(super) fn check_runs(checks: &[Value], workflows: &BTreeMap<u64, WorkflowRun
             state = state.max(check_run(check));
             continue;
         };
-        let workflow = (check["app"]["slug"] == "github-actions")
-            .then(|| workflows.get(&suite))
-            .flatten();
+        let workflow = workflows.get(&suite);
         let (scope, order) = match workflow {
             Some(run)
                 if matches!(
@@ -174,6 +178,26 @@ pub(super) fn commit_statuses(statuses: &[Value]) -> CheckState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_actions_checks_with_the_same_name_and_suite_remain_independent() {
+        for app in [
+            json!({"id":2,"slug":"other-ci"}),
+            json!({"id":2}),
+            Value::Null,
+        ] {
+            let mut checks = vec![
+                json!({"id":100,"app":app,"name":"test","status":"completed","conclusion":"failure","check_suite":{"id":10}}),
+                json!({"id":200,"app":app,"name":"test","status":"completed","conclusion":"success","check_suite":{"id":10}}),
+            ];
+            assert_eq!(check_runs(&checks, &BTreeMap::new()), CheckState::Failed);
+            checks.reverse();
+            assert_eq!(check_runs(&checks, &BTreeMap::new()), CheckState::Failed);
+            checks[1]["status"] = json!("in_progress");
+            checks[1]["conclusion"] = Value::Null;
+            assert_eq!(check_runs(&checks, &BTreeMap::new()), CheckState::Running);
+        }
+    }
 
     #[test]
     fn independent_executions_stay_blocking_but_automatic_runs_and_reruns_replace() {
