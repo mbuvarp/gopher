@@ -721,12 +721,14 @@ exit 1
         for resource in ["core", "graphql"] {
             let delay = Github::cooldown(&config, Some(resource));
             if retry_after.is_some() {
-                // HTTP dates have whole-second precision. Account for actual
-                // subprocess/scheduler time instead of assuming it stays <5s.
+                // HTTP dates have whole-second precision, and the parser adds
+                // one second of safety margin. Account for actual subprocess/
+                // scheduler time instead of assuming it stays <5s.
                 let window = std::time::Duration::from_secs(180);
                 let minimum =
                     window.saturating_sub(started.elapsed() + std::time::Duration::from_secs(1));
-                assert!(delay >= minimum && delay <= window, "delay: {delay:?}");
+                let maximum = window + std::time::Duration::from_secs(1);
+                assert!(delay >= minimum && delay <= maximum, "delay: {delay:?}");
             } else {
                 assert!(delay.is_zero());
             }
