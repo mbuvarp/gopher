@@ -290,7 +290,7 @@ fn shutdown_preserves_an_unconfirmed_service_error_notification() {
 }
 
 #[test]
-fn shutdown_does_not_throttle_a_notification_that_was_never_scheduled() {
+fn shutdown_does_not_throttle_a_late_unscheduled_notification() {
     let directory = tempfile::tempdir().unwrap();
     let (sender, receiver) = mpsc::channel();
     let worker = worker::start(
@@ -309,12 +309,12 @@ fn shutdown_does_not_throttle_a_notification_that_was_never_scheduled() {
             break id;
         }
     };
-    // The UI drops requests still waiting for notification permission first.
+    // A notification event already queued for the UI can arrive after shutdown.
+    worker.sender.send(Command::Shutdown).unwrap();
     worker
         .sender
         .send(Command::NotificationFailed(notification_id))
         .unwrap();
-    worker.sender.send(Command::Shutdown).unwrap();
     loop {
         if matches!(
             receiver.recv_timeout(Duration::from_secs(5)).unwrap(),

@@ -461,7 +461,8 @@ pub fn run(
                     }
                 }
                 UiEvent::Notify{id,title,body,review}=>{
-                    if permission==Some(true) {
+                    if shutting_down {let _=sender.send(Command::NotificationFailed(id));}
+                    else if permission==Some(true) {
                         if let Some(center)=&center {notify(center,id,title,body,review,sender.clone(),proxy.clone());}
                     } else if permission.is_none() && bundled {pending.push((id,title,body,review));}
                     else {let _=sender.send(Command::NotificationFailed(id));}
