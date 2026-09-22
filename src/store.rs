@@ -50,25 +50,44 @@ impl Store {
         Ok(())
     }
 
-    /// Only successfully scheduled service-error notifications start the cooldown.
+    /// Successful and unresolved native requests both guard against duplicate alerts.
     pub fn service_error_notification_due(&self, now: i64, interval_seconds: i64) -> Result<bool> {
-        let last: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT value FROM metadata WHERE key='last_service_error_notification'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|value| value.parse())
-            .transpose()?;
-        // A clock correction must not extend a persisted cooldown indefinitely.
-        Ok(last.is_none_or(|last| now < last || now.saturating_sub(last) >= interval_seconds))
+        for key in [
+            "last_service_error_notification",
+            "unconfirmed_service_error_notification",
+        ] {
+            let last: Option<i64> = self
+                .connection
+                .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()?
+                .map(|value| value.parse())
+                .transpose()?;
+            // A clock correction must not extend a persisted cooldown indefinitely.
+            if last.is_some_and(|last| now >= last && now.saturating_sub(last) < interval_seconds) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub fn record_service_error_notification(&self, now: i64) -> Result<()> {
         self.connection.execute(
             "INSERT OR REPLACE INTO metadata(key,value) VALUES ('last_service_error_notification',?1)",
+            [now.to_string()],
+        )?;
+        self.connection.execute(
+            "DELETE FROM metadata WHERE key='unconfirmed_service_error_notification'",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Preserve an attempt whose macOS callback did not arrive before shutdown.
+    pub fn record_unconfirmed_service_error_notification(&self, now: i64) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO metadata(key,value) VALUES ('unconfirmed_service_error_notification',?1)",
             [now.to_string()],
         )?;
         Ok(())

@@ -246,6 +246,50 @@ fn shutdown_records_a_completed_service_error_notification() {
 }
 
 #[test]
+fn shutdown_preserves_an_unconfirmed_service_error_notification() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let worker = worker::start(
+        directory.path().into(),
+        Config {
+            gh_path: Some(directory.path().join("missing-gh")),
+            ..Default::default()
+        },
+        Arc::new(move |event| {
+            let _ = sender.send(event);
+        }),
+    )
+    .unwrap();
+    loop {
+        if matches!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            UiEvent::Notify { .. }
+        ) {
+            break;
+        }
+    }
+    worker.sender.send(Command::Shutdown).unwrap();
+    loop {
+        if matches!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            UiEvent::Stopped
+        ) {
+            break;
+        }
+    }
+    drop(worker);
+    let store = gopher::store::Store::open(directory.path()).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let interval = 3 * 60 * 60;
+    assert!(!store.service_error_notification_due(now, interval).unwrap());
+    assert!(
+        store
+            .service_error_notification_due(now + interval, interval)
+            .unwrap()
+    );
+}
+
+#[test]
 fn notification_actions_acknowledge_only_their_update_and_open_waits_for_browser() {
     use gopher::{model::Snapshot, store::Store, worker::transition};
     let directory = tempfile::tempdir().unwrap();

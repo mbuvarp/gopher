@@ -461,7 +461,10 @@ async fn run(
                     && (pending_service_error_notification.is_none() || notification_wait_expired)
                 {
                     if notification_wait_expired && pending_service_error_notification.is_some() {
-                        tracing::warn!(event = "notification_shutdown_wait_expired");
+                        store.record_unconfirmed_service_error_notification(
+                            chrono::Utc::now().timestamp(),
+                        )?;
+                        tracing::warn!(event = "notification_shutdown_unconfirmed");
                     }
                     break;
                 }
