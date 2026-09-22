@@ -630,7 +630,19 @@ impl Github {
             }
             page += 1;
         }
-        check_state = check_state.max(check_status::check_runs(&all_checks));
+        let workflows = if check_status::needs_workflow_identity(&all_checks) {
+            match check_status::workflow_runs(self, &reference.repo, &snapshot.head).await {
+                Ok(workflows) => workflows,
+                Err(_) => {
+                    tracing::warn!(event = "workflow_identity_unavailable", repo = %reference.repo,
+                        pr = reference.number, "Keeping check suites independent");
+                    BTreeMap::new()
+                }
+            }
+        } else {
+            BTreeMap::new()
+        };
+        check_state = check_state.max(check_status::check_runs(&all_checks, &workflows));
         // CodeRabbit also uses legacy commit statuses, which are separate from check runs.
         let mut statuses = Vec::new();
         let mut page = 1;

@@ -389,6 +389,7 @@ async fn snapshot_resolves_superseded_checks_across_pages() {
         let (_dir, gh) = mock(&format!(
             r#"
 case "$*" in
+  *actions/runs*) echo '{{"workflow_runs":[{{"id":10,"workflow_id":1,"check_suite_id":10,"head_sha":"head","head_branch":"feature","event":"pull_request"}},{{"id":20,"workflow_id":1,"check_suite_id":20,"head_sha":"head","head_branch":"feature","event":"pull_request"}}]}}'; exit 0 ;;
   *check-runs*'page=2'*) echo '{last_checks}'; exit 0 ;;
   *check-runs*) echo '{first_checks}'; exit 0 ;;
 esac
@@ -408,6 +409,59 @@ esac
             .unwrap();
         assert_eq!(snapshot.check_state, Some(CheckState::Running));
         assert!(snapshot.checks.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn snapshot_preserves_independent_suites_and_unavailable_workflow_identity() {
+    use gopher::model::CheckState;
+    use serde_json::json;
+    for (workflow, head, unavailable, expected) in [
+        (1, "head", false, CheckState::Green),
+        (2, "head", false, CheckState::Failed),
+        (1, "other-head", false, CheckState::Failed),
+        (1, "head", true, CheckState::Failed),
+    ] {
+        let checks = json!({"check_runs":[
+            {"id":1,"app":{"id":1,"slug":"github-actions"},"name":"test","check_suite":{"id":10},"status":"completed","conclusion":"failure"},
+            {"id":2,"app":{"id":1,"slug":"github-actions"},"name":"test","check_suite":{"id":20},"status":"completed","conclusion":"success"}
+        ]});
+        let mut first_runs: Vec<_> = (100..199)
+            .map(|id| {
+                json!({
+                    "id":id,"workflow_id":id,"check_suite_id":id,"head_sha":"head",
+                    "head_branch":"feature","event":"pull_request"
+                })
+            })
+            .collect();
+        first_runs.push(json!({"id":20,"workflow_id":workflow,"check_suite_id":20,
+            "head_sha":"head","head_branch":"feature","event":"pull_request"}));
+        let last_runs = json!({"workflow_runs":[{"id":10,"workflow_id":1,"check_suite_id":10,
+            "head_sha":head,"head_branch":"feature","event":"pull_request"}]});
+        let (_dir, gh) = mock(&format!(
+            r#"
+case "$*" in
+  *actions/runs*) if {unavailable}; then echo 'HTTP 403' >&2; exit 1; fi ;;
+esac
+case "$*" in
+  *actions/runs*'head_sha=head'*'page=2'*) echo '{last_runs}'; exit 0 ;;
+  *actions/runs*'head_sha=head'*) echo '{first_runs}'; exit 0 ;;
+  *check-runs*) echo '{checks}'; exit 0 ;;
+esac
+{fixture}
+"#,
+            first_runs = json!({"workflow_runs":first_runs}),
+            fixture = include_str!("fixtures/gh-snapshot.sh"),
+        ));
+        let snapshot = gh
+            .snapshot(&gopher::github::PrRef {
+                id: "PR_1".into(),
+                repo: "owner/repo".into(),
+                number: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.check_state, Some(expected));
     }
 }
 
