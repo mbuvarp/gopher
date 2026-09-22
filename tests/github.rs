@@ -680,14 +680,19 @@ exit 1
 #[tokio::test]
 async fn service_unavailable_retry_after_pauses_both_resources_and_other_clients() {
     for (retry_after, exhausted) in [
-        (Some("180".to_string()), false),
-        (
-            Some((chrono::Utc::now() + chrono::Duration::seconds(180)).to_rfc2822()),
-            false,
-        ),
-        (Some("180".to_string()), true),
+        (Some("180"), false),
+        (Some("date"), false),
+        (Some("180"), true),
         (None, false),
     ] {
+        let started = std::time::Instant::now();
+        let retry_after = retry_after.map(|value| {
+            if value == "date" {
+                (chrono::Utc::now() + chrono::Duration::seconds(180)).to_rfc2822()
+            } else {
+                value.to_string()
+            }
+        });
         let header = retry_after
             .as_ref()
             .map(|value| format!("Retry-After: {value}\r\n"))
@@ -716,7 +721,12 @@ exit 1
         for resource in ["core", "graphql"] {
             let delay = Github::cooldown(&config, Some(resource));
             if retry_after.is_some() {
-                assert!(delay >= std::time::Duration::from_secs(175));
+                // HTTP dates have whole-second precision. Account for actual
+                // subprocess/scheduler time instead of assuming it stays <5s.
+                let window = std::time::Duration::from_secs(180);
+                let minimum =
+                    window.saturating_sub(started.elapsed() + std::time::Duration::from_secs(1));
+                assert!(delay >= minimum && delay <= window, "delay: {delay:?}");
             } else {
                 assert!(delay.is_zero());
             }
