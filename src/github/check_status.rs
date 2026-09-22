@@ -13,6 +13,7 @@ pub(super) struct WorkflowRun {
 enum Scope {
     Suite(u64),
     Workflow(u64, String, String),
+    Execution(u64),
 }
 
 struct RankedCheck<'a> {
@@ -108,10 +109,21 @@ pub(super) fn check_runs(checks: &[Value], workflows: &BTreeMap<u64, WorkflowRun
             .then(|| workflows.get(&suite))
             .flatten();
         let (scope, order) = match workflow {
-            Some(run) => (
-                Scope::Workflow(run.workflow, run.event.clone(), run.branch.clone()),
-                (run.run, id),
-            ),
+            Some(run)
+                if matches!(
+                    run.event.as_str(),
+                    "push" | "pull_request" | "pull_request_target"
+                ) =>
+            {
+                (
+                    Scope::Workflow(run.workflow, run.event.clone(), run.branch.clone()),
+                    (run.run, id),
+                )
+            }
+            // Automatic PR/push runs replace earlier results for that context.
+            // Manual and other triggers may have different inputs: only jobs
+            // within the same execution can replace one another there.
+            Some(run) => (Scope::Execution(run.run), (run.run, id)),
             None => (Scope::Suite(suite), (0, id)),
         };
         // A late-created job from an older workflow run cannot replace the new run.
@@ -162,6 +174,48 @@ pub(super) fn commit_statuses(statuses: &[Value]) -> CheckState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_executions_stay_blocking_but_automatic_runs_and_reruns_replace() {
+        let checks = vec![
+            json!({"id":100,"app":{"id":1,"slug":"github-actions"},"name":"test","status":"completed","conclusion":"failure","check_suite":{"id":10}}),
+            json!({"id":200,"app":{"id":1,"slug":"github-actions"},"name":"test","status":"completed","conclusion":"success","check_suite":{"id":20}}),
+        ];
+        for event in [
+            "push",
+            "pull_request",
+            "pull_request_target",
+            "workflow_dispatch",
+            "repository_dispatch",
+            "schedule",
+            "workflow_run",
+            "unknown",
+        ] {
+            let old = WorkflowRun {
+                workflow: 1,
+                run: 10,
+                event: event.into(),
+                branch: "feature".into(),
+            };
+            let new = WorkflowRun {
+                run: 20,
+                ..old.clone()
+            };
+            let mut workflows = BTreeMap::from([(10, old), (20, new)]);
+            let expected = if matches!(event, "push" | "pull_request" | "pull_request_target") {
+                CheckState::Green
+            } else {
+                CheckState::Failed
+            };
+            assert_eq!(check_runs(&checks, &workflows), expected, "{event}");
+            workflows.get_mut(&20).unwrap().run = 10;
+            assert_eq!(
+                check_runs(&checks, &workflows),
+                CheckState::Green,
+                "rerun: {event}"
+            );
+        }
+    }
 
     #[test]
     fn only_verified_workflow_replacements_can_hide_a_failed_suite() {
