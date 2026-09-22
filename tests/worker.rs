@@ -202,6 +202,50 @@ fn failed_service_error_notification_does_not_start_the_cooldown() {
 }
 
 #[test]
+fn shutdown_records_a_completed_service_error_notification() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let worker = worker::start(
+        directory.path().into(),
+        Config {
+            gh_path: Some(directory.path().join("missing-gh")),
+            ..Default::default()
+        },
+        Arc::new(move |event| {
+            let _ = sender.send(event);
+        }),
+    )
+    .unwrap();
+    let notification_id = loop {
+        if let UiEvent::Notify { id, .. } = receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+            break id;
+        }
+    };
+    worker.sender.send(Command::Shutdown).unwrap();
+    // The first completion barrier can be queued before the native callback.
+    worker.sender.send(Command::ShutdownComplete).unwrap();
+    worker
+        .sender
+        .send(Command::NotificationDelivered(notification_id))
+        .unwrap();
+    loop {
+        if matches!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            UiEvent::Stopped
+        ) {
+            break;
+        }
+    }
+    drop(worker);
+    let store = gopher::store::Store::open(directory.path()).unwrap();
+    assert!(
+        !store
+            .service_error_notification_due(chrono::Utc::now().timestamp(), 3 * 60 * 60)
+            .unwrap()
+    );
+}
+
+#[test]
 fn notification_actions_acknowledge_only_their_update_and_open_waits_for_browser() {
     use gopher::{model::Snapshot, store::Store, worker::transition};
     let directory = tempfile::tempdir().unwrap();

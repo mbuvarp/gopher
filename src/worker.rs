@@ -16,6 +16,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 const IGNORED_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const SERVICE_ERROR_NOTIFICATION_INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
+const NOTIFICATION_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub enum UiEvent {
@@ -308,6 +309,7 @@ async fn run(
     }
     let mut label_deadline = Instant::now();
     let mut shutting_down = false;
+    let mut notification_shutdown_deadline = None;
     loop {
         // Keep ordinary deadlines intact so a credential switch can lift an old
         // quota wait. Ignored identities use GraphQL; snapshots need both quotas.
@@ -343,6 +345,8 @@ async fn run(
                 &command,
                 Command::Shutdown
                     | Command::ShutdownComplete
+                    | Command::NotificationDelivered(_)
+                    | Command::NotificationFailed(_)
                     | Command::LabelSaved { .. }
                     | Command::PrAction(
                         ActionCommand::Merged { .. } | ActionCommand::LabelDone { .. }
@@ -434,6 +438,15 @@ async fn run(
                 if !shutting_down {
                     shutting_down = true;
                     pr_actions.begin_shutdown();
+                    if pending_service_error_notification.is_some() {
+                        notification_shutdown_deadline =
+                            Some(Instant::now() + NOTIFICATION_SHUTDOWN_WAIT);
+                        let sender = sender.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(NOTIFICATION_SHUTDOWN_WAIT).await;
+                            let _ = sender.send(Command::ShutdownComplete);
+                        });
+                    }
                     if !pr_actions.has_submissions() {
                         let _ = sender.send(Command::ShutdownComplete);
                     }
@@ -441,7 +454,15 @@ async fn run(
                 continue;
             }
             Command::ShutdownComplete => {
-                if shutting_down && !pr_actions.has_submissions() {
+                let notification_wait_expired = notification_shutdown_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline);
+                if shutting_down
+                    && !pr_actions.has_submissions()
+                    && (pending_service_error_notification.is_none() || notification_wait_expired)
+                {
+                    if notification_wait_expired && pending_service_error_notification.is_some() {
+                        tracing::warn!(event = "notification_shutdown_wait_expired");
+                    }
                     break;
                 }
                 continue;
