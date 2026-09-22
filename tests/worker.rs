@@ -8,7 +8,7 @@ use std::{
 };
 
 #[test]
-fn missing_cli_notifies_once_and_worker_shuts_down_cleanly() {
+fn service_errors_share_a_notification_cooldown_and_worker_shuts_down_cleanly() {
     let directory = tempfile::tempdir().unwrap();
     let config = Config {
         gh_path: Some(directory.path().join("missing-gh")),
@@ -51,9 +51,74 @@ fn missing_cli_notifies_once_and_worker_shuts_down_cleanly() {
         UiEvent::Updated { error: Some(_), .. } => (),
         _ => panic!("An unchanged missing-CLI error must not emit another notification"),
     }
+    worker
+        .sender
+        .send(Command::PollComplete(Err(
+            "GitHub request timed out; check connectivity".into(),
+        )))
+        .unwrap();
+    match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+        UiEvent::Updated {
+            error: Some(error), ..
+        } => {
+            assert!(error.contains("timed out"));
+        }
+        _ => panic!("A different service error must respect the same cooldown"),
+    }
     let start = std::time::Instant::now();
     drop(worker);
     assert!(start.elapsed() < Duration::from_secs(2));
+
+    let (sender, receiver) = mpsc::channel();
+    let worker = worker::start(
+        directory.path().into(),
+        Config {
+            gh_path: Some(directory.path().join("missing-gh")),
+            ..Default::default()
+        },
+        Arc::new(move |event| {
+            let _ = sender.send(event);
+        }),
+    )
+    .unwrap();
+    loop {
+        match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+            UiEvent::Updated { error: Some(_), .. } => break,
+            UiEvent::Notify { .. } => panic!("The cooldown must survive a restart"),
+            _ => (),
+        }
+    }
+    drop(worker);
+}
+
+#[test]
+fn service_error_notification_slot_expires_after_three_hours() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = gopher::store::Store::open(directory.path()).unwrap();
+    let interval = 3 * 60 * 60;
+    assert!(
+        store
+            .claim_service_error_notification(1_000_000, interval)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .claim_service_error_notification(1_000_000 + interval - 1, interval)
+            .unwrap()
+    );
+    drop(store);
+
+    let store = gopher::store::Store::open(directory.path()).unwrap();
+    assert!(
+        store
+            .claim_service_error_notification(1_000_000 + interval, interval)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .claim_service_error_notification(1_000_000 + interval + 1, interval)
+            .unwrap()
+    );
 }
 
 #[test]

@@ -15,6 +15,7 @@ use std::{
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 const IGNORED_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const SERVICE_ERROR_NOTIFICATION_INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
 
 #[derive(Clone, Debug)]
 pub enum UiEvent {
@@ -710,18 +711,23 @@ async fn run(
                         store.retain(&prs.keys().cloned().collect())?;
                     }
                 }
-                if new_error != error {
-                    if let Some(message) = &new_error {
+                if let Some(message) = &new_error {
+                    if new_error != error {
                         tracing::error!(event="service_error",error=%message);
+                    }
+                    if store.claim_service_error_notification(
+                        chrono::Utc::now().timestamp(),
+                        SERVICE_ERROR_NOTIFICATION_INTERVAL.as_secs() as i64,
+                    )? {
                         sink(UiEvent::Notify {
                             review: false,
                             id: format!("gopher-error-{}", hash(message)),
                             title: "Gopher needs attention".into(),
                             body: message.clone(),
                         });
-                    } else {
-                        tracing::info!(event = "service_recovered");
                     }
+                } else if error.is_some() {
+                    tracing::info!(event = "service_recovered");
                 }
                 error = new_error;
                 failures = if error.is_some() {

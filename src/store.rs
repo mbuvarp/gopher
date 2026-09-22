@@ -50,6 +50,33 @@ impl Store {
         Ok(())
     }
 
+    /// Claim the shared service-error notification slot before scheduling a banner.
+    /// Keeping the timestamp in metadata preserves the cooldown across app restarts.
+    pub fn claim_service_error_notification(
+        &self,
+        now: i64,
+        interval_seconds: i64,
+    ) -> Result<bool> {
+        let last: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key='last_service_error_notification'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| value.parse())
+            .transpose()?;
+        if last.is_some_and(|last| now.saturating_sub(last) < interval_seconds) {
+            return Ok(false);
+        }
+        self.connection.execute(
+            "INSERT OR REPLACE INTO metadata(key,value) VALUES ('last_service_error_notification',?1)",
+            [now.to_string()],
+        )?;
+        Ok(true)
+    }
+
     pub fn ignored(&self) -> Result<BTreeSet<String>> {
         let mut query = self.connection.prepare("SELECT id FROM ignored_prs")?;
         Ok(query
