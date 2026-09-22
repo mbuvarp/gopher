@@ -596,6 +596,7 @@ impl Github {
             }
         }
         let mut check_state = snapshot.check_state.unwrap_or_default();
+        let mut all_checks = Vec::new();
         let mut page = 1;
         loop {
             let endpoint = format!(
@@ -609,7 +610,6 @@ impl Github {
                 .as_array()
                 .context("Missing check runs")?;
             for check in checks {
-                check_state = check_state.max(check_status::check_run(check));
                 if Agent::from_app(&string(&check["app"], "slug")).is_none() {
                     continue;
                 }
@@ -624,11 +624,25 @@ impl Github {
                     summary: string(&check["output"], "summary"),
                 });
             }
+            all_checks.extend(checks.iter().cloned());
             if checks.len() < 100 {
                 break;
             }
             page += 1;
         }
+        let workflows = if check_status::needs_workflow_identity(&all_checks) {
+            match check_status::workflow_runs(self, &reference.repo, &snapshot.head).await {
+                Ok(workflows) => workflows,
+                Err(_) => {
+                    tracing::warn!(event = "workflow_identity_unavailable", repo = %reference.repo,
+                        pr = reference.number, "Keeping check suites independent");
+                    BTreeMap::new()
+                }
+            }
+        } else {
+            BTreeMap::new()
+        };
+        check_state = check_state.max(check_status::check_runs(&all_checks, &workflows));
         // CodeRabbit also uses legacy commit statuses, which are separate from check runs.
         let mut statuses = Vec::new();
         let mut page = 1;

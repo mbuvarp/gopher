@@ -480,6 +480,27 @@ mod tests {
 
     #[test]
     fn installer_lock_excludes_concurrent_installs() {
+        const CHILD: &str = "GOPHER_INSTALLER_LOCK_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Other tests spawn processes concurrently. On macOS, a child can
+            // briefly inherit our flock between fork and exec, keeping it alive
+            // after drop(first). Run the drop/reacquire assertions in isolation.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "installer::tests::installer_lock_excludes_concurrent_installs",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("lock");
         let first = lock_file(&path).unwrap();

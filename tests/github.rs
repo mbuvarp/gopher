@@ -377,6 +377,95 @@ esac
 }
 
 #[tokio::test]
+async fn snapshot_resolves_superseded_checks_across_pages() {
+    use gopher::model::CheckState;
+    use serde_json::json;
+    for reverse in [false, true] {
+        let old = json!({"id":1,"app":{"id":1,"slug":"github-actions"},"name":"required","status":"completed","conclusion":"failure","check_suite":{"id":10}});
+        let new = json!({"id":200,"app":{"id":1,"slug":"github-actions"},"name":"required","status":"in_progress","conclusion":null,"check_suite":{"id":20}});
+        let (first, last) = if reverse { (new, old) } else { (old, new) };
+        let mut first_checks: Vec<_> = (2..101).map(|id| json!({"id":id,"app":{"id":1,"slug":"github-actions"},"name":format!("job-{id}"),"status":"completed","conclusion":"success"})).collect();
+        first_checks.push(first);
+        let (_dir, gh) = mock(&format!(
+            r#"
+case "$*" in
+  *actions/runs*) echo '{{"workflow_runs":[{{"id":10,"workflow_id":1,"check_suite_id":10,"head_sha":"head","head_branch":"feature","event":"pull_request"}},{{"id":20,"workflow_id":1,"check_suite_id":20,"head_sha":"head","head_branch":"feature","event":"pull_request"}}]}}'; exit 0 ;;
+  *check-runs*'page=2'*) echo '{last_checks}'; exit 0 ;;
+  *check-runs*) echo '{first_checks}'; exit 0 ;;
+esac
+{fixture}
+"#,
+            first_checks = json!({"check_runs":first_checks}),
+            last_checks = json!({"check_runs":[last]}),
+            fixture = include_str!("fixtures/gh-snapshot.sh"),
+        ));
+        let snapshot = gh
+            .snapshot(&gopher::github::PrRef {
+                id: "PR_1".into(),
+                repo: "owner/repo".into(),
+                number: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.check_state, Some(CheckState::Running));
+        assert!(snapshot.checks.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn snapshot_preserves_independent_suites_and_unavailable_workflow_identity() {
+    use gopher::model::CheckState;
+    use serde_json::json;
+    for (workflow, head, unavailable, expected) in [
+        (1, "head", false, CheckState::Green),
+        (2, "head", false, CheckState::Failed),
+        (1, "other-head", false, CheckState::Failed),
+        (1, "head", true, CheckState::Failed),
+    ] {
+        let checks = json!({"check_runs":[
+            {"id":1,"app":{"id":1,"slug":"github-actions"},"name":"test","check_suite":{"id":10},"status":"completed","conclusion":"failure"},
+            {"id":2,"app":{"id":1,"slug":"github-actions"},"name":"test","check_suite":{"id":20},"status":"completed","conclusion":"success"}
+        ]});
+        let mut first_runs: Vec<_> = (100..199)
+            .map(|id| {
+                json!({
+                    "id":id,"workflow_id":id,"check_suite_id":id,"head_sha":"head",
+                    "head_branch":"feature","event":"pull_request"
+                })
+            })
+            .collect();
+        first_runs.push(json!({"id":20,"workflow_id":workflow,"check_suite_id":20,
+            "head_sha":"head","head_branch":"feature","event":"pull_request"}));
+        let last_runs = json!({"workflow_runs":[{"id":10,"workflow_id":1,"check_suite_id":10,
+            "head_sha":head,"head_branch":"feature","event":"pull_request"}]});
+        let (_dir, gh) = mock(&format!(
+            r#"
+case "$*" in
+  *actions/runs*) if {unavailable}; then echo 'HTTP 403' >&2; exit 1; fi ;;
+esac
+case "$*" in
+  *actions/runs*'head_sha=head'*'page=2'*) echo '{last_runs}'; exit 0 ;;
+  *actions/runs*'head_sha=head'*) echo '{first_runs}'; exit 0 ;;
+  *check-runs*) echo '{checks}'; exit 0 ;;
+esac
+{fixture}
+"#,
+            first_runs = json!({"workflow_runs":first_runs}),
+            fixture = include_str!("fixtures/gh-snapshot.sh"),
+        ));
+        let snapshot = gh
+            .snapshot(&gopher::github::PrRef {
+                id: "PR_1".into(),
+                repo: "owner/repo".into(),
+                number: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.check_state, Some(expected));
+    }
+}
+
+#[tokio::test]
 async fn rejects_head_changes_during_pagination() {
     let script = include_str!("fixtures/gh-snapshot.sh").replace(
         "\"headRefOid\":\"head\",\"labels\":{\"nodes\":[{\"name\":\"ready\"",
@@ -591,14 +680,19 @@ exit 1
 #[tokio::test]
 async fn service_unavailable_retry_after_pauses_both_resources_and_other_clients() {
     for (retry_after, exhausted) in [
-        (Some("180".to_string()), false),
-        (
-            Some((chrono::Utc::now() + chrono::Duration::seconds(180)).to_rfc2822()),
-            false,
-        ),
-        (Some("180".to_string()), true),
+        (Some("180"), false),
+        (Some("date"), false),
+        (Some("180"), true),
         (None, false),
     ] {
+        let started = std::time::Instant::now();
+        let retry_after = retry_after.map(|value| {
+            if value == "date" {
+                (chrono::Utc::now() + chrono::Duration::seconds(180)).to_rfc2822()
+            } else {
+                value.to_string()
+            }
+        });
         let header = retry_after
             .as_ref()
             .map(|value| format!("Retry-After: {value}\r\n"))
@@ -627,7 +721,14 @@ exit 1
         for resource in ["core", "graphql"] {
             let delay = Github::cooldown(&config, Some(resource));
             if retry_after.is_some() {
-                assert!(delay >= std::time::Duration::from_secs(175));
+                // HTTP dates have whole-second precision, and the parser adds
+                // one second of safety margin. Account for actual subprocess/
+                // scheduler time instead of assuming it stays <5s.
+                let window = std::time::Duration::from_secs(180);
+                let minimum =
+                    window.saturating_sub(started.elapsed() + std::time::Duration::from_secs(1));
+                let maximum = window + std::time::Duration::from_secs(1);
+                assert!(delay >= minimum && delay <= maximum, "delay: {delay:?}");
             } else {
                 assert!(delay.is_zero());
             }

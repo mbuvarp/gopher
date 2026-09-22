@@ -1,5 +1,147 @@
-//! Summarize all CI checks using responses already fetched for reviewer detection.
+//! Summarize CI checks, resolving Actions workflow identity only for ambiguous names.
 use super::*;
+
+#[derive(Clone, Debug)]
+pub(super) struct WorkflowRun {
+    workflow: u64,
+    run: u64,
+    event: String,
+    branch: String,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Scope {
+    Suite(u64),
+    Workflow(u64, String, String),
+    Execution(u64),
+}
+
+struct RankedCheck<'a> {
+    order: (u64, u64),
+    check: &'a Value,
+}
+
+pub(super) fn needs_workflow_identity(checks: &[Value]) -> bool {
+    let mut suites = BTreeMap::new();
+    for check in checks {
+        if check["app"]["slug"] != "github-actions" {
+            continue;
+        }
+        if let (Some(name), Some(suite)) =
+            (check["name"].as_str(), check["check_suite"]["id"].as_u64())
+            && *suites.entry(name).or_insert(suite) != suite
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub(super) async fn workflow_runs(
+    github: &Github,
+    repo: &str,
+    head: &str,
+) -> Result<BTreeMap<u64, WorkflowRun>> {
+    let mut workflows = BTreeMap::new();
+    let mut page = 1;
+    loop {
+        let endpoint =
+            format!("repos/{repo}/actions/runs?head_sha={head}&per_page=100&page={page}");
+        let data = github
+            .execute(&["api", "--hostname", "github.com", &endpoint], None)
+            .await?;
+        let runs = data["workflow_runs"]
+            .as_array()
+            .context("Missing workflow runs")?;
+        for run in runs {
+            if run["head_sha"] != head {
+                continue;
+            }
+            if let (Some(suite), Some(workflow), Some(id), Some(event), Some(branch)) = (
+                run["check_suite_id"].as_u64(),
+                run["workflow_id"].as_u64(),
+                run["id"].as_u64(),
+                run["event"].as_str(),
+                run["head_branch"].as_str(),
+            ) {
+                workflows.insert(
+                    suite,
+                    WorkflowRun {
+                        workflow,
+                        run: id,
+                        event: event.into(),
+                        branch: branch.into(),
+                    },
+                );
+            }
+        }
+        if runs.len() < 100 {
+            return Ok(workflows);
+        }
+        page += 1;
+    }
+}
+
+pub(super) fn check_runs(checks: &[Value], workflows: &BTreeMap<u64, WorkflowRun>) -> CheckState {
+    // Names alone do not establish replacement: independent Actions workflows
+    // often both use `test`. Only verified workflow identity can join suites.
+    let mut latest: BTreeMap<(String, Scope, &str), RankedCheck<'_>> = BTreeMap::new();
+    let mut state = CheckState::Green;
+    for check in checks {
+        // Replacement semantics are specific to GitHub Actions. Other apps
+        // can publish independent checks with identical names in one suite.
+        if check["app"]["slug"] != "github-actions" {
+            state = state.max(check_run(check));
+            continue;
+        }
+        let app = check["app"]["id"]
+            .as_u64()
+            .map(|id| format!("id:{id}"))
+            .or_else(|| {
+                check["app"]["slug"]
+                    .as_str()
+                    .map(|slug| format!("slug:{slug}"))
+            });
+        let (Some(app), Some(name), Some(id), Some(suite)) = (
+            app,
+            check["name"].as_str(),
+            check["id"].as_u64(),
+            check["check_suite"]["id"].as_u64(),
+        ) else {
+            state = state.max(check_run(check));
+            continue;
+        };
+        let workflow = workflows.get(&suite);
+        let (scope, order) = match workflow {
+            Some(run)
+                if matches!(
+                    run.event.as_str(),
+                    "push" | "pull_request" | "pull_request_target"
+                ) =>
+            {
+                (
+                    Scope::Workflow(run.workflow, run.event.clone(), run.branch.clone()),
+                    (run.run, id),
+                )
+            }
+            // Automatic PR/push runs replace earlier results for that context.
+            // Manual and other triggers may have different inputs: only jobs
+            // within the same execution can replace one another there.
+            Some(run) => (Scope::Execution(run.run), (run.run, id)),
+            None => (Scope::Suite(suite), (0, id)),
+        };
+        // A late-created job from an older workflow run cannot replace the new run.
+        let current = latest
+            .entry((app, scope, name))
+            .or_insert(RankedCheck { order, check });
+        if order > current.order {
+            *current = RankedCheck { order, check };
+        }
+    }
+    latest
+        .values()
+        .fold(state, |state, ranked| state.max(check_run(ranked.check)))
+}
 
 pub(super) fn check_run(check: &Value) -> CheckState {
     if check["status"] != "completed" {
@@ -36,6 +178,163 @@ pub(super) fn commit_statuses(statuses: &[Value]) -> CheckState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_actions_checks_with_the_same_name_and_suite_remain_independent() {
+        for app in [
+            json!({"id":2,"slug":"other-ci"}),
+            json!({"id":2}),
+            Value::Null,
+        ] {
+            let mut checks = vec![
+                json!({"id":100,"app":app,"name":"test","status":"completed","conclusion":"failure","check_suite":{"id":10}}),
+                json!({"id":200,"app":app,"name":"test","status":"completed","conclusion":"success","check_suite":{"id":10}}),
+            ];
+            assert_eq!(check_runs(&checks, &BTreeMap::new()), CheckState::Failed);
+            checks.reverse();
+            assert_eq!(check_runs(&checks, &BTreeMap::new()), CheckState::Failed);
+            checks[1]["status"] = json!("in_progress");
+            checks[1]["conclusion"] = Value::Null;
+            assert_eq!(check_runs(&checks, &BTreeMap::new()), CheckState::Running);
+        }
+    }
+
+    #[test]
+    fn independent_executions_stay_blocking_but_automatic_runs_and_reruns_replace() {
+        let checks = vec![
+            json!({"id":100,"app":{"id":1,"slug":"github-actions"},"name":"test","status":"completed","conclusion":"failure","check_suite":{"id":10}}),
+            json!({"id":200,"app":{"id":1,"slug":"github-actions"},"name":"test","status":"completed","conclusion":"success","check_suite":{"id":20}}),
+        ];
+        for event in [
+            "push",
+            "pull_request",
+            "pull_request_target",
+            "workflow_dispatch",
+            "repository_dispatch",
+            "schedule",
+            "workflow_run",
+            "unknown",
+        ] {
+            let old = WorkflowRun {
+                workflow: 1,
+                run: 10,
+                event: event.into(),
+                branch: "feature".into(),
+            };
+            let new = WorkflowRun {
+                run: 20,
+                ..old.clone()
+            };
+            let mut workflows = BTreeMap::from([(10, old), (20, new)]);
+            let expected = if matches!(event, "push" | "pull_request" | "pull_request_target") {
+                CheckState::Green
+            } else {
+                CheckState::Failed
+            };
+            assert_eq!(check_runs(&checks, &workflows), expected, "{event}");
+            workflows.get_mut(&20).unwrap().run = 10;
+            assert_eq!(
+                check_runs(&checks, &workflows),
+                CheckState::Green,
+                "rerun: {event}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_verified_workflow_replacements_can_hide_a_failed_suite() {
+        let checks = vec![
+            json!({"id":300,"app":{"id":1,"slug":"github-actions"},"name":"test","status":"completed","conclusion":"failure","check_suite":{"id":10}}),
+            json!({"id":200,"app":{"id":1,"slug":"github-actions"},"name":"test","status":"completed","conclusion":"success","check_suite":{"id":20}}),
+        ];
+        let old = WorkflowRun {
+            workflow: 1,
+            run: 10,
+            event: "pull_request".into(),
+            branch: "feature".into(),
+        };
+        let new = WorkflowRun {
+            workflow: 1,
+            run: 20,
+            ..old.clone()
+        };
+        assert!(needs_workflow_identity(&checks));
+        assert_eq!(check_runs(&checks, &BTreeMap::new()), CheckState::Failed);
+        let mut workflows = BTreeMap::from([(10, old), (20, new)]);
+        // The old workflow's failed job was created after the newer run's job.
+        assert_eq!(check_runs(&checks, &workflows), CheckState::Green);
+        workflows.get_mut(&20).unwrap().workflow = 2;
+        assert_eq!(check_runs(&checks, &workflows), CheckState::Failed);
+        workflows.get_mut(&20).unwrap().workflow = 1;
+        workflows.get_mut(&20).unwrap().event = "push".into();
+        assert_eq!(check_runs(&checks, &workflows), CheckState::Failed);
+        workflows.get_mut(&20).unwrap().event = "pull_request".into();
+        workflows.get_mut(&20).unwrap().branch = "other".into();
+        assert_eq!(check_runs(&checks, &workflows), CheckState::Failed);
+        workflows.remove(&10);
+        assert_eq!(check_runs(&checks, &workflows), CheckState::Failed);
+        let mut external = checks;
+        for check in &mut external {
+            check["app"]["slug"] = json!("other-ci");
+        }
+        assert!(!needs_workflow_identity(&external));
+        assert_eq!(check_runs(&external, &workflows), CheckState::Failed);
+    }
+
+    #[test]
+    fn superseded_runs_do_not_override_current_results() {
+        let mut checks = vec![
+            json!({"id":1,"app":{"id":1,"slug":"github-actions"},"name":"Redesign required","status":"completed","conclusion":"failure","check_suite":{"id":10}}),
+            json!({"id":2,"app":{"id":1,"slug":"github-actions"},"check_suite":{"id":10},"name":"Repository format","status":"completed","conclusion":"cancelled"}),
+            json!({"id":3,"app":{"id":1,"slug":"github-actions"},"name":"Redesign required","status":"completed","conclusion":"success","check_suite":{"id":20}}),
+            json!({"id":4,"app":{"id":1,"slug":"github-actions"},"check_suite":{"id":20},"name":"Repository format","status":"completed","conclusion":"success"}),
+            json!({"id":5,"app":{"id":1,"slug":"github-actions"},"name":"Admin test","status":"in_progress","conclusion":null}),
+        ];
+        let workflows = BTreeMap::from([
+            (
+                10,
+                WorkflowRun {
+                    workflow: 1,
+                    run: 10,
+                    event: "pull_request".into(),
+                    branch: "feature".into(),
+                },
+            ),
+            (
+                20,
+                WorkflowRun {
+                    workflow: 1,
+                    run: 20,
+                    event: "pull_request".into(),
+                    branch: "feature".into(),
+                },
+            ),
+        ]);
+        assert_eq!(check_runs(&checks, &workflows), CheckState::Running);
+        checks.reverse();
+        assert_eq!(check_runs(&checks, &workflows), CheckState::Running);
+        checks[0]["status"] = json!("completed");
+        checks[0]["conclusion"] = json!("success");
+        assert_eq!(check_runs(&checks, &workflows), CheckState::Green);
+        checks.push(json!({"id":6,"app":{"id":1,"slug":"github-actions"},"name":"Redesign required","status":"completed","conclusion":"failure"}));
+        assert_eq!(check_runs(&checks, &workflows), CheckState::Failed);
+    }
+
+    #[test]
+    fn independent_or_unidentified_failures_remain_blocking() {
+        let successful = json!({"id":3,"app":{"id":1,"slug":"github-actions"},"name":"test","status":"completed","conclusion":"success"});
+        for failed in [
+            json!({"id":1,"app":{"id":2},"name":"test","status":"completed","conclusion":"failure"}),
+            json!({"id":1,"app":{"id":1,"slug":"github-actions"},"name":"other test","status":"completed","conclusion":"cancelled"}),
+            json!({"app":{"id":1,"slug":"github-actions"},"name":"test","status":"completed","conclusion":"failure"}),
+        ] {
+            assert_eq!(
+                check_runs(&[failed, successful.clone()], &BTreeMap::new()),
+                CheckState::Failed
+            );
+        }
+        assert_eq!(check_runs(&[], &BTreeMap::new()), CheckState::Green);
+    }
 
     #[test]
     fn running_and_terminal_check_states() {
