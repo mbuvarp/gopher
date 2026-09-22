@@ -407,6 +407,11 @@ pub fn run(
             Event::UserEvent(AppEvent::Shutdown(reason)) => {
                 exit_reason = reason;
                 shutting_down = true;
+                // These requests never reached UNUserNotificationCenter. Release
+                // their worker slots before shutdown can mark one unconfirmed.
+                for (id, _, _, _) in pending.drain(..) {
+                    let _ = sender.send(Command::NotificationFailed(id));
+                }
                 let _ = sender.send(Command::Shutdown);
                 if worker_stopped { *flow = ControlFlow::Exit; }
             }

@@ -290,6 +290,49 @@ fn shutdown_preserves_an_unconfirmed_service_error_notification() {
 }
 
 #[test]
+fn shutdown_does_not_throttle_a_notification_that_was_never_scheduled() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let worker = worker::start(
+        directory.path().into(),
+        Config {
+            gh_path: Some(directory.path().join("missing-gh")),
+            ..Default::default()
+        },
+        Arc::new(move |event| {
+            let _ = sender.send(event);
+        }),
+    )
+    .unwrap();
+    let notification_id = loop {
+        if let UiEvent::Notify { id, .. } = receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+            break id;
+        }
+    };
+    // The UI drops requests still waiting for notification permission first.
+    worker
+        .sender
+        .send(Command::NotificationFailed(notification_id))
+        .unwrap();
+    worker.sender.send(Command::Shutdown).unwrap();
+    loop {
+        if matches!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            UiEvent::Stopped
+        ) {
+            break;
+        }
+    }
+    drop(worker);
+    let store = gopher::store::Store::open(directory.path()).unwrap();
+    assert!(
+        store
+            .service_error_notification_due(chrono::Utc::now().timestamp(), 3 * 60 * 60)
+            .unwrap()
+    );
+}
+
+#[test]
 fn notification_actions_acknowledge_only_their_update_and_open_waits_for_browser() {
     use gopher::{model::Snapshot, store::Store, worker::transition};
     let directory = tempfile::tempdir().unwrap();
