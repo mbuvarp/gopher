@@ -8,7 +8,7 @@ use std::{
 };
 
 #[test]
-fn missing_cli_notifies_once_and_worker_shuts_down_cleanly() {
+fn service_errors_share_a_notification_cooldown_and_worker_shuts_down_cleanly() {
     let directory = tempfile::tempdir().unwrap();
     let config = Config {
         gh_path: Some(directory.path().join("missing-gh")),
@@ -24,11 +24,13 @@ fn missing_cli_notifies_once_and_worker_shuts_down_cleanly() {
     )
     .unwrap();
     let mut notified = None;
+    let mut notification_id = None;
     let mut saw_refresh = false;
     loop {
         match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
-            UiEvent::Notify { body, .. } => {
+            UiEvent::Notify { id, body, .. } => {
                 assert!(notified.replace(body).is_none());
+                assert!(notification_id.replace(id).is_none());
             }
             UiEvent::Updated { loading: true, .. } => saw_refresh = true,
             UiEvent::Updated {
@@ -45,15 +47,289 @@ fn missing_cli_notifies_once_and_worker_shuts_down_cleanly() {
     }
     worker
         .sender
+        .send(Command::NotificationDelivered(notification_id.unwrap()))
+        .unwrap();
+    loop {
+        if matches!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            UiEvent::Updated { error: Some(_), .. }
+        ) {
+            break;
+        }
+    }
+    worker
+        .sender
         .send(Command::PollComplete(Err(notified.unwrap())))
         .unwrap();
     match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
         UiEvent::Updated { error: Some(_), .. } => (),
         _ => panic!("An unchanged missing-CLI error must not emit another notification"),
     }
+    worker
+        .sender
+        .send(Command::PollComplete(Err(
+            "GitHub request timed out; check connectivity".into(),
+        )))
+        .unwrap();
+    match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+        UiEvent::Updated {
+            error: Some(error), ..
+        } => {
+            assert!(error.contains("timed out"));
+        }
+        _ => panic!("A different service error must respect the same cooldown"),
+    }
     let start = std::time::Instant::now();
     drop(worker);
     assert!(start.elapsed() < Duration::from_secs(2));
+
+    let (sender, receiver) = mpsc::channel();
+    let worker = worker::start(
+        directory.path().into(),
+        Config {
+            gh_path: Some(directory.path().join("missing-gh")),
+            ..Default::default()
+        },
+        Arc::new(move |event| {
+            let _ = sender.send(event);
+        }),
+    )
+    .unwrap();
+    loop {
+        match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+            UiEvent::Updated { error: Some(_), .. } => break,
+            UiEvent::Notify { .. } => panic!("The cooldown must survive a restart"),
+            _ => (),
+        }
+    }
+    drop(worker);
+}
+
+#[test]
+fn service_error_notification_slot_expires_after_three_hours() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = gopher::store::Store::open(directory.path()).unwrap();
+    let interval = 3 * 60 * 60;
+    assert!(
+        store
+            .service_error_notification_due(1_000_000, interval)
+            .unwrap()
+    );
+    store.record_service_error_notification(1_000_000).unwrap();
+    assert!(
+        !store
+            .service_error_notification_due(1_000_000 + interval - 1, interval)
+            .unwrap()
+    );
+    drop(store);
+
+    let store = gopher::store::Store::open(directory.path()).unwrap();
+    assert!(
+        store
+            .service_error_notification_due(1_000_000 + interval, interval)
+            .unwrap()
+    );
+    store
+        .record_service_error_notification(1_000_000 + interval)
+        .unwrap();
+    assert!(
+        !store
+            .service_error_notification_due(1_000_000 + interval + 1, interval)
+            .unwrap()
+    );
+    assert!(
+        store
+            .service_error_notification_due(1_000_000, interval)
+            .unwrap()
+    );
+}
+
+#[test]
+fn failed_service_error_notification_does_not_start_the_cooldown() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let worker = worker::start(
+        directory.path().into(),
+        Config {
+            gh_path: Some(directory.path().join("missing-gh")),
+            ..Default::default()
+        },
+        Arc::new(move |event| {
+            let _ = sender.send(event);
+        }),
+    )
+    .unwrap();
+    let first_id = loop {
+        if let UiEvent::Notify { id, .. } = receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+            break id;
+        }
+    };
+    worker
+        .sender
+        .send(Command::NotificationFailed(first_id))
+        .unwrap();
+    worker
+        .sender
+        .send(Command::PollComplete(
+            Err("GitHub request timed out".into()),
+        ))
+        .unwrap();
+    let retry_id = loop {
+        if let UiEvent::Notify { id, .. } = receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+            break id;
+        }
+    };
+    worker
+        .sender
+        .send(Command::NotificationDelivered(retry_id))
+        .unwrap();
+    worker
+        .sender
+        .send(Command::PollComplete(Err(
+            "GitHub secure connection timed out".into(),
+        )))
+        .unwrap();
+    loop {
+        match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+            UiEvent::Updated {
+                error: Some(error), ..
+            } if error.contains("secure connection") => break,
+            UiEvent::Notify { .. } => panic!("A delivered retry must start the cooldown"),
+            _ => (),
+        }
+    }
+    drop(worker);
+}
+
+#[test]
+fn shutdown_records_a_completed_service_error_notification() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let worker = worker::start(
+        directory.path().into(),
+        Config {
+            gh_path: Some(directory.path().join("missing-gh")),
+            ..Default::default()
+        },
+        Arc::new(move |event| {
+            let _ = sender.send(event);
+        }),
+    )
+    .unwrap();
+    let notification_id = loop {
+        if let UiEvent::Notify { id, .. } = receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+            break id;
+        }
+    };
+    worker.sender.send(Command::Shutdown).unwrap();
+    // The first completion barrier can be queued before the native callback.
+    worker.sender.send(Command::ShutdownComplete).unwrap();
+    worker
+        .sender
+        .send(Command::NotificationDelivered(notification_id))
+        .unwrap();
+    loop {
+        if matches!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            UiEvent::Stopped
+        ) {
+            break;
+        }
+    }
+    drop(worker);
+    let store = gopher::store::Store::open(directory.path()).unwrap();
+    assert!(
+        !store
+            .service_error_notification_due(chrono::Utc::now().timestamp(), 3 * 60 * 60)
+            .unwrap()
+    );
+}
+
+#[test]
+fn shutdown_preserves_an_unconfirmed_service_error_notification() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let worker = worker::start(
+        directory.path().into(),
+        Config {
+            gh_path: Some(directory.path().join("missing-gh")),
+            ..Default::default()
+        },
+        Arc::new(move |event| {
+            let _ = sender.send(event);
+        }),
+    )
+    .unwrap();
+    loop {
+        if matches!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            UiEvent::Notify { .. }
+        ) {
+            break;
+        }
+    }
+    worker.sender.send(Command::Shutdown).unwrap();
+    loop {
+        if matches!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            UiEvent::Stopped
+        ) {
+            break;
+        }
+    }
+    drop(worker);
+    let store = gopher::store::Store::open(directory.path()).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let interval = 3 * 60 * 60;
+    assert!(!store.service_error_notification_due(now, interval).unwrap());
+    assert!(
+        store
+            .service_error_notification_due(now + interval, interval)
+            .unwrap()
+    );
+}
+
+#[test]
+fn shutdown_does_not_throttle_a_late_unscheduled_notification() {
+    let directory = tempfile::tempdir().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let worker = worker::start(
+        directory.path().into(),
+        Config {
+            gh_path: Some(directory.path().join("missing-gh")),
+            ..Default::default()
+        },
+        Arc::new(move |event| {
+            let _ = sender.send(event);
+        }),
+    )
+    .unwrap();
+    let notification_id = loop {
+        if let UiEvent::Notify { id, .. } = receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+            break id;
+        }
+    };
+    // A notification event already queued for the UI can arrive after shutdown.
+    worker.sender.send(Command::Shutdown).unwrap();
+    worker
+        .sender
+        .send(Command::NotificationFailed(notification_id))
+        .unwrap();
+    loop {
+        if matches!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            UiEvent::Stopped
+        ) {
+            break;
+        }
+    }
+    drop(worker);
+    let store = gopher::store::Store::open(directory.path()).unwrap();
+    assert!(
+        store
+            .service_error_notification_due(chrono::Utc::now().timestamp(), 3 * 60 * 60)
+            .unwrap()
+    );
 }
 
 #[test]

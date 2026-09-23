@@ -407,6 +407,9 @@ pub fn run(
             Event::UserEvent(AppEvent::Shutdown(reason)) => {
                 exit_reason = reason;
                 shutting_down = true;
+                // These requests never reached UNUserNotificationCenter. Release
+                // their worker slots before shutdown can mark one unconfirmed.
+                fail_pending_notifications(&mut pending, &sender);
                 let _ = sender.send(Command::Shutdown);
                 if worker_stopped { *flow = ControlFlow::Exit; }
             }
@@ -424,7 +427,7 @@ pub fn run(
                 tracing::info!(event="notification_permission",granted);
                 if granted { for (id,title,body,review) in pending.drain(..) {
                     if let Some(center)=&center {notify(center,id,title,body,review,sender.clone(),proxy.clone());}
-                }} else {for (id,_,_,_) in pending.drain(..){let _=sender.send(Command::NotificationFailed(id));}}
+                }} else {fail_pending_notifications(&mut pending,&sender);}
                 rebuild=true;
             }
             Event::UserEvent(AppEvent::NotificationError(message)) => {ui_error=Some(message);rebuild=true;}
@@ -456,7 +459,8 @@ pub fn run(
                     }
                 }
                 UiEvent::Notify{id,title,body,review}=>{
-                    if permission==Some(true) {
+                    if shutting_down {let _=sender.send(Command::NotificationFailed(id));}
+                    else if permission==Some(true) {
                         if let Some(center)=&center {notify(center,id,title,body,review,sender.clone(),proxy.clone());}
                     } else if permission.is_none() && bundled {pending.push((id,title,body,review));}
                     else {let _=sender.send(Command::NotificationFailed(id));}
@@ -543,6 +547,7 @@ pub fn run(
                             Action::Quit=>{
                                 exit_reason="quit";
                                 if let Err(error)=log.diagnostic("INFO",serde_json::json!({"event":"shutdown_requested","reason":"quit","pid":std::process::id()})) {eprintln!("Gopher could not log quit: {error}");}
+                                fail_pending_notifications(&mut pending,&sender);
                                 shutting_down=true;let _=sender.send(Command::Shutdown);if worker_stopped {*flow=ControlFlow::Exit;}
                             }
                         }
@@ -599,12 +604,22 @@ pub fn run(
                 tracing::debug!(event="menu_updated",prs=prs.len(),updates=attention.len(),state=?state);
             }
     });
+    fail_pending_notifications(&mut pending, &sender);
     let _ = sender.send(Command::Shutdown);
     drop(menu_observer);
     drop(delegate);
     match startup_error {
         Some(error) => Err(error),
         None => Ok(exit_reason),
+    }
+}
+
+fn fail_pending_notifications(
+    pending: &mut Vec<(String, String, String, bool)>,
+    sender: &UnboundedSender<Command>,
+) {
+    for (id, _, _, _) in pending.drain(..) {
+        let _ = sender.send(Command::NotificationFailed(id));
     }
 }
 
