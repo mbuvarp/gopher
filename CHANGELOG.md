@@ -6,6 +6,10 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-23
+
+- Limit GitHub service-error notifications to one every three hours, including after restarting Gopher, while keeping the current error visible in the app.
+
 ## [0.3.1] - 2026-09-22
 
 - Fix incorrect “Checks failed” status when newer automatic GitHub Actions runs replace older failed or cancelled checks.
