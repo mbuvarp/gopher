@@ -6,6 +6,11 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-24
+
+- Show draft pull requests with a pencil icon in the inbox and menu, without letting their review state change the menu bar status. When a draft becomes ready, surface its actionable review result as a new update.
+- Save label changes when leaving the picker, and show progress or failures on the PR row. Failed changes remain available to retry.
+
 ## [0.3.2] - 2026-09-23
 
 - Limit GitHub service-error notifications to one every three hours, including after restarting Gopher, while keeping the current error visible in the app.
