@@ -1,6 +1,6 @@
 //! Native, persistent review inbox. Controls retain their identity across polls;
 //! actions capture the update displayed at activation, before entering the actor.
-use super::{Action, AppEvent, pr_status_symbol, repo_heading, repo_parts};
+use super::{Action, AppEvent, pr_status_image, repo_heading, repo_parts};
 use crate::model::{CheckState, PullRequest, State};
 use crate::{
     actions::{ActionState, Request, Setting},
@@ -399,11 +399,7 @@ impl Row {
         } else {
             format!("{}\nClick to acknowledge this update", pr.snapshot.title)
         })));
-        let (symbol, description) = pr_status_symbol(state, pr.snapshot.draft);
-        if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &NSString::from_str(symbol),
-            Some(&NSString::from_str(description)),
-        ) {
+        if let Some(image) = pr_status_image(state, pr.snapshot.draft) {
             // Symbol glyph size is controlled by its configuration, not NSImage.size.
             let configuration =
                 NSImageSymbolConfiguration::configurationWithPointSize_weight(36.0, unsafe {

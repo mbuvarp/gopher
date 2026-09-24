@@ -194,6 +194,9 @@ pub struct PullRequest {
     /// review, so the same evidence creates a new update across polls and restarts.
     #[serde(default)]
     pub ready_generation: u64,
+    /// An observed draft-to-ready transition awaiting an actionable result.
+    #[serde(default)]
+    pub ready_pending: bool,
 }
 impl PullRequest {
     /// Identity-only data must never be treated as current review evidence.
@@ -212,6 +215,7 @@ impl PullRequest {
             candidate_since: 0,
             reviewing_since: None,
             ready_generation: 0,
+            ready_pending: false,
         }
     }
     pub fn needs_attention(&self) -> bool {
