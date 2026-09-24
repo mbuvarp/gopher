@@ -82,6 +82,10 @@ async fn shutdown_finishes_submitted_label_but_cancels_the_queue() {
             selected: true,
         });
     }
+    h.request(Request::SaveLabels {
+        pr: "PR_1".into(),
+        name: None,
+    });
     while !h.coordinator.has_submissions() {
         h.step().await;
     }
@@ -116,6 +120,10 @@ async fn shutdown_reports_submitted_label_after_account_invalidation() {
         pr: "PR_1".into(),
         name: "one".into(),
         selected: true,
+    });
+    h.request(Request::SaveLabels {
+        pr: "PR_1".into(),
+        name: None,
     });
     while !h.coordinator.has_submissions() {
         h.step().await;
@@ -439,6 +447,12 @@ async fn label_toggles_are_queued_and_results_only_change_the_requested_label() 
         name: "second".into(),
         selected: false,
     });
+    assert_eq!(h.coordinator.state.labels["PR_1"].unsaved.len(), 2);
+    assert!(!h.directory.path().join("labels.log").exists());
+    h.request(Request::SaveLabels {
+        pr: "PR_1".into(),
+        name: None,
+    });
     assert_eq!(h.coordinator.state.labels["PR_1"].pending.len(), 2);
     while !h.coordinator.state.labels["PR_1"].pending.is_empty() {
         h.step().await;
@@ -454,7 +468,101 @@ async fn label_toggles_are_queued_and_results_only_change_the_requested_label() 
 }
 
 #[tokio::test]
-async fn disabling_labels_reverts_queued_toggles_without_sending_mutations() {
+async fn toggling_a_label_back_clears_the_draft_without_a_mutation() {
+    let mut h = Harness::new();
+    h.coordinator.state.labels.insert(
+        "PR_1".into(),
+        Labels {
+            items: vec![Label {
+                name: "one".into(),
+                color: "ff0000".into(),
+                selected: false,
+            }],
+            ..Default::default()
+        },
+    );
+    for selected in [true, false] {
+        h.request(Request::Label {
+            pr: "PR_1".into(),
+            name: "one".into(),
+            selected,
+        });
+    }
+    assert!(h.coordinator.state.labels["PR_1"].unsaved.is_empty());
+    h.request(Request::SaveLabels {
+        pr: "PR_1".into(),
+        name: None,
+    });
+    assert!(h.coordinator.state.labels["PR_1"].pending.is_empty());
+    assert!(!h.directory.path().join("labels.log").exists());
+}
+
+#[tokio::test]
+async fn saving_one_draft_leaves_other_drafts_unsaved() {
+    let mut h = Harness::new();
+    h.coordinator.state.labels.insert(
+        "PR_1".into(),
+        Labels {
+            items: ["one", "two"]
+                .into_iter()
+                .map(|name| Label {
+                    name: name.into(),
+                    color: "ff0000".into(),
+                    selected: false,
+                })
+                .collect(),
+            ..Default::default()
+        },
+    );
+    for name in ["one", "two"] {
+        h.request(Request::Label {
+            pr: "PR_1".into(),
+            name: name.into(),
+            selected: true,
+        });
+    }
+    h.request(Request::SaveLabels {
+        pr: "PR_1".into(),
+        name: Some("one".into()),
+    });
+    assert!(h.coordinator.state.labels["PR_1"].pending.contains("one"));
+    assert!(h.coordinator.state.labels["PR_1"].unsaved.contains("two"));
+    while !h.coordinator.state.labels["PR_1"].pending.is_empty() {
+        h.step().await;
+    }
+    assert!(h.coordinator.state.labels["PR_1"].unsaved.contains("two"));
+    let calls = std::fs::read_to_string(h.directory.path().join("labels.log")).unwrap();
+    assert_eq!(calls.lines().count(), 1);
+}
+
+#[tokio::test]
+async fn draft_survives_refresh_and_clears_when_remote_selection_matches() {
+    let mut h = Harness::new();
+    h.coordinator
+        .catalogues
+        .insert("owner/repo".into(), catalogue(&["one"]));
+    h.sync_labels();
+    h.request(Request::Label {
+        pr: "PR_1".into(),
+        name: "one".into(),
+        selected: true,
+    });
+    h.sync_labels();
+    let labels = &h.coordinator.state.labels["PR_1"];
+    assert!(labels.items[0].selected);
+    assert!(labels.unsaved.contains("one"));
+    h.prs.get_mut("PR_1").unwrap().snapshot.labels = catalogue(&["one"]).labels;
+    h.sync_labels();
+    assert!(h.coordinator.state.labels["PR_1"].unsaved.is_empty());
+    h.request(Request::SaveLabels {
+        pr: "PR_1".into(),
+        name: None,
+    });
+    assert!(!h.directory.path().join("labels.log").exists());
+}
+
+#[tokio::test]
+async fn disabling_labels_keeps_failed_changes_for_retry_without_sending_mutations() {
     let mut h = Harness::new();
     h.coordinator.state.labels.insert(
         "PR_1".into(),
@@ -472,14 +580,19 @@ async fn disabling_labels_reverts_queued_toggles_without_sending_mutations() {
         name: "one".into(),
         selected: true,
     });
+    h.request(Request::SaveLabels {
+        pr: "PR_1".into(),
+        name: None,
+    });
     h.request(Request::Configure {
         repo: "owner/repo".into(),
         change: Setting::Enabled(Kind::Label, false),
     });
     h.step().await;
     let labels = &h.coordinator.state.labels["PR_1"];
-    assert!(!labels.items[0].selected);
+    assert!(labels.items[0].selected);
     assert!(labels.pending.is_empty());
+    assert!(labels.unsaved.contains("one"));
     assert!(labels.error.is_some());
     assert!(!h.directory.path().join("labels.log").exists());
 }
@@ -625,6 +738,10 @@ echo"#,
             name: "one".into(),
             selected: true,
         });
+        h.request(Request::SaveLabels {
+            pr: "PR_1".into(),
+            name: None,
+        });
         tokio::time::timeout(Duration::from_secs(8), async {
             while !h.directory.path().join("auth-started").exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -732,7 +849,7 @@ async fn label_receipt_follows_pending_or_rejected_action_state() {
             panic!("Receipt must follow action state");
         };
         if accepted {
-            assert!(state.labels["PR_1"].pending.contains("one"));
+            assert!(state.labels["PR_1"].unsaved.contains("one"));
         } else {
             assert!(state.error.is_some());
         }
@@ -914,7 +1031,10 @@ fn catalogue_errors_keep_cached_labels_and_do_not_hide_mutation_errors() {
         .catalogues
         .insert("owner/repo".into(), catalogue(&["bug"]));
     h.sync_labels();
-    h.coordinator.state.labels.get_mut("PR_1").unwrap().error = Some("Mutation failed".into());
+    let labels = h.coordinator.state.labels.get_mut("PR_1").unwrap();
+    labels.items[0].selected = true;
+    labels.unsaved.insert("bug".into());
+    labels.error = Some("Mutation failed".into());
     h.coordinator.loads.insert("owner/repo".into(), 1);
     h.handle(ActionCommand::LabelsLoaded {
         repo: "owner/repo".into(),
@@ -934,6 +1054,32 @@ fn catalogue_errors_keep_cached_labels_and_do_not_hide_mutation_errors() {
     assert_eq!(labels.items.len(), 2);
     assert!(labels.catalogue_error.is_none());
     assert_eq!(labels.error.as_deref(), Some("Mutation failed"));
+}
+
+#[test]
+fn resolved_label_error_clears_when_the_last_pending_job_finishes() {
+    let mut h = Harness::new();
+    h.coordinator
+        .catalogues
+        .insert("owner/repo".into(), catalogue(&["bug"]));
+    h.sync_labels();
+    let labels = h.coordinator.state.labels.get_mut("PR_1").unwrap();
+    labels.pending.insert("other".into());
+    labels.error = Some("Mutation failed".into());
+    h.sync_labels();
+    assert_eq!(
+        h.coordinator.state.labels["PR_1"].error.as_deref(),
+        Some("Mutation failed")
+    );
+    h.coordinator
+        .state
+        .labels
+        .get_mut("PR_1")
+        .unwrap()
+        .pending
+        .clear();
+    h.sync_labels();
+    assert!(h.coordinator.state.labels["PR_1"].error.is_none());
 }
 
 #[test]

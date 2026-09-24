@@ -53,6 +53,7 @@ impl Coordinator {
             // Pending mutations survive catalogue and PR snapshot refreshes.
             for previous in &labels.items {
                 if labels.pending.contains(&previous.name)
+                    || labels.unsaved.contains(&previous.name)
                     || self
                         .completed_labels
                         .contains_key(&(id.clone(), previous.name.clone()))
@@ -61,7 +62,7 @@ impl Coordinator {
                 }
             }
             for label in items.values_mut() {
-                if !labels.pending.contains(&label.name) {
+                if !labels.pending.contains(&label.name) && !labels.unsaved.contains(&label.name) {
                     label.selected = self
                         .completed_labels
                         .get(&(id.clone(), label.name.clone()))
@@ -71,6 +72,25 @@ impl Coordinator {
             }
             labels.items = items.into_values().collect();
             labels.items.sort_by_cached_key(|l| l.name.to_lowercase());
+            labels.unsaved.retain(|name| {
+                labels
+                    .items
+                    .iter()
+                    .find(|label| &label.name == name)
+                    .is_some_and(|label| {
+                        let applied = self
+                            .completed_labels
+                            .get(&(id.clone(), name.clone()))
+                            .copied()
+                            .unwrap_or_else(|| {
+                                pr.snapshot.labels.iter().any(|saved| &saved.name == name)
+                            });
+                        label.selected != applied
+                    })
+            });
+            if labels.unsaved.is_empty() && labels.pending.is_empty() {
+                labels.error = None;
+            }
             labels.loading = self.loads.contains_key(&repo);
             labels.catalogue_ready = catalogue.is_some();
             labels.catalogue_error = self.load_errors.get(&repo).cloned();

@@ -151,6 +151,10 @@ pub enum Request {
         name: String,
         selected: bool,
     },
+    SaveLabels {
+        pr: String,
+        name: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,6 +170,7 @@ pub struct Labels {
     pub catalogue_ready: bool,
     pub catalogue_error: Option<String>,
     pub pending: BTreeSet<String>,
+    pub unsaved: BTreeSet<String>,
     pub error: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]

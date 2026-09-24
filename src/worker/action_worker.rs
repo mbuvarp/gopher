@@ -103,7 +103,6 @@ struct LabelJob {
     intent: Intent,
     name: String,
     selected: bool,
-    previous: bool,
     color: String,
 }
 
@@ -264,11 +263,20 @@ impl Coordinator {
             return;
         }
         let label_request = matches!(&command, ActionCommand::Request(Request::Label { .. }));
+        let save_pr = match &command {
+            ActionCommand::Request(Request::SaveLabels { pr, .. }) => Some(pr.clone()),
+            _ => None,
+        };
         match command {
             ActionCommand::Request(request) => {
                 if let Err(error) = self.request(request, context) {
                     tracing::warn!(event="pr_action_rejected", error=%error);
                     self.state.error = Some(error.to_string());
+                    if let Some(pr) = &save_pr
+                        && let Some(labels) = self.state.labels.get_mut(pr)
+                    {
+                        labels.error = Some(error.to_string());
+                    }
                 }
             }
             ActionCommand::Tick {
@@ -502,7 +510,7 @@ impl Coordinator {
                 self.refresh_catalogues(context, Some(&intent.pr.snapshot.repo));
             }
             Request::Label { pr, name, selected } => {
-                let intent = self.intent(&pr, Kind::Label, context)?;
+                self.intent(&pr, Kind::Label, context)?;
                 let labels = self
                     .state
                     .labels
@@ -517,24 +525,68 @@ impl Coordinator {
                     .iter_mut()
                     .find(|label| label.name == name)
                     .context("Label no longer exists")?;
-                let color = label.color.clone();
-                let previous = label.selected;
-                if previous == selected {
+                if label.selected == selected {
                     return Ok(());
                 }
                 label.selected = selected;
-                labels.pending.insert(name.clone());
-                labels.error = None;
-                let jobs = self.label_jobs.entry(pr.clone()).or_default();
-                jobs.push_back(LabelJob {
-                    intent,
-                    name,
-                    selected,
-                    previous,
-                    color,
-                });
-                if jobs.len() == 1 {
-                    self.start_label(&pr, context);
+                let applied = self
+                    .completed_labels
+                    .get(&(pr.clone(), name.clone()))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        context.prs[&pr]
+                            .snapshot
+                            .labels
+                            .iter()
+                            .any(|label| label.name == name)
+                    });
+                if selected == applied {
+                    labels.unsaved.remove(&name);
+                } else {
+                    labels.unsaved.insert(name);
+                }
+                if labels.unsaved.is_empty() {
+                    labels.error = None;
+                }
+            }
+            Request::SaveLabels { pr, name } => {
+                let names: Vec<String> = {
+                    let labels = self
+                        .state
+                        .labels
+                        .get(&pr)
+                        .context("Load the PR labels first")?;
+                    match name {
+                        Some(name) if labels.unsaved.contains(&name) => vec![name],
+                        Some(_) => Vec::new(),
+                        None => labels.unsaved.iter().cloned().collect(),
+                    }
+                };
+                for name in names {
+                    let intent = self.intent(&pr, Kind::Label, context)?;
+                    let labels = self.state.labels.get_mut(&pr).unwrap();
+                    let label = labels
+                        .items
+                        .iter()
+                        .find(|item| item.name == name)
+                        .context("Label no longer exists")?;
+                    let selected = label.selected;
+                    let color = label.color.clone();
+                    labels.unsaved.remove(&name);
+                    labels.pending.insert(name.clone());
+                    if labels.unsaved.is_empty() {
+                        labels.error = None;
+                    }
+                    let jobs = self.label_jobs.entry(pr.clone()).or_default();
+                    jobs.push_back(LabelJob {
+                        intent,
+                        name,
+                        selected,
+                        color,
+                    });
+                    if jobs.len() == 1 {
+                        self.start_label(&pr, context);
+                    }
                 }
             }
         }
@@ -676,11 +728,7 @@ impl Coordinator {
             if let Some(labels) = self.state.labels.get_mut(pr) {
                 labels.pending.remove(&job.name);
                 if let Err(error) = result {
-                    if let Some(label) =
-                        labels.items.iter_mut().find(|label| label.name == job.name)
-                    {
-                        label.selected = job.previous;
-                    }
+                    labels.unsaved.insert(job.name.clone());
                     labels.error = Some(error);
                 } else {
                     self.completed_labels

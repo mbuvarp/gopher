@@ -394,9 +394,10 @@ impl ConfigEditor {
 struct LabelRow {
     checkbox: Retained<NSButton>,
     dot: Retained<NSImageView>,
+    unsaved: Retained<NSButton>,
 }
 pub(super) struct LabelPicker {
-    id: String,
+    pub(super) id: String,
     title: String,
     view: Retained<FlippedView>,
     message: Retained<NSTextField>,
@@ -407,7 +408,7 @@ impl LabelPicker {
     fn new(pr: &PullRequest, target: &ActionTarget) -> Self {
         let mtm = MainThreadMarker::new().unwrap();
         let view = FlippedView::new(rect(0.0, 0.0, WIDTH, HEIGHT - 82.0), mtm);
-        let message = label("Toggle labels to add or remove them.", 12.0, true, mtm);
+        let message = label("Choose labels. Back saves your changes.", 12.0, true, mtm);
         view.addSubview(&message);
         let refresh = target.button(
             "Refresh labels",
@@ -449,7 +450,7 @@ impl LabelPicker {
         } else if labels.items.is_empty() {
             "This repository has no labels."
         } else {
-            "Toggle labels to add or remove them."
+            "Choose labels. Back saves your changes."
         };
         set_text(&self.message, text);
         let height = self
@@ -469,7 +470,8 @@ impl LabelPicker {
             } else {
                 row.checkbox.removeFromSuperview();
                 row.dot.removeFromSuperview();
-                forget([row.checkbox.tag()], target);
+                row.unsaved.removeFromSuperview();
+                forget([row.checkbox.tag(), row.unsaved.tag()], target);
                 false
             }
         });
@@ -490,6 +492,17 @@ impl LabelPicker {
                 checkbox.setToolTip(Some(&NSString::from_str(&item.name)));
                 let dot =
                     NSImageView::initWithFrame(NSImageView::alloc(mtm), rect(0.0, 0.0, 12.0, 12.0));
+                let unsaved = target.button(
+                    "Unsaved",
+                    AppEvent::PrAction(Request::SaveLabels {
+                        pr: self.id.clone(),
+                        name: Some(item.name.clone()),
+                    }),
+                    mtm,
+                );
+                unsaved.setBordered(false);
+                unsaved.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+                unsaved.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
                 if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
                     &NSString::from_str("circle.fill"),
                     None,
@@ -499,11 +512,20 @@ impl LabelPicker {
                 }
                 self.view.addSubview(&checkbox);
                 self.view.addSubview(&dot);
-                LabelRow { checkbox, dot }
+                self.view.addSubview(&unsaved);
+                LabelRow {
+                    checkbox,
+                    dot,
+                    unsaved,
+                }
             });
-            row.checkbox.setFrame(rect(44.0, y, WIDTH - 64.0, 28.0));
+            row.checkbox.setFrame(rect(44.0, y, WIDTH - 144.0, 28.0));
             row.dot.setFrame(rect(23.0, y + 8.0, 12.0, 12.0));
             row.dot.setContentTintColor(Some(&label_color(&item.color)));
+            row.unsaved.setFrame(rect(WIDTH - 100.0, y, 80.0, 28.0));
+            row.unsaved.setHidden(!labels.unsaved.contains(&item.name));
+            row.unsaved
+                .setEnabled(allowed && !labels.pending.contains(&item.name));
             row.checkbox.setState(if item.selected {
                 NSControlStateValueOn
             } else {
@@ -582,7 +604,7 @@ impl DetailPanel {
     pub fn subtitle(&self) -> &'static str {
         match self {
             Self::Configuration(_) => "Changes save automatically for this repository.",
-            Self::Labels(_) => "Changes apply to this pull request.",
+            Self::Labels(_) => "Changes save when you go back.",
             Self::Settings(_) => "Customize Gopher’s keyboard shortcuts and updates.",
         }
     }
@@ -599,7 +621,13 @@ impl DetailPanel {
             Self::Settings(editor) => editor.remove(target),
             Self::Labels(picker) => {
                 forget([picker.refresh.tag()], target);
-                forget(picker.rows.values().map(|row| row.checkbox.tag()), target);
+                forget(
+                    picker
+                        .rows
+                        .values()
+                        .flat_map(|row| [row.checkbox.tag(), row.unsaved.tag()]),
+                    target,
+                );
             }
         }
     }
