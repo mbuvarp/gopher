@@ -416,6 +416,42 @@ fn title_change_does_not_reset_acknowledgement() {
     s.title = "New title".into();
     assert!(!transition(s, Some(&first), None, 130, 0).needs_attention());
 }
+
+#[test]
+fn draft_to_ready_creates_a_durable_actionable_update() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let mut s = snapshot();
+    s.draft = true;
+    s.reviews.push(review(Agent::Cubic, "0 issues found"));
+    let mut draft = transition(s.clone(), None, None, 100, 0);
+    assert_eq!(draft.state, State::Approved);
+    draft.acknowledged = Some(draft.update_id.clone());
+
+    s.draft = false;
+    let ready = transition(s.clone(), Some(&draft), None, 130, 0);
+    assert_eq!(ready.ready_generation, 1);
+    assert_ne!(ready.update_id, draft.update_id);
+    assert!(ready.needs_attention());
+    assert_eq!(
+        transition(s.clone(), Some(&ready), None, 160, 0).update_id,
+        ready.update_id
+    );
+
+    store.save(&ready).unwrap();
+    let restored = store.load().unwrap().remove(0);
+    assert_eq!(restored.ready_generation, 1);
+    let notice = store.notification(&ready).unwrap().unwrap();
+    assert!(store.notification_target(&notice).unwrap().is_some());
+
+    s.draft = true;
+    let again_draft = transition(s.clone(), Some(&restored), None, 190, 0);
+    assert_eq!(again_draft.update_id, ready.update_id);
+    s.draft = false;
+    let again_ready = transition(s, Some(&again_draft), None, 220, 0);
+    assert_eq!(again_ready.ready_generation, 2);
+    assert_ne!(again_ready.update_id, ready.update_id);
+}
 #[test]
 fn labels_persist_without_resetting_acknowledgement_and_legacy_cache_still_loads() {
     let mut snapshot = snapshot();

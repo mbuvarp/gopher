@@ -842,7 +842,17 @@ pub fn transition(
     } else {
         raw
     };
-    let update_id = fingerprint(&snapshot, &agents, state);
+    let ready_generation = previous.map_or(0, |pr| {
+        pr.ready_generation.saturating_add(u64::from(
+            pr.snapshot.draft && !snapshot.draft && state.actionable(),
+        ))
+    });
+    let review_id = fingerprint(&snapshot, &agents, state);
+    let update_id = if ready_generation == 0 {
+        review_id
+    } else {
+        hash(format!("{review_id}:ready:{ready_generation}"))
+    };
     let head_since = previous
         .filter(|p| p.snapshot.head == snapshot.head)
         .map_or(now, |p| p.head_since);
@@ -865,6 +875,7 @@ pub fn transition(
         candidate_id,
         candidate_since,
         reviewing_since,
+        ready_generation,
     }
 }
 

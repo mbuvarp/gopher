@@ -190,6 +190,10 @@ pub struct PullRequest {
     /// Local observation time for the current continuous Reviewing state.
     #[serde(default)]
     pub reviewing_since: Option<i64>,
+    /// Increments when an observed draft PR becomes ready with an actionable
+    /// review, so the same evidence creates a new update across polls and restarts.
+    #[serde(default)]
+    pub ready_generation: u64,
 }
 impl PullRequest {
     /// Identity-only data must never be treated as current review evidence.
@@ -207,6 +211,7 @@ impl PullRequest {
             candidate_id: String::new(),
             candidate_since: 0,
             reviewing_since: None,
+            ready_generation: 0,
         }
     }
     pub fn needs_attention(&self) -> bool {
