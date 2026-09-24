@@ -435,7 +435,7 @@ pub fn run(
                 UiEvent::Stopped => unreachable!(),
                 UiEvent::HotkeysLoaded {preferences,error}=>{keyboard.load(preferences,error);rebuild=true;}
                 UiEvent::HotkeysSaved(result)=>{keyboard.saved(result);rebuild=true;}
-                UiEvent::ActionsChanged(state)=>{popover.action_state=state;rebuild=true;}
+                UiEvent::ActionsChanged(state)=>{popover.actions_changed(state);rebuild=true;}
                 UiEvent::LabelRequestHandled=>{popover.label_request_handled();rebuild=true;}
                 UiEvent::IgnoredUpdated{prs:updated,error,loading}=>{ignored_prs=updated;ignored_error=error;ignored_loading=loading;rebuild=true;}
                 UiEvent::Updated{prs:updated,error,loading}=>{prs=updated;service_error=error;refreshing=loading;rebuild=true;}

@@ -8,10 +8,17 @@ struct Pill {
 #[derive(Default)]
 pub(super) struct LabelPills {
     pills: RefCell<Vec<Pill>>,
+    message: RefCell<Option<Retained<NSTextField>>>,
 }
 impl LabelPills {
     /// Return the extra height needed when the metadata line wraps.
-    pub fn update(&self, view: &NSView, status: &NSTextField, labels: &[PrLabel]) -> f64 {
+    pub fn update(
+        &self,
+        view: &NSView,
+        status: &NSTextField,
+        labels: &[PrLabel],
+        message: Option<&str>,
+    ) -> f64 {
         let mtm = MainThreadMarker::new().unwrap();
         let mut pills = self.pills.borrow_mut();
         while pills.len() > labels.len() {
@@ -21,13 +28,44 @@ impl LabelPills {
         }
         let start = 49.0;
         let right = CONTENT_WIDTH - 4.0;
+        // Keep the short progress message beside the check summary. The
+        // ordinary label pills may still wrap when they need more room.
+        let progress_width = if message == Some("Updating labels…") {
+            112.0
+        } else {
+            0.0
+        };
         let status_width = status
             .sizeThatFits(NSSize::new(10000.0, 18.0))
             .width
-            .min(right - start);
+            .min(right - start - progress_width);
         status.setFrame(rect(start, 34.0, status_width, 18.0));
         let mut x = start + status_width + 6.0;
         let mut y = 34.0;
+        if let Some(text) = message {
+            if progress_width == 0.0 && right - x < 200.0 {
+                x = start;
+                y += 22.0;
+            }
+            let mut field = self.message.borrow_mut();
+            let field = field.get_or_insert_with(|| {
+                let field = super::label("", 11.0, true, mtm);
+                field.setMaximumNumberOfLines(1);
+                field.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                view.addSubview(&field);
+                field
+            });
+            set_text(field, text);
+            field.setFrame(rect(x, y, right - x, 18.0));
+            field.setHidden(false);
+            for pill in pills.iter() {
+                pill.background.setHidden(true);
+                pill.text.setHidden(true);
+            }
+            return y - 34.0;
+        } else if let Some(field) = self.message.borrow().as_ref() {
+            field.setHidden(true);
+        }
         for (index, label) in labels.iter().enumerate() {
             if index == pills.len() {
                 let background = NSBox::initWithFrame(NSBox::alloc(mtm), rect(0.0, 0.0, 1.0, 18.0));
@@ -44,6 +82,8 @@ impl LabelPills {
                 pills.push(Pill { background, text });
             }
             let pill = &pills[index];
+            pill.background.setHidden(false);
+            pill.text.setHidden(false);
             set_text(&pill.text, &label.name);
             let width = (pill.text.sizeThatFits(NSSize::new(10000.0, 18.0)).width + 8.0)
                 .ceil()

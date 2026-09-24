@@ -378,6 +378,7 @@ impl Row {
         ignored: bool,
         target: &ActionTarget,
         action_state: &ActionState,
+        saving_labels: bool,
     ) -> f64 {
         let state = if pr.stale && !ignored {
             State::Unknown
@@ -431,9 +432,27 @@ impl Row {
                 pr.snapshot.check_state
             },
         );
-        let label_height = self
-            .labels
-            .update(&self.view, &self.status, &pr.snapshot.labels);
+        let label_height = self.labels.update(
+            &self.view,
+            &self.status,
+            &pr.snapshot.labels,
+            if saving_labels
+                || action_state
+                    .labels
+                    .get(&pr.snapshot.id)
+                    .is_some_and(|labels| !labels.pending.is_empty())
+            {
+                Some("Updating labels…")
+            } else if action_state
+                .labels
+                .get(&pr.snapshot.id)
+                .is_some_and(|labels| labels.error.is_some())
+            {
+                Some("Label update failed · open Labels to retry")
+            } else {
+                None
+            },
+        );
         for button in [
             &*self.open as &NSView,
             &*self.disclosure,
@@ -561,6 +580,7 @@ pub(super) struct ReviewPopover {
     expanded: [HashSet<String>; 2],
     detail: Option<DetailPanel>,
     pub(super) action_state: ActionState,
+    saving_labels: HashSet<String>,
     target: Retained<ActionTarget>,
 }
 impl ReviewPopover {
@@ -695,6 +715,7 @@ impl ReviewPopover {
             target,
             detail: None,
             action_state: ActionState::default(),
+            saving_labels: HashSet::new(),
         }
     }
     pub(super) fn toggle(&mut self, tray: &TrayIcon) {
@@ -902,6 +923,14 @@ impl ReviewPopover {
         let pending = &self.target.ivars().pending_label_requests;
         pending.set(pending.get().saturating_sub(1));
     }
+    pub(super) fn actions_changed(&mut self, state: ActionState) {
+        self.saving_labels.retain(|id| {
+            state.labels.get(id).is_some_and(|labels| {
+                labels.pending.is_empty() && !labels.unsaved.is_empty() && labels.error.is_none()
+            })
+        });
+        self.action_state = state;
+    }
     fn labels_saving(&self) -> bool {
         self.target.ivars().pending_label_requests.get() > 0
             || self
@@ -910,10 +939,20 @@ impl ReviewPopover {
                 .is_some_and(|detail| detail.labels_saving(&self.action_state))
     }
     pub(super) fn back(&mut self) {
-        if self.labels_saving() || self.keyboard_state.pending {
+        if self.keyboard_state.pending {
             return;
         }
         if let Some(detail) = self.detail.take() {
+            if let DetailPanel::Labels(picker) = &detail {
+                self.saving_labels.insert(picker.id.clone());
+                let _ = super::dispatch_pr_action(
+                    Request::SaveLabels {
+                        pr: picker.id.clone(),
+                        name: None,
+                    },
+                    &self.target.ivars().sender,
+                );
+            }
             detail.remove(&self.target);
             self.scroll.setDocumentView(Some(&self.document));
             self.restore_scroll = true;
@@ -924,7 +963,6 @@ impl ReviewPopover {
     pub(super) fn escape(&mut self) {
         if !self.popover.isShown()
             || self.rows.values().any(|row| row.actions.is_tracking())
-            || self.labels_saving()
             || self.keyboard_state.pending
         {
             return;
@@ -951,8 +989,7 @@ impl ReviewPopover {
         self.update_item
             .setTitle(&NSString::from_str(self.update_state.menu_title()));
         self.update_item.setEnabled(self.update_state.can_check);
-        self.back
-            .setEnabled(!self.labels_saving() && !self.keyboard_state.pending);
+        self.back.setEnabled(!self.keyboard_state.pending);
         let mtm = MainThreadMarker::new().unwrap();
         if let Some(detail) = &mut self.detail {
             if let DetailPanel::Settings(editor) = detail {
@@ -1117,6 +1154,7 @@ impl ReviewPopover {
                 ignored,
                 &self.target,
                 &self.action_state,
+                self.saving_labels.contains(&pr.snapshot.id),
             );
             row.background.setFrame(rect(
                 -HIGHLIGHT_PADDING,
