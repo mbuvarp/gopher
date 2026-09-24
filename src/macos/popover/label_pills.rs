@@ -56,13 +56,13 @@ impl LabelPills {
                 field
             });
             set_text(field, text);
-            field.setFrame(rect(x, y, right - x, 18.0));
+            let width = field
+                .sizeThatFits(NSSize::new(10000.0, 18.0))
+                .width
+                .min(right - x);
+            field.setFrame(rect(x, y, width, 18.0));
             field.setHidden(false);
-            for pill in pills.iter() {
-                pill.background.setHidden(true);
-                pill.text.setHidden(true);
-            }
-            return y - 34.0;
+            x += width + 6.0;
         } else if let Some(field) = self.message.borrow().as_ref() {
             field.setHidden(true);
         }

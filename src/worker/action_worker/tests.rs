@@ -1031,7 +1031,10 @@ fn catalogue_errors_keep_cached_labels_and_do_not_hide_mutation_errors() {
         .catalogues
         .insert("owner/repo".into(), catalogue(&["bug"]));
     h.sync_labels();
-    h.coordinator.state.labels.get_mut("PR_1").unwrap().error = Some("Mutation failed".into());
+    let labels = h.coordinator.state.labels.get_mut("PR_1").unwrap();
+    labels.items[0].selected = true;
+    labels.unsaved.insert("bug".into());
+    labels.error = Some("Mutation failed".into());
     h.coordinator.loads.insert("owner/repo".into(), 1);
     h.handle(ActionCommand::LabelsLoaded {
         repo: "owner/repo".into(),
@@ -1051,6 +1054,32 @@ fn catalogue_errors_keep_cached_labels_and_do_not_hide_mutation_errors() {
     assert_eq!(labels.items.len(), 2);
     assert!(labels.catalogue_error.is_none());
     assert_eq!(labels.error.as_deref(), Some("Mutation failed"));
+}
+
+#[test]
+fn resolved_label_error_clears_when_the_last_pending_job_finishes() {
+    let mut h = Harness::new();
+    h.coordinator
+        .catalogues
+        .insert("owner/repo".into(), catalogue(&["bug"]));
+    h.sync_labels();
+    let labels = h.coordinator.state.labels.get_mut("PR_1").unwrap();
+    labels.pending.insert("other".into());
+    labels.error = Some("Mutation failed".into());
+    h.sync_labels();
+    assert_eq!(
+        h.coordinator.state.labels["PR_1"].error.as_deref(),
+        Some("Mutation failed")
+    );
+    h.coordinator
+        .state
+        .labels
+        .get_mut("PR_1")
+        .unwrap()
+        .pending
+        .clear();
+    h.sync_labels();
+    assert!(h.coordinator.state.labels["PR_1"].error.is_none());
 }
 
 #[test]

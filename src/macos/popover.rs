@@ -818,11 +818,12 @@ impl ReviewPopover {
         )
     }
     pub(super) fn settings(&mut self) {
-        if self.labels_saving()
-            || self.keyboard_state.pending
-            || matches!(self.detail, Some(DetailPanel::Settings(_)))
-        {
+        if self.keyboard_state.pending || matches!(self.detail, Some(DetailPanel::Settings(_))) {
             return;
+        }
+        if let Some(DetailPanel::Labels(picker)) = &self.detail {
+            let id = picker.id.clone();
+            self.save_label_drafts(&id);
         }
         self.show_detail(DetailPanel::settings(&self.target));
     }
@@ -938,20 +939,23 @@ impl ReviewPopover {
                 .as_ref()
                 .is_some_and(|detail| detail.labels_saving(&self.action_state))
     }
+    fn save_label_drafts(&mut self, id: &str) {
+        self.saving_labels.insert(id.into());
+        let _ = super::dispatch_pr_action(
+            Request::SaveLabels {
+                pr: id.into(),
+                name: None,
+            },
+            &self.target.ivars().sender,
+        );
+    }
     pub(super) fn back(&mut self) {
         if self.keyboard_state.pending {
             return;
         }
         if let Some(detail) = self.detail.take() {
             if let DetailPanel::Labels(picker) = &detail {
-                self.saving_labels.insert(picker.id.clone());
-                let _ = super::dispatch_pr_action(
-                    Request::SaveLabels {
-                        pr: picker.id.clone(),
-                        name: None,
-                    },
-                    &self.target.ivars().sender,
-                );
+                self.save_label_drafts(&picker.id);
             }
             detail.remove(&self.target);
             self.scroll.setDocumentView(Some(&self.document));

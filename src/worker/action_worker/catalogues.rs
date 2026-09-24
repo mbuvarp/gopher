@@ -72,7 +72,6 @@ impl Coordinator {
             }
             labels.items = items.into_values().collect();
             labels.items.sort_by_cached_key(|l| l.name.to_lowercase());
-            let had_unsaved = !labels.unsaved.is_empty();
             labels.unsaved.retain(|name| {
                 labels
                     .items
@@ -89,7 +88,7 @@ impl Coordinator {
                         label.selected != applied
                     })
             });
-            if had_unsaved && labels.unsaved.is_empty() && labels.pending.is_empty() {
+            if labels.unsaved.is_empty() && labels.pending.is_empty() {
                 labels.error = None;
             }
             labels.loading = self.loads.contains_key(&repo);
