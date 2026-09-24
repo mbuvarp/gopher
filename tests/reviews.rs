@@ -416,6 +416,79 @@ fn title_change_does_not_reset_acknowledgement() {
     s.title = "New title".into();
     assert!(!transition(s, Some(&first), None, 130, 0).needs_attention());
 }
+
+#[test]
+fn draft_to_ready_creates_a_durable_actionable_update() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let mut s = snapshot();
+    s.draft = true;
+    s.reviews.push(review(Agent::Cubic, "0 issues found"));
+    let mut draft = transition(s.clone(), None, None, 100, 0);
+    assert_eq!(draft.state, State::Approved);
+    draft.acknowledged = Some(draft.update_id.clone());
+
+    s.draft = false;
+    let ready = transition(s.clone(), Some(&draft), None, 130, 0);
+    assert_eq!(ready.ready_generation, 1);
+    assert_ne!(ready.update_id, draft.update_id);
+    assert!(ready.needs_attention());
+    assert_eq!(
+        transition(s.clone(), Some(&ready), None, 160, 0).update_id,
+        ready.update_id
+    );
+
+    store.save(&ready).unwrap();
+    let restored = store.load().unwrap().remove(0);
+    assert_eq!(restored.ready_generation, 1);
+    let notice = store.notification(&ready).unwrap().unwrap();
+    assert!(store.notification_target(&notice).unwrap().is_some());
+
+    s.draft = true;
+    let again_draft = transition(s.clone(), Some(&restored), None, 190, 0);
+    assert_eq!(again_draft.update_id, ready.update_id);
+    s.draft = false;
+    let again_ready = transition(s, Some(&again_draft), None, 220, 0);
+    assert_eq!(again_ready.ready_generation, 2);
+    assert_ne!(again_ready.update_id, ready.update_id);
+}
+
+#[test]
+fn ready_transition_waits_for_settled_evidence_after_stale_restore() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let mut snapshot = snapshot();
+    snapshot.draft = true;
+    snapshot
+        .reviews
+        .push(review(Agent::Cubic, "0 issues found"));
+    let reviewing = transition(snapshot.clone(), None, None, 100, 30);
+    let mut approved = transition(snapshot.clone(), Some(&reviewing), None, 140, 30);
+    assert_eq!(approved.state, State::Approved);
+    approved.acknowledged = Some(approved.update_id.clone());
+    store.save(&approved).unwrap();
+
+    let restored = store.load().unwrap().remove(0);
+    assert!(restored.stale);
+    snapshot.draft = false;
+    let settling = transition(snapshot.clone(), Some(&restored), None, 200, 30);
+    assert_eq!(settling.state, State::Reviewing);
+    assert!(settling.ready_pending);
+    assert_eq!(settling.ready_generation, 0);
+    store.save(&settling).unwrap();
+    let settling_restored = store.load().unwrap().remove(0);
+    assert!(settling_restored.ready_pending);
+    let settling_again = transition(snapshot.clone(), Some(&settling_restored), None, 240, 30);
+    assert_eq!(settling_again.state, State::Reviewing);
+    assert!(settling_again.ready_pending);
+
+    let ready = transition(snapshot, Some(&settling_again), None, 280, 30);
+    assert_eq!(ready.state, State::Approved);
+    assert!(!ready.ready_pending);
+    assert_eq!(ready.ready_generation, 1);
+    assert_ne!(ready.update_id, approved.update_id);
+    assert!(ready.needs_attention());
+}
 #[test]
 fn labels_persist_without_resetting_acknowledgement_and_legacy_cache_still_loads() {
     let mut snapshot = snapshot();

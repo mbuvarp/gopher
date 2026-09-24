@@ -728,19 +728,10 @@ fn append_pr_submenu(
     menu: &Menu,
     submenu: &Submenu,
     state: State,
+    draft: bool,
     target: &PrMenuTarget,
 ) -> Result<()> {
-    let symbol = match state {
-        State::Unknown => "questionmark.circle",
-        State::Reviewing => "arrow.triangle.2.circlepath",
-        State::Comments => "text.bubble",
-        State::Approved => "checkmark.circle",
-    };
-    let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-        &NSString::from_str(symbol),
-        Some(&NSString::from_str(state.label())),
-    )
-    .with_context(|| format!("Could not load menu icon {symbol}"))?;
+    let image = pr_status_image(state, draft).context("Could not load PR menu icon")?;
     image.setSize(NSSize::new(16.0, 16.0));
     image.setTemplate(true);
     menu.append(submenu)?;
@@ -894,7 +885,7 @@ fn menu(
                 None,
             ))?;
         }
-        append_pr_submenu(&menu, &item, state, pr_menu_target)?;
+        append_pr_submenu(&menu, &item, state, pr.snapshot.draft, pr_menu_target)?;
     }
     menu.append(&PredefinedMenuItem::separator())?;
     let actions_menu = Submenu::new("Actions", true);
@@ -929,6 +920,35 @@ enum MenuBarState {
     Review(State),
 }
 
+fn pr_status_symbols(state: State, draft: bool) -> (&'static [&'static str], &'static str) {
+    const DRAFT: &[&str] = &["pencil.and.scribble", "pencil"];
+    const UNKNOWN: &[&str] = &["questionmark.circle"];
+    const REVIEWING: &[&str] = &["arrow.triangle.2.circlepath"];
+    const COMMENTS: &[&str] = &["text.bubble"];
+    const APPROVED: &[&str] = &["checkmark.circle"];
+    if draft {
+        // Prefer the requested symbol where available and retain a draft icon on older systems.
+        return (DRAFT, "Draft pull request");
+    }
+    let symbols = match state {
+        State::Unknown => UNKNOWN,
+        State::Reviewing => REVIEWING,
+        State::Comments => COMMENTS,
+        State::Approved => APPROVED,
+    };
+    (symbols, state.label())
+}
+
+fn pr_status_image(state: State, draft: bool) -> Option<objc2::rc::Retained<NSImage>> {
+    let (symbols, description) = pr_status_symbols(state, draft);
+    symbols.iter().find_map(|symbol| {
+        NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str(symbol),
+            Some(&NSString::from_str(description)),
+        )
+    })
+}
+
 fn menu_bar_state(prs: &[PullRequest], has_error: bool) -> MenuBarState {
     if has_error {
         return MenuBarState::Review(State::Unknown);
@@ -936,7 +956,7 @@ fn menu_bar_state(prs: &[PullRequest], has_error: bool) -> MenuBarState {
     for state in [State::Comments, State::Approved] {
         if prs
             .iter()
-            .any(|pr| pr.needs_attention() && pr.state == state)
+            .any(|pr| !pr.snapshot.draft && pr.needs_attention() && pr.state == state)
         {
             return MenuBarState::Review(state);
         }
@@ -944,12 +964,14 @@ fn menu_bar_state(prs: &[PullRequest], has_error: bool) -> MenuBarState {
     let unacknowledged = |pr: &&PullRequest| pr.acknowledged.as_deref() != Some(&pr.update_id);
     if prs
         .iter()
+        .filter(|pr| !pr.snapshot.draft)
         .filter(unacknowledged)
         .any(|pr| !pr.stale && pr.state == State::Reviewing)
     {
         MenuBarState::Review(State::Reviewing)
     } else if prs
         .iter()
+        .filter(|pr| !pr.snapshot.draft)
         .filter(unacknowledged)
         .any(|pr| pr.stale || pr.state == State::Unknown)
     {
@@ -1102,6 +1124,40 @@ mod tests {
         pr.acknowledged = None;
         assert_eq!(
             menu_bar_state(&[pr], false),
+            MenuBarState::Review(State::Unknown)
+        );
+    }
+
+    #[test]
+    fn draft_icons_override_review_state_without_affecting_menu_bar() {
+        let mut draft = worker::transition(Snapshot::default(), None, None, 100, 0);
+        draft.snapshot.draft = true;
+        for state in [
+            State::Unknown,
+            State::Reviewing,
+            State::Comments,
+            State::Approved,
+        ] {
+            draft.state = state;
+            assert_eq!(
+                pr_status_symbols(state, true),
+                (&["pencil.and.scribble", "pencil"][..], "Draft pull request")
+            );
+            assert_eq!(menu_bar_state(&[draft.clone()], false), MenuBarState::Idle);
+        }
+        draft.stale = true;
+        assert_eq!(menu_bar_state(&[draft.clone()], false), MenuBarState::Idle);
+
+        let mut ready = draft.clone();
+        ready.snapshot.draft = false;
+        ready.stale = false;
+        ready.state = State::Comments;
+        assert_eq!(
+            menu_bar_state(&[draft, ready], false),
+            MenuBarState::Review(State::Comments)
+        );
+        assert_eq!(
+            menu_bar_state(&[], true),
             MenuBarState::Review(State::Unknown)
         );
     }
