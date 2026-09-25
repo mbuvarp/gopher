@@ -134,7 +134,11 @@ pub enum Setting {
 }
 #[derive(Clone, Debug)]
 pub enum Request {
-    ReadyForReview(String),
+    ReadyForReview {
+        pr: String,
+        head: String,
+        update: String,
+    },
     Configure {
         repo: String,
         change: Setting,

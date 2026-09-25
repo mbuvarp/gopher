@@ -109,9 +109,11 @@ impl PrActions {
         );
         let ready = menu_item(
             "Ready for review",
-            Some(AppEvent::PrAction(Request::ReadyForReview(
-                pr.snapshot.id.clone(),
-            ))),
+            Some(AppEvent::PrAction(Request::ReadyForReview {
+                pr: pr.snapshot.id.clone(),
+                head: pr.snapshot.head.clone(),
+                update: pr.update_id.clone(),
+            })),
             target,
         );
         let labels = menu_item(
@@ -220,7 +222,11 @@ impl PrActions {
         self.labels.setEnabled(preferences.allows(Kind::Label, pr));
         bind_item(
             &self.ready,
-            AppEvent::PrAction(Request::ReadyForReview(pr.snapshot.id.clone())),
+            AppEvent::PrAction(Request::ReadyForReview {
+                pr: pr.snapshot.id.clone(),
+                head: pr.snapshot.head.clone(),
+                update: pr.update_id.clone(),
+            }),
             target,
         );
         bind_item(

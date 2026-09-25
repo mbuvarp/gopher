@@ -88,11 +88,15 @@ pub fn ready_for_review(
     snapshot: &Snapshot,
     previous: Option<&PullRequest>,
     agents: &[AgentResult],
+    expected: Option<&[Agent]>,
 ) -> bool {
-    snapshot.open
+    (expected.is_none() || !agents.is_empty())
+        && snapshot.open
         && !snapshot.draft
         && !snapshot.threads.iter().any(|thread| !thread.resolved)
-        && observed_agents(snapshot).is_empty()
+        && observed_agents(snapshot)
+            .iter()
+            .all(|agent| expected.is_some() && !agents.iter().any(|result| result.agent == *agent))
         && agents.iter().all(|agent| agent.verdict == Verdict::Unknown)
         && !agents.iter().any(|agent| {
             agent
@@ -102,7 +106,8 @@ pub fn ready_for_review(
         && !previous.is_some_and(|pr| {
             let observed = observed_agents(&pr.snapshot);
             pr.agents.iter().any(|agent| {
-                agent.verdict != Verdict::Skipped
+                (expected.is_none() || agents.iter().any(|result| result.agent == agent.agent))
+                    && agent.verdict != Verdict::Skipped
                     && (agent.verdict != Verdict::Unknown
                         || !agent.run_id.is_empty()
                         || observed.contains(&agent.agent))

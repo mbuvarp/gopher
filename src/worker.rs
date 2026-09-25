@@ -436,7 +436,11 @@ async fn run(
                     && let Some(pr) = prs.get_mut(&id)
                     && pr.snapshot.draft
                 {
-                    apply_ready_saved(pr);
+                    let expected = config
+                        .repositories
+                        .get(&pr.snapshot.repo)
+                        .and_then(|repo| repo.reviewers.as_deref());
+                    apply_ready_saved(pr, expected);
                     store.save(pr)?;
                     if polling {
                         invalidated_poll_ids.insert(id);
@@ -848,11 +852,11 @@ async fn run(
     Ok(())
 }
 
-fn apply_ready_saved(pr: &mut PullRequest) {
+fn apply_ready_saved(pr: &mut PullRequest, expected: Option<&[Agent]>) {
     pr.snapshot.draft = false;
     pr.ready_pending = true;
     if matches!(pr.state, State::Unknown | State::ReadyForReview)
-        && reviewers::ready_for_review(&pr.snapshot, Some(pr), &pr.agents)
+        && reviewers::ready_for_review(&pr.snapshot, Some(pr), &pr.agents, expected)
     {
         pr.state = State::ReadyForReview;
     }
@@ -867,7 +871,8 @@ pub fn transition(
 ) -> PullRequest {
     let agents = reviewers::evaluate(&snapshot, previous, expected);
     let raw = reviewers::aggregate(&snapshot, &agents);
-    let raw = if raw == State::Unknown && reviewers::ready_for_review(&snapshot, previous, &agents)
+    let raw = if raw == State::Unknown
+        && reviewers::ready_for_review(&snapshot, previous, &agents, expected)
     {
         State::ReadyForReview
     } else {
@@ -939,7 +944,7 @@ mod tests {
             0,
         );
         assert_eq!(draft.state, State::Unknown);
-        apply_ready_saved(&mut draft);
+        apply_ready_saved(&mut draft, None);
         assert!(!draft.snapshot.draft);
         assert_eq!(draft.state, State::ReadyForReview);
         assert!(draft.ready_pending);
@@ -947,6 +952,25 @@ mod tests {
         let confirmed = transition(draft.snapshot.clone(), Some(&draft), None, 130, 0);
         assert_eq!(confirmed.state, State::ReadyForReview);
         assert!(confirmed.ready_pending);
+    }
+
+    #[test]
+    fn ready_action_respects_an_explicit_empty_reviewer_set() {
+        let mut draft = transition(
+            Snapshot {
+                id: "PR_1".into(),
+                open: true,
+                draft: true,
+                ..Default::default()
+            },
+            None,
+            Some(&[]),
+            100,
+            0,
+        );
+        apply_ready_saved(&mut draft, Some(&[]));
+        assert_eq!(draft.state, State::Unknown);
+        assert!(draft.ready_pending);
     }
 
     #[tokio::test]

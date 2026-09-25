@@ -120,6 +120,8 @@ struct ReadyIntent {
     token: u64,
     reference: PrRef,
     viewer: String,
+    head: String,
+    update: String,
 }
 
 pub(super) struct Coordinator {
@@ -240,6 +242,13 @@ impl Coordinator {
                 self.publish(context);
             }
         }
+        let ready_count = self.state.ready.len();
+        self.state
+            .ready
+            .retain(|id, _| context.prs.get(id).is_none_or(|pr| pr.snapshot.draft));
+        if self.state.ready.len() != ready_count {
+            self.publish(context);
+        }
         self.sync_labels(context);
         let cancelled = self
             .merges
@@ -312,11 +321,17 @@ impl Coordinator {
                     let checked = result.and_then(|(snapshot, github)| {
                         let current = context.prs.get(&pr);
                         if context.viewer == Some(intent.viewer.as_str())
-                            && current
-                                .is_some_and(|p| p.snapshot.open && p.snapshot.draft && !p.stale)
+                            && current.is_some_and(|p| {
+                                p.snapshot.open
+                                    && p.snapshot.draft
+                                    && !p.stale
+                                    && p.snapshot.head == intent.head
+                                    && p.update_id == intent.update
+                            })
                             && snapshot.id == pr
                             && snapshot.open
                             && snapshot.draft
+                            && snapshot.head == intent.head
                         {
                             Ok(github)
                         } else {
@@ -326,7 +341,9 @@ impl Coordinator {
                     match checked {
                         Err(error) => {
                             self.ready.remove(&pr);
-                            self.state.ready.insert(pr, ReadyProgress::Failed(error));
+                            if context.prs.get(&pr).is_none_or(|p| p.snapshot.draft) {
+                                self.state.ready.insert(pr, ReadyProgress::Failed(error));
+                            }
                         }
                         Ok(github) => {
                             self.state
@@ -370,7 +387,7 @@ impl Coordinator {
                         }
                         Err(error) => {
                             tracing::warn!(event="ready_for_review_failed", pr_id=%pr, error=%error);
-                            if current {
+                            if current && context.prs.get(&pr).is_none_or(|p| p.snapshot.draft) {
                                 self.state.ready.insert(pr, ReadyProgress::Failed(error));
                             }
                         }
@@ -550,7 +567,7 @@ impl Coordinator {
     fn request(&mut self, request: Request, context: &Context<'_>) -> Result<()> {
         self.state.error = None;
         match request {
-            Request::ReadyForReview(pr) => {
+            Request::ReadyForReview { pr, head, update } => {
                 ensure!(
                     !self.ready.contains_key(&pr),
                     "Ready for review is already pending"
@@ -563,6 +580,10 @@ impl Coordinator {
                     current.snapshot.open && current.snapshot.draft && !current.stale,
                     "Ready for review requires a fresh draft PR"
                 );
+                ensure!(
+                    current.snapshot.head == head && current.update_id == update,
+                    "Ready for review cancelled: the displayed PR or review changed"
+                );
                 let intent = ReadyIntent {
                     token: self.token(),
                     reference: PrRef {
@@ -574,6 +595,8 @@ impl Coordinator {
                         .viewer
                         .context("Waiting for GitHub authentication")?
                         .into(),
+                    head,
+                    update,
                 };
                 let token = intent.token;
                 let reference = intent.reference.clone();

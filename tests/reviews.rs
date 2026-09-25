@@ -152,6 +152,15 @@ fn fresh_pr_without_review_activity_is_ready_for_review() {
     let required = transition(snapshot(), None, Some(&[Agent::Codex]), 100, 30);
     assert_eq!(required.state, State::ReadyForReview);
     assert_eq!(required.agents[0].verdict, Verdict::Unknown);
+
+    let no_automated_reviewers = transition(snapshot(), None, Some(&[]), 100, 30);
+    assert_eq!(no_automated_reviewers.state, State::Unknown);
+    let mut unrelated_activity = snapshot();
+    unrelated_activity
+        .reviews
+        .push(review(Agent::Cubic, "0 issues found"));
+    let codex_only = transition(unrelated_activity, None, Some(&[Agent::Codex]), 100, 30);
+    assert_eq!(codex_only.state, State::ReadyForReview);
 }
 #[test]
 fn review_activity_or_lost_participation_is_not_ready_for_review() {
