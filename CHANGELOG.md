@@ -6,6 +6,11 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-25
+
+- Add a Ready for review action for draft PRs, with progress and error feedback while Gopher asks GitHub to mark them ready.
+- Show fresh PRs waiting for their first automated review as Ready for review with an hourglass icon. Reserve Unknown for missing or ambiguous review evidence, and respect configured reviewer overrides.
+
 ## [0.4.0] - 2026-09-24
 
 - Show draft pull requests with a pencil icon in the inbox and menu, without letting their review state change the menu bar status. When a draft becomes ready, surface its actionable review result as a new update.
