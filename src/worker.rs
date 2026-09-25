@@ -59,6 +59,10 @@ pub enum UiEvent {
 pub enum Command {
     SaveHotkeys(crate::hotkeys::Preferences),
     PrAction(ActionCommand),
+    ReadySaved {
+        pr: String,
+        viewer: String,
+    },
     LabelSaved {
         pr: String,
         viewer: String,
@@ -348,8 +352,11 @@ async fn run(
                     | Command::NotificationDelivered(_)
                     | Command::NotificationFailed(_)
                     | Command::LabelSaved { .. }
+                    | Command::ReadySaved { .. }
                     | Command::PrAction(
-                        ActionCommand::Merged { .. } | ActionCommand::LabelDone { .. }
+                        ActionCommand::Merged { .. }
+                            | ActionCommand::ReadyDone { .. }
+                            | ActionCommand::LabelDone { .. }
                     )
             )
         {
@@ -414,6 +421,27 @@ async fn run(
                     }
                     store.save(pr)?;
                     // A poll started before the mutation must not replace its result.
+                    if polling {
+                        invalidated_poll_ids.insert(id);
+                        rediscover_after_poll = true;
+                    }
+                    deadline = Instant::now();
+                }
+            }
+            Command::ReadySaved {
+                pr: id,
+                viewer: account,
+            } => {
+                if viewer.as_deref() == Some(account.as_str())
+                    && let Some(pr) = prs.get_mut(&id)
+                    && pr.snapshot.draft
+                {
+                    let expected = config
+                        .repositories
+                        .get(&pr.snapshot.repo)
+                        .and_then(|repo| repo.reviewers.as_deref());
+                    apply_ready_saved(pr, expected);
+                    store.save(pr)?;
                     if polling {
                         invalidated_poll_ids.insert(id);
                         rediscover_after_poll = true;
@@ -786,7 +814,7 @@ async fn run(
         }
         if shutting_down {
             if !pr_actions.has_submissions() {
-                // A LabelDone handler queues LabelSaved before this barrier.
+                // Mutation handlers queue saved results before this barrier.
                 // Persist that result before dropping the runtime and instance lock.
                 let _ = sender.send(Command::ShutdownComplete);
             }
@@ -824,6 +852,16 @@ async fn run(
     Ok(())
 }
 
+fn apply_ready_saved(pr: &mut PullRequest, expected: Option<&[Agent]>) {
+    pr.snapshot.draft = false;
+    pr.ready_pending = true;
+    if matches!(pr.state, State::Unknown | State::ReadyForReview)
+        && reviewers::ready_for_review(&pr.snapshot, Some(pr), &pr.agents, expected)
+    {
+        pr.state = State::ReadyForReview;
+    }
+}
+
 pub fn transition(
     snapshot: Snapshot,
     previous: Option<&PullRequest>,
@@ -833,6 +871,13 @@ pub fn transition(
 ) -> PullRequest {
     let agents = reviewers::evaluate(&snapshot, previous, expected);
     let raw = reviewers::aggregate(&snapshot, &agents);
+    let raw = if raw == State::Unknown
+        && reviewers::ready_for_review(&snapshot, previous, &agents, expected)
+    {
+        State::ReadyForReview
+    } else {
+        raw
+    };
     let candidate_id = fingerprint(&snapshot, &agents, raw);
     let candidate_since = previous
         .filter(|p| !p.stale && p.candidate_id == candidate_id)
@@ -883,6 +928,50 @@ pub fn transition(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_ready_action_shows_waiting_state_before_the_next_poll() {
+        let mut draft = transition(
+            Snapshot {
+                id: "PR_1".into(),
+                open: true,
+                draft: true,
+                ..Default::default()
+            },
+            None,
+            None,
+            100,
+            0,
+        );
+        assert_eq!(draft.state, State::Unknown);
+        apply_ready_saved(&mut draft, None);
+        assert!(!draft.snapshot.draft);
+        assert_eq!(draft.state, State::ReadyForReview);
+        assert!(draft.ready_pending);
+        assert!(!draft.needs_attention());
+        let confirmed = transition(draft.snapshot.clone(), Some(&draft), None, 130, 0);
+        assert_eq!(confirmed.state, State::ReadyForReview);
+        assert!(confirmed.ready_pending);
+    }
+
+    #[test]
+    fn ready_action_respects_an_explicit_empty_reviewer_set() {
+        let mut draft = transition(
+            Snapshot {
+                id: "PR_1".into(),
+                open: true,
+                draft: true,
+                ..Default::default()
+            },
+            None,
+            Some(&[]),
+            100,
+            0,
+        );
+        apply_ready_saved(&mut draft, Some(&[]));
+        assert_eq!(draft.state, State::Unknown);
+        assert!(draft.ready_pending);
+    }
 
     #[tokio::test]
     async fn shutdown_flushes_label_saves_queued_after_the_quit_request() {

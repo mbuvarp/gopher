@@ -134,6 +134,11 @@ pub enum Setting {
 }
 #[derive(Clone, Debug)]
 pub enum Request {
+    ReadyForReview {
+        pr: String,
+        head: String,
+        update: String,
+    },
     Configure {
         repo: String,
         change: Setting,
@@ -182,6 +187,12 @@ pub enum MergeProgress {
     Complete,
     Failed(String),
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadyProgress {
+    Checking,
+    Submitting,
+    Failed(String),
+}
 impl MergeProgress {
     pub fn text(&self) -> String {
         match self {
@@ -204,6 +215,7 @@ impl MergeProgress {
 pub struct ActionState {
     pub preferences: BTreeMap<String, Preferences>,
     pub merges: BTreeMap<String, MergeProgress>,
+    pub ready: BTreeMap<String, ReadyProgress>,
     pub labels: BTreeMap<String, Labels>,
     pub error: Option<String>,
 }

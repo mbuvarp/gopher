@@ -847,7 +847,9 @@ fn classify_failure(stderr: &str) -> RequestFailure {
 
 fn request_kind(args: &[&str], payload: Option<&Value>) -> &'static str {
     if let Some(query) = payload.and_then(|p| p["query"].as_str()) {
-        if query.contains("search(") || query.contains("query AuthoredPrs") {
+        if query.contains("mutation ReadyForReview") {
+            "ready_for_review"
+        } else if query.contains("search(") || query.contains("query AuthoredPrs") {
             "discover_prs"
         } else if query.contains("viewer {") {
             "viewer"

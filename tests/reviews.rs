@@ -136,8 +136,58 @@ fn summary(body: &str) -> Comment {
 }
 
 #[test]
-fn no_reviewers_is_unknown() {
+fn no_reviewers_have_no_raw_review_verdict() {
     assert_eq!(state(&snapshot()), State::Unknown);
+}
+#[test]
+fn fresh_pr_without_review_activity_is_ready_for_review() {
+    let first = transition(snapshot(), None, None, 100, 30);
+    assert_eq!(first.state, State::ReadyForReview);
+    assert_eq!(first.status_label(100), "Ready for review");
+    assert!(!first.needs_attention());
+    let next = transition(snapshot(), Some(&first), None, 130, 30);
+    assert_eq!(next.state, State::ReadyForReview);
+    assert_eq!(next.update_id, first.update_id);
+
+    let required = transition(snapshot(), None, Some(&[Agent::Codex]), 100, 30);
+    assert_eq!(required.state, State::ReadyForReview);
+    assert_eq!(required.agents[0].verdict, Verdict::Unknown);
+
+    let no_automated_reviewers = transition(snapshot(), None, Some(&[]), 100, 30);
+    assert_eq!(no_automated_reviewers.state, State::Unknown);
+    let mut unrelated_activity = snapshot();
+    unrelated_activity
+        .reviews
+        .push(review(Agent::Cubic, "0 issues found"));
+    let codex_only = transition(unrelated_activity, None, Some(&[Agent::Codex]), 100, 30);
+    assert_eq!(codex_only.state, State::ReadyForReview);
+}
+#[test]
+fn review_activity_or_lost_participation_is_not_ready_for_review() {
+    let mut s = snapshot();
+    s.reviews.push(review(Agent::Cubic, "0 issues found"));
+    let approved = transition(s.clone(), None, None, 100, 0);
+    assert_eq!(approved.state, State::Approved);
+    s.reviews.clear();
+    let missing = transition(s.clone(), Some(&approved), None, 130, 0);
+    assert_eq!(missing.state, State::Unknown);
+
+    let mut old_review = review(Agent::Cubic, "0 issues found");
+    old_review.commit = "older-commit".into();
+    s.reviews.push(old_review);
+    assert_eq!(transition(s, None, None, 160, 0).state, State::Unknown);
+}
+#[test]
+fn draft_or_unresolved_threads_are_not_ready_for_review() {
+    let mut s = snapshot();
+    s.draft = true;
+    assert_eq!(
+        transition(s.clone(), None, None, 100, 0).state,
+        State::Unknown
+    );
+    s.draft = false;
+    s.threads.push(thread());
+    assert_eq!(transition(s, None, None, 100, 0).state, State::Unknown);
 }
 #[test]
 fn cubic_zero_issues_is_clean_even_without_formal_approval() {

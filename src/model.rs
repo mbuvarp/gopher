@@ -40,6 +40,7 @@ impl Agent {
 #[serde(rename_all = "snake_case")]
 pub enum State {
     Unknown,
+    ReadyForReview,
     Reviewing,
     Comments,
     Approved,
@@ -51,6 +52,7 @@ impl State {
     pub fn label(self) -> &'static str {
         match self {
             Self::Unknown => "Unknown",
+            Self::ReadyForReview => "Ready for review",
             Self::Reviewing => "Reviewing",
             Self::Comments => "Comments",
             Self::Approved => "Approved",

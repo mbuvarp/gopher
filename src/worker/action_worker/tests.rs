@@ -185,6 +185,12 @@ impl Harness {
             "input=$(cat)",
             r#"
 input=$(cat)
+case "$input" in
+ *'mutation ReadyForReview'*)
+   printf '%s' "$input" > "$(dirname "$0")/ready.json"
+   echo '{"data":{"markPullRequestReadyForReview":{"pullRequest":{"id":"PR_1","isDraft":false}}}}'
+   exit 0;;
+esac
 case "$input" in *viewer*) echo '{"data":{"viewer":{"login":"test"}}}'; exit 0;; esac
 "#,
         );
@@ -261,6 +267,14 @@ esac
     fn request(&mut self, request: Request) {
         self.handle(ActionCommand::Request(request));
     }
+    fn ready_request(&self) -> Request {
+        let pr = &self.prs["PR_1"];
+        Request::ReadyForReview {
+            pr: pr.snapshot.id.clone(),
+            head: pr.snapshot.head.clone(),
+            update: pr.update_id.clone(),
+        }
+    }
     fn start_merge(&mut self) -> u64 {
         self.request(Request::Merge {
             on_green: false,
@@ -295,6 +309,108 @@ esac
     fn assert_no_merge(&self) {
         assert!(!self.directory.path().join("merge.json").exists());
     }
+}
+
+#[tokio::test]
+async fn ready_for_review_submits_for_draft_without_check_requirements() {
+    let mut h = Harness::new();
+    let gh = h.config.gh_path.as_ref().unwrap();
+    let script = std::fs::read_to_string(gh).unwrap().replace(
+        "\"state\":\"OPEN\",\"isDraft\":false",
+        "\"state\":\"OPEN\",\"isDraft\":true",
+    );
+    std::fs::write(gh, script).unwrap();
+    h.refresh_pr().await;
+    assert!(h.prs["PR_1"].snapshot.draft);
+    h.request(h.ready_request());
+    let saved = loop {
+        let command = tokio::time::timeout(Duration::from_secs(8), h.receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match command {
+            Command::PrAction(action) => h.handle(action),
+            Command::ReadySaved { pr, viewer } => break (pr, viewer),
+            _ => {}
+        }
+    };
+    assert_eq!(saved, ("PR_1".into(), "test".into()));
+    assert!(h.directory.path().join("ready.json").exists());
+}
+
+#[tokio::test]
+async fn ready_for_review_rejects_stale_and_remote_non_draft_prs() {
+    let mut h = Harness::new();
+    h.prs.get_mut("PR_1").unwrap().snapshot.draft = true;
+    h.request(h.ready_request());
+    assert!(!h.directory.path().join("ready.json").exists());
+
+    h.prs.get_mut("PR_1").unwrap().stale = false;
+    h.request(h.ready_request());
+    h.step().await;
+    assert!(matches!(
+        h.coordinator.state.ready.get("PR_1"),
+        Some(ReadyProgress::Failed(_))
+    ));
+    assert!(!h.directory.path().join("ready.json").exists());
+}
+
+#[tokio::test]
+async fn ready_for_review_rejects_an_update_that_changed_while_menu_was_open() {
+    let mut h = Harness::new();
+    h.refresh_pr().await;
+    h.prs.get_mut("PR_1").unwrap().snapshot.draft = true;
+    let displayed = h.ready_request();
+    h.prs.get_mut("PR_1").unwrap().update_id = "new-review-update".into();
+    h.request(displayed);
+    assert!(h.coordinator.ready.is_empty());
+    assert!(
+        h.coordinator
+            .state
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("review changed")
+    );
+    assert!(!h.directory.path().join("ready.json").exists());
+}
+
+#[tokio::test]
+async fn ready_for_review_rejects_head_changes_during_validation() {
+    let mut h = Harness::new();
+    let gh = h.config.gh_path.as_ref().unwrap();
+    let script = std::fs::read_to_string(gh).unwrap().replace(
+        "\"state\":\"OPEN\",\"isDraft\":false",
+        "\"state\":\"OPEN\",\"isDraft\":true",
+    );
+    std::fs::write(gh, script).unwrap();
+    h.refresh_pr().await;
+    h.request(h.ready_request());
+    h.prs.get_mut("PR_1").unwrap().snapshot.head = "new-head".into();
+    h.step().await;
+    assert!(matches!(
+        h.coordinator.state.ready.get("PR_1"),
+        Some(ReadyProgress::Failed(_))
+    ));
+    assert!(!h.directory.path().join("ready.json").exists());
+}
+
+#[test]
+fn ready_failure_clears_when_another_actor_marks_the_pr_ready() {
+    let mut h = Harness::new();
+    h.coordinator.state.ready.insert(
+        "PR_1".into(),
+        ReadyProgress::Failed("Ready for review cancelled".into()),
+    );
+    h.coordinator.reconcile(&Context {
+        store: &h.store,
+        prs: &h.prs,
+        viewer: Some(h.viewer),
+        config: &h.config,
+        sender: &h.sender,
+        sink: &h.sink,
+    });
+    assert!(!h.coordinator.state.ready.contains_key("PR_1"));
 }
 
 #[tokio::test]

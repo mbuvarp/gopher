@@ -505,9 +505,12 @@ impl Row {
         let action_error = if ignored {
             None
         } else {
-            match action_state.merges.get(&pr.snapshot.id) {
-                Some(crate::actions::MergeProgress::Failed(error)) => Some(error.as_str()),
-                _ => None,
+            match action_state.ready.get(&pr.snapshot.id) {
+                Some(crate::actions::ReadyProgress::Failed(error)) => Some(error.as_str()),
+                _ => match action_state.merges.get(&pr.snapshot.id) {
+                    Some(crate::actions::MergeProgress::Failed(error)) => Some(error.as_str()),
+                    _ => None,
+                },
             }
         };
         self.action_message.setHidden(action_error.is_none());

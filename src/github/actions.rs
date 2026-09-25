@@ -14,6 +14,29 @@ pub(super) fn message(response: &Value, fallback: &str) -> String {
 }
 
 impl Github {
+    pub async fn ready_for_review(&self, pr: &PrRef) -> Result<()> {
+        let response = self
+            .execute_response(
+                &["api", "graphql", "--hostname", "github.com", "--input", "-"],
+                Some(&json!({
+                    "query": "mutation ReadyForReview($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft}}}",
+                    "variables": {"id": pr.id}
+                })),
+                ResponsePolicy::Mutation,
+            )
+            .await?;
+        ensure!(
+            response.get("errors").is_none(),
+            "GitHub rejected Ready for review"
+        );
+        let updated = &response["data"]["markPullRequestReadyForReview"]["pullRequest"];
+        ensure!(
+            updated["id"] == pr.id && updated["isDraft"] == false,
+            "GitHub did not confirm that the PR is ready for review"
+        );
+        Ok(())
+    }
+
     async fn rest(&self, endpoint: &str) -> Result<Value> {
         self.execute(&["api", "--hostname", "github.com", endpoint], None)
             .await
