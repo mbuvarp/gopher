@@ -185,6 +185,12 @@ impl Harness {
             "input=$(cat)",
             r#"
 input=$(cat)
+case "$input" in
+ *'mutation ReadyForReview'*)
+   printf '%s' "$input" > "$(dirname "$0")/ready.json"
+   echo '{"data":{"markPullRequestReadyForReview":{"pullRequest":{"id":"PR_1","isDraft":false}}}}'
+   exit 0;;
+esac
 case "$input" in *viewer*) echo '{"data":{"viewer":{"login":"test"}}}'; exit 0;; esac
 "#,
         );
@@ -295,6 +301,50 @@ esac
     fn assert_no_merge(&self) {
         assert!(!self.directory.path().join("merge.json").exists());
     }
+}
+
+#[tokio::test]
+async fn ready_for_review_submits_for_draft_without_check_requirements() {
+    let mut h = Harness::new();
+    let gh = h.config.gh_path.as_ref().unwrap();
+    let script = std::fs::read_to_string(gh).unwrap().replace(
+        "\"state\":\"OPEN\",\"isDraft\":false",
+        "\"state\":\"OPEN\",\"isDraft\":true",
+    );
+    std::fs::write(gh, script).unwrap();
+    h.refresh_pr().await;
+    assert!(h.prs["PR_1"].snapshot.draft);
+    h.request(Request::ReadyForReview("PR_1".into()));
+    let saved = loop {
+        let command = tokio::time::timeout(Duration::from_secs(8), h.receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match command {
+            Command::PrAction(action) => h.handle(action),
+            Command::ReadySaved { pr, viewer } => break (pr, viewer),
+            _ => {}
+        }
+    };
+    assert_eq!(saved, ("PR_1".into(), "test".into()));
+    assert!(h.directory.path().join("ready.json").exists());
+}
+
+#[tokio::test]
+async fn ready_for_review_rejects_stale_and_remote_non_draft_prs() {
+    let mut h = Harness::new();
+    h.prs.get_mut("PR_1").unwrap().snapshot.draft = true;
+    h.request(Request::ReadyForReview("PR_1".into()));
+    assert!(!h.directory.path().join("ready.json").exists());
+
+    h.prs.get_mut("PR_1").unwrap().stale = false;
+    h.request(Request::ReadyForReview("PR_1".into()));
+    h.step().await;
+    assert!(matches!(
+        h.coordinator.state.ready.get("PR_1"),
+        Some(ReadyProgress::Failed(_))
+    ));
+    assert!(!h.directory.path().join("ready.json").exists());
 }
 
 #[tokio::test]

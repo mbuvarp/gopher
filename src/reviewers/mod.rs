@@ -10,29 +10,7 @@ pub fn evaluate(
     previous: Option<&PullRequest>,
     expected: Option<&[Agent]>,
 ) -> Vec<AgentResult> {
-    let observed: BTreeSet<Agent> = snapshot
-        .reviews
-        .iter()
-        .filter_map(|r| Agent::from_login(&r.author))
-        .chain(
-            snapshot
-                .comments
-                .iter()
-                .filter_map(|c| Agent::from_login(&c.author)),
-        )
-        .chain(
-            snapshot
-                .reactions
-                .iter()
-                .filter_map(|r| Agent::from_login(&r.author)),
-        )
-        .chain(
-            snapshot
-                .checks
-                .iter()
-                .filter_map(|c| Agent::from_app(&c.app)),
-        )
-        .collect();
+    let observed = observed_agents(snapshot);
     let agents: BTreeSet<Agent> = if let Some(expected) = expected {
         expected.iter().copied().collect()
     } else {
@@ -75,6 +53,61 @@ pub fn evaluate(
             result
         })
         .collect()
+}
+
+fn observed_agents(snapshot: &Snapshot) -> BTreeSet<Agent> {
+    snapshot
+        .reviews
+        .iter()
+        .filter_map(|r| Agent::from_login(&r.author))
+        .chain(
+            snapshot
+                .comments
+                .iter()
+                .filter_map(|c| Agent::from_login(&c.author)),
+        )
+        .chain(
+            snapshot
+                .reactions
+                .iter()
+                .filter_map(|r| Agent::from_login(&r.author)),
+        )
+        .chain(
+            snapshot
+                .checks
+                .iter()
+                .filter_map(|c| Agent::from_app(&c.app)),
+        )
+        .collect()
+}
+
+/// A fresh, non-draft PR can wait for its first review without implying a
+/// detection failure. Once a reviewer has participated, missing evidence stays
+/// unknown until a current result is observed.
+pub fn ready_for_review(
+    snapshot: &Snapshot,
+    previous: Option<&PullRequest>,
+    agents: &[AgentResult],
+) -> bool {
+    snapshot.open
+        && !snapshot.draft
+        && !snapshot.threads.iter().any(|thread| !thread.resolved)
+        && observed_agents(snapshot).is_empty()
+        && agents.iter().all(|agent| agent.verdict == Verdict::Unknown)
+        && !agents.iter().any(|agent| {
+            agent
+                .reason
+                .starts_with("Previously participating reviewer has no current activity")
+        })
+        && !previous.is_some_and(|pr| {
+            let observed = observed_agents(&pr.snapshot);
+            pr.agents.iter().any(|agent| {
+                agent.verdict != Verdict::Skipped
+                    && (agent.verdict != Verdict::Unknown
+                        || !agent.run_id.is_empty()
+                        || observed.contains(&agent.agent))
+            })
+        })
 }
 
 pub fn aggregate(snapshot: &Snapshot, agents: &[AgentResult]) -> State {

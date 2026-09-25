@@ -923,6 +923,7 @@ enum MenuBarState {
 fn pr_status_symbols(state: State, draft: bool) -> (&'static [&'static str], &'static str) {
     const DRAFT: &[&str] = &["pencil.and.scribble", "pencil"];
     const UNKNOWN: &[&str] = &["questionmark.circle"];
+    const READY: &[&str] = &["hourglass"];
     const REVIEWING: &[&str] = &["arrow.triangle.2.circlepath"];
     const COMMENTS: &[&str] = &["text.bubble"];
     const APPROVED: &[&str] = &["checkmark.circle"];
@@ -932,6 +933,7 @@ fn pr_status_symbols(state: State, draft: bool) -> (&'static [&'static str], &'s
     }
     let symbols = match state {
         State::Unknown => UNKNOWN,
+        State::ReadyForReview => READY,
         State::Reviewing => REVIEWING,
         State::Comments => COMMENTS,
         State::Approved => APPROVED,
@@ -1017,7 +1019,7 @@ fn template_rgba(bytes: &[u8]) -> Vec<u8> {
 
 fn icon(state: MenuBarState) -> tray_icon::Icon {
     let state = match state {
-        MenuBarState::Idle | MenuBarState::Review(State::Reviewing) => {
+        MenuBarState::Idle | MenuBarState::Review(State::ReadyForReview | State::Reviewing) => {
             return channel_icon(gopher_rgba().to_vec());
         }
         MenuBarState::Review(state) => state,
@@ -1034,6 +1036,7 @@ fn icon(state: MenuBarState) -> tray_icon::Icon {
                         || distance(px, py, 23., 16., 18., 21.) < 1.8
                         || ((px - 18.).abs() < 1.8 && (25. ..29.).contains(&py))
                 }
+                State::ReadyForReview => unreachable!("ready for review uses the gopher artwork"),
                 State::Reviewing => unreachable!("reviewing uses the gopher artwork"),
                 State::Comments => {
                     (px > 5. && px < 30. && py > 7. && py < 25.)
@@ -1110,6 +1113,12 @@ mod tests {
             menu_bar_state(&[pr.clone()], false),
             MenuBarState::Review(State::Unknown)
         );
+        pr.state = State::ReadyForReview;
+        assert_eq!(menu_bar_state(&[pr.clone()], false), MenuBarState::Idle);
+        assert_eq!(
+            pr_status_symbols(pr.state, false),
+            (&["hourglass"][..], "Ready for review")
+        );
         for state in [State::Comments, State::Approved, State::Reviewing] {
             pr.state = state;
             pr.acknowledged = None;
@@ -1134,6 +1143,7 @@ mod tests {
         draft.snapshot.draft = true;
         for state in [
             State::Unknown,
+            State::ReadyForReview,
             State::Reviewing,
             State::Comments,
             State::Approved,

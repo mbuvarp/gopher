@@ -22,6 +22,16 @@ mod catalogues;
 
 pub enum ActionCommand {
     Request(Request),
+    ReadyChecked {
+        pr: String,
+        token: u64,
+        result: Result<(Box<Snapshot>, Github), String>,
+    },
+    ReadyDone {
+        pr: String,
+        token: u64,
+        result: Result<(), String>,
+    },
     Tick {
         pr: String,
         token: u64,
@@ -105,12 +115,19 @@ struct LabelJob {
     selected: bool,
     color: String,
 }
+#[derive(Clone)]
+struct ReadyIntent {
+    token: u64,
+    reference: PrRef,
+    viewer: String,
+}
 
 pub(super) struct Coordinator {
     pub state: ActionState,
     viewer: Option<String>,
     sequence: u64,
     merges: BTreeMap<String, Intent>,
+    ready: BTreeMap<String, ReadyIntent>,
     loads: BTreeMap<String, u64>,
     catalogues: BTreeMap<String, LabelCatalogue>,
     attempts: BTreeMap<String, std::time::Instant>,
@@ -121,6 +138,7 @@ pub(super) struct Coordinator {
     // Independent of UI/account state: a submitted request must finish even if
     // its intent is later invalidated by a poll or account change.
     submissions: BTreeSet<u64>,
+    submitted_ready: BTreeMap<u64, ReadyIntent>,
     submitted_labels: BTreeMap<u64, LabelJob>,
 }
 impl Coordinator {
@@ -133,6 +151,7 @@ impl Coordinator {
             viewer: store.viewer()?,
             sequence: 0,
             merges: BTreeMap::new(),
+            ready: BTreeMap::new(),
             loads: BTreeMap::new(),
             catalogues: store.label_catalogues(store.viewer()?.as_deref().unwrap_or(""))?,
             attempts: BTreeMap::new(),
@@ -141,12 +160,15 @@ impl Coordinator {
             label_jobs: BTreeMap::new(),
             shutting_down: false,
             submissions: BTreeSet::new(),
+            submitted_ready: BTreeMap::new(),
             submitted_labels: BTreeMap::new(),
         })
     }
     pub fn begin_shutdown(&mut self) {
         self.shutting_down = true;
         self.merges
+            .retain(|_, intent| self.submissions.contains(&intent.token));
+        self.ready
             .retain(|_, intent| self.submissions.contains(&intent.token));
         for jobs in self.label_jobs.values_mut() {
             jobs.retain(|job| self.submissions.contains(&job.intent.token));
@@ -190,9 +212,12 @@ impl Coordinator {
     }
     pub fn reconcile(&mut self, context: &Context<'_>) {
         if self.viewer.as_deref() != context.viewer {
-            let changed = !self.state.merges.is_empty() || !self.state.labels.is_empty();
+            let changed = !self.state.merges.is_empty()
+                || !self.state.ready.is_empty()
+                || !self.state.labels.is_empty();
             self.viewer = context.viewer.map(str::to_owned);
             self.merges.clear();
+            self.ready.clear();
             self.loads.clear();
             self.attempts.clear();
             self.load_errors.clear();
@@ -209,6 +234,7 @@ impl Coordinator {
                 .unwrap_or_default();
             self.label_jobs.clear();
             self.state.merges.clear();
+            self.state.ready.clear();
             self.state.labels.clear();
             if changed {
                 self.publish(context);
@@ -257,7 +283,9 @@ impl Coordinator {
         if self.shutting_down
             && !matches!(
                 command,
-                ActionCommand::Merged { .. } | ActionCommand::LabelDone { .. }
+                ActionCommand::Merged { .. }
+                    | ActionCommand::ReadyDone { .. }
+                    | ActionCommand::LabelDone { .. }
             )
         {
             return;
@@ -276,6 +304,76 @@ impl Coordinator {
                         && let Some(labels) = self.state.labels.get_mut(pr)
                     {
                         labels.error = Some(error.to_string());
+                    }
+                }
+            }
+            ActionCommand::ReadyChecked { pr, token, result } => {
+                if let Some(intent) = self.ready.get(&pr).filter(|i| i.token == token).cloned() {
+                    let checked = result.and_then(|(snapshot, github)| {
+                        let current = context.prs.get(&pr);
+                        if context.viewer == Some(intent.viewer.as_str())
+                            && current
+                                .is_some_and(|p| p.snapshot.open && p.snapshot.draft && !p.stale)
+                            && snapshot.id == pr
+                            && snapshot.open
+                            && snapshot.draft
+                        {
+                            Ok(github)
+                        } else {
+                            Err("Ready for review cancelled: the PR or account changed.".into())
+                        }
+                    });
+                    match checked {
+                        Err(error) => {
+                            self.ready.remove(&pr);
+                            self.state.ready.insert(pr, ReadyProgress::Failed(error));
+                        }
+                        Ok(github) => {
+                            self.state
+                                .ready
+                                .insert(pr.clone(), ReadyProgress::Submitting);
+                            self.submissions.insert(token);
+                            self.submitted_ready.insert(token, intent.clone());
+                            let sender = context.sender.clone();
+                            tokio::spawn(async move {
+                                let result = github
+                                    .ready_for_review(&intent.reference)
+                                    .await
+                                    .map_err(|e| e.to_string());
+                                let _ = sender.send(Command::PrAction(ActionCommand::ReadyDone {
+                                    pr,
+                                    token,
+                                    result,
+                                }));
+                            });
+                        }
+                    }
+                }
+            }
+            ActionCommand::ReadyDone { pr, token, result } => {
+                self.submissions.remove(&token);
+                if let Some(intent) = self.submitted_ready.remove(&token) {
+                    let current = self.ready.get(&pr).is_some_and(|i| i.token == token);
+                    if current {
+                        self.ready.remove(&pr);
+                    }
+                    match result {
+                        Ok(()) => {
+                            tracing::info!(event="pr_ready_for_review", pr_id=%pr);
+                            if current {
+                                self.state.ready.remove(&pr);
+                            }
+                            let _ = context.sender.send(Command::ReadySaved {
+                                pr,
+                                viewer: intent.viewer,
+                            });
+                        }
+                        Err(error) => {
+                            tracing::warn!(event="ready_for_review_failed", pr_id=%pr, error=%error);
+                            if current {
+                                self.state.ready.insert(pr, ReadyProgress::Failed(error));
+                            }
+                        }
                     }
                 }
             }
@@ -452,6 +550,55 @@ impl Coordinator {
     fn request(&mut self, request: Request, context: &Context<'_>) -> Result<()> {
         self.state.error = None;
         match request {
+            Request::ReadyForReview(pr) => {
+                ensure!(
+                    !self.ready.contains_key(&pr),
+                    "Ready for review is already pending"
+                );
+                let current = context
+                    .prs
+                    .get(&pr)
+                    .context("This PR is no longer in the active list")?;
+                ensure!(
+                    current.snapshot.open && current.snapshot.draft && !current.stale,
+                    "Ready for review requires a fresh draft PR"
+                );
+                let intent = ReadyIntent {
+                    token: self.token(),
+                    reference: PrRef {
+                        id: pr.clone(),
+                        repo: current.snapshot.repo.clone(),
+                        number: current.snapshot.number,
+                    },
+                    viewer: context
+                        .viewer
+                        .context("Waiting for GitHub authentication")?
+                        .into(),
+                };
+                let token = intent.token;
+                let reference = intent.reference.clone();
+                let viewer = intent.viewer.clone();
+                self.ready.insert(pr.clone(), intent);
+                self.state.ready.insert(pr.clone(), ReadyProgress::Checking);
+                let sender = context.sender.clone();
+                let config = context.config.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let github = Github::new(&config)?;
+                        ensure!(github.viewer().await? == viewer, "GitHub account changed");
+                        let snapshot = github.snapshot(&reference).await?;
+                        ensure!(github.viewer().await? == viewer, "GitHub account changed");
+                        Ok((Box::new(snapshot), github))
+                    }
+                    .await
+                    .map_err(|e: anyhow::Error| e.to_string());
+                    let _ = sender.send(Command::PrAction(ActionCommand::ReadyChecked {
+                        pr,
+                        token,
+                        result,
+                    }));
+                });
+            }
             Request::Configure { repo, change } => {
                 let mut preferences = self.state.preferences(&repo);
                 preferences.apply(&change);

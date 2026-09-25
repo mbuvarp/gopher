@@ -1,5 +1,5 @@
 use super::*;
-use crate::actions::{Condition, Kind, MergeMethod, MergeProgress};
+use crate::actions::{Condition, Kind, MergeMethod, MergeProgress, ReadyProgress};
 use objc2::runtime::ProtocolObject;
 use std::cell::Cell;
 
@@ -70,6 +70,7 @@ pub(super) struct PrActions {
     pub button: Retained<NSPopUpButton>,
     pub cancel: Retained<NSButton>,
     configure: Retained<NSMenuItem>,
+    ready: Retained<NSMenuItem>,
     merge: Retained<NSMenuItem>,
     labels: Retained<NSMenuItem>,
     separator: Retained<NSMenuItem>,
@@ -106,6 +107,13 @@ impl PrActions {
             })),
             target,
         );
+        let ready = menu_item(
+            "Ready for review",
+            Some(AppEvent::PrAction(Request::ReadyForReview(
+                pr.snapshot.id.clone(),
+            ))),
+            target,
+        );
         let labels = menu_item(
             "Label",
             Some(AppEvent::PopoverAction(Action::Labels {
@@ -124,6 +132,7 @@ impl PrActions {
         let separator = NSMenuItem::separatorItem(mtm);
         menu.addItem(&configure);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
+        menu.addItem(&ready);
         menu.addItem(&merge);
         menu.addItem(&labels);
         menu.addItem(&separator);
@@ -140,6 +149,7 @@ impl PrActions {
             button,
             cancel,
             configure,
+            ready,
             merge,
             labels,
             separator,
@@ -181,6 +191,18 @@ impl PrActions {
             ));
         }
         let preferences = state.preferences(&pr.snapshot.repo);
+        self.ready.setHidden(!pr.snapshot.draft);
+        self.ready.setEnabled(
+            pr.snapshot.draft
+                && pr.snapshot.open
+                && !pr.stale
+                && !state.ready.get(&pr.snapshot.id).is_some_and(|progress| {
+                    matches!(
+                        progress,
+                        ReadyProgress::Checking | ReadyProgress::Submitting
+                    )
+                }),
+        );
         self.merge.setTitle(&NSString::from_str(
             if pr.snapshot.check_state == Some(crate::model::CheckState::Running) {
                 "Merge on green checks"
@@ -190,11 +212,17 @@ impl PrActions {
         ));
         self.merge.setHidden(!preferences.merge.enabled);
         self.labels.setHidden(!preferences.label.enabled);
-        self.separator
-            .setHidden(!preferences.merge.enabled && !preferences.label.enabled);
+        self.separator.setHidden(
+            !pr.snapshot.draft && !preferences.merge.enabled && !preferences.label.enabled,
+        );
         self.merge
             .setEnabled(preferences.allows(Kind::Merge, pr) && !busy);
         self.labels.setEnabled(preferences.allows(Kind::Label, pr));
+        bind_item(
+            &self.ready,
+            AppEvent::PrAction(Request::ReadyForReview(pr.snapshot.id.clone())),
+            target,
+        );
         bind_item(
             &self.configure,
             AppEvent::PopoverAction(Action::ConfigureRepo(pr.snapshot.repo.clone())),
@@ -226,6 +254,7 @@ impl PrActions {
         forget(
             [
                 self.configure.tag(),
+                self.ready.tag(),
                 self.merge.tag(),
                 self.labels.tag(),
                 self.ignore.tag(),
