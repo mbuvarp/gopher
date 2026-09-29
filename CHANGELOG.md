@@ -6,6 +6,11 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-29
+
+- Show a Failed status with distinct PR and menu bar icons when Codex explicitly reports a failed review for the current commit.
+- Notify after the failure is confirmed, and allow acknowledgement to silence that update.
+
 ## [0.5.0] - 2026-09-25
 
 - Add a Ready for review action for draft PRs, with progress and error feedback while Gopher asks GitHub to mark them ready.
