@@ -30,7 +30,20 @@ pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResul
             .lines()
             .filter(|line| line.starts_with('|') && line.contains('`'))
             .collect();
-        if rows.iter().any(|row| {
+        let current_rows: Vec<_> = rows
+            .iter()
+            .copied()
+            .filter(|row| matches_commit(row.split('|').nth(3).unwrap_or(""), &s.head))
+            .collect();
+        if current_rows.is_empty() {
+            return result(
+                agent,
+                Verdict::Unknown,
+                &summary.id,
+                "Codex summary is missing current-commit evidence",
+            );
+        }
+        if current_rows.iter().any(|row| {
             row.split('|').nth(2).is_some_and(|cell| {
                 cell.to_lowercase().contains("running") || cell.to_lowercase().contains("queued")
             })
@@ -42,24 +55,43 @@ pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResul
                 "Codex summary contains a running review",
             );
         }
-        if rows.is_empty()
-            || rows
-                .iter()
-                .any(|row| !matches_commit(row.split('|').nth(3).unwrap_or(""), &s.head))
-        {
+        let statuses: Vec<_> = current_rows
+            .iter()
+            .map(|row| row.split('|').nth(2).unwrap_or(""))
+            .collect();
+        let failed: Vec<_> = current_rows
+            .iter()
+            .zip(&statuses)
+            .filter(|(_, status)| {
+                status
+                    .split(|c: char| !c.is_ascii_alphabetic())
+                    .find(|word| !word.is_empty())
+                    .is_some_and(|word| word.eq_ignore_ascii_case("failed"))
+            })
+            .map(|(row, _)| *row)
+            .collect();
+        if !failed.is_empty() {
+            return result(
+                agent,
+                Verdict::Failed,
+                format!("{}:{}", summary.id, crate::model::hash(failed.join("\n"))),
+                "Codex summary reports a failed review for the current commit",
+            );
+        }
+        if current_rows.len() != rows.len() {
             return result(
                 agent,
                 Verdict::Unknown,
                 &summary.id,
-                "Codex summary is missing current-commit evidence",
+                "Codex summary includes review activity for an older commit",
             );
         }
-        let statuses: Vec<_> = rows
+        let statuses: Vec<_> = statuses
             .iter()
-            .map(|row| row.split('|').nth(2).unwrap_or("").to_lowercase())
+            .map(|status| status.to_lowercase())
             .collect();
         if statuses.iter().any(|status| {
-            ["failed", "cancelled", "canceled", "skipped", "error"]
+            ["cancelled", "canceled", "skipped", "error"]
                 .iter()
                 .any(|word| status.contains(word))
         }) {

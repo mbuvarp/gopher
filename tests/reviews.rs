@@ -377,14 +377,97 @@ fn summary_for_old_commit_does_not_approve() {
     assert_eq!(state(&s), State::Unknown);
 }
 #[test]
-fn codex_error_summary_blocks_old_review() {
+fn explicit_codex_failure_blocks_old_approval() {
     let mut s = snapshot();
     s.comments.push(summary("<!-- codex-pull-request-review-summary -->\n| Code Review | Failed | `abcdef0` | New commits |"));
     s.reviews.push(Review {
         state: "APPROVED".into(),
         ..review(Agent::Codex, "")
     });
+    assert_eq!(state(&s), State::Failed);
+}
+#[test]
+fn codex_failed_summary_settles_and_notifies_once_per_update() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let mut s = snapshot();
+    s.comments
+        .push(summary(include_str!("fixtures/codex-failed.md")));
+
+    let first = transition(s.clone(), None, None, 100, 30);
+    assert_eq!(first.agents[0].verdict, Verdict::Failed);
+    assert_eq!(first.state, State::Reviewing);
+    assert!(!first.needs_attention());
+    let mut confirmed = transition(s.clone(), Some(&first), None, 130, 30);
+    assert_eq!(confirmed.state, State::Failed);
+    assert!(confirmed.needs_attention());
+    let notification = store.notification(&confirmed).unwrap().unwrap();
+    store.mark_delivered(&notification).unwrap();
+    assert!(store.notification(&confirmed).unwrap().is_none());
+
+    confirmed.acknowledged = Some(confirmed.update_id.clone());
+    let stable = transition(s.clone(), Some(&confirmed), None, 160, 30);
+    assert_eq!(stable.update_id, confirmed.update_id);
+    assert!(!stable.needs_attention());
+
+    s.comments[0].body = s.comments[0].body.replace("10:23:41", "10:25:41");
+    let rerun = transition(s, Some(&stable), None, 190, 30);
+    assert_ne!(rerun.update_id, stable.update_id);
+    assert_eq!(rerun.state, State::Reviewing);
+    let failed_again = transition(rerun.snapshot.clone(), Some(&rerun), None, 220, 30);
+    assert_eq!(failed_again.state, State::Failed);
+    assert!(failed_again.needs_attention());
+    assert!(store.notification(&failed_again).unwrap().is_some());
+}
+#[test]
+fn codex_failure_requires_current_commit_and_is_distinct_from_other_statuses() {
+    for (status, expected) in [
+        ("Failed", State::Failed),
+        ("Not failed", State::Unknown),
+        ("Cancelled", State::Unknown),
+        ("Skipped", State::Unknown),
+        ("Error", State::Unknown),
+    ] {
+        let mut s = snapshot();
+        s.comments.push(summary(&format!("<!-- codex-pull-request-review-summary -->\n| Code Review | {status} | `abcdef0` | New commits |")));
+        assert_eq!(state(&s), expected, "{status}");
+        s.head = "1111111000000000000000000000000000000000".into();
+        assert_eq!(state(&s), State::Unknown, "old {status}");
+    }
+}
+#[test]
+fn current_codex_failure_is_not_hidden_by_an_older_summary_row() {
+    let mut s = snapshot();
+    s.comments.push(summary("<!-- codex-pull-request-review-summary -->\n| Code Review | Running | `1111111` | New commits |\n| Security Review | Failed | `abcdef0` | Manual |"));
+    assert_eq!(state(&s), State::Failed);
+    s.comments[0].body = s.comments[0]
+        .body
+        .replace("Failed", "Completed — no findings");
     assert_eq!(state(&s), State::Unknown);
+}
+#[test]
+fn running_review_precedes_failure_but_failure_precedes_missing_evidence() {
+    let mut s = snapshot();
+    s.comments.push(summary("<!-- codex-pull-request-review-summary -->\n| Code Review | Failed | `abcdef0` | New commits |"));
+    let failed = reviewers::evaluate(&s, None, None);
+    let missing = AgentResult {
+        agent: Agent::CodeRabbit,
+        verdict: Verdict::Unknown,
+        run_id: String::new(),
+        reason: String::new(),
+    };
+    assert_eq!(
+        reviewers::aggregate(&s, &[failed[0].clone(), missing.clone()]),
+        State::Failed
+    );
+    let running = AgentResult {
+        verdict: Verdict::Running,
+        ..missing
+    };
+    assert_eq!(
+        reviewers::aggregate(&s, &[failed[0].clone(), running]),
+        State::Reviewing
+    );
 }
 #[test]
 fn unrelated_successful_ci_does_not_count() {

@@ -925,6 +925,7 @@ fn pr_status_symbols(state: State, draft: bool) -> (&'static [&'static str], &'s
     const UNKNOWN: &[&str] = &["questionmark.circle"];
     const READY: &[&str] = &["hourglass"];
     const REVIEWING: &[&str] = &["arrow.triangle.2.circlepath"];
+    const FAILED: &[&str] = &["exclamationmark.octagon"];
     const COMMENTS: &[&str] = &["text.bubble"];
     const APPROVED: &[&str] = &["checkmark.circle"];
     if draft {
@@ -935,6 +936,7 @@ fn pr_status_symbols(state: State, draft: bool) -> (&'static [&'static str], &'s
         State::Unknown => UNKNOWN,
         State::ReadyForReview => READY,
         State::Reviewing => REVIEWING,
+        State::Failed => FAILED,
         State::Comments => COMMENTS,
         State::Approved => APPROVED,
     };
@@ -955,7 +957,7 @@ fn menu_bar_state(prs: &[PullRequest], has_error: bool) -> MenuBarState {
     if has_error {
         return MenuBarState::Review(State::Unknown);
     }
-    for state in [State::Comments, State::Approved] {
+    for state in [State::Failed, State::Comments, State::Approved] {
         if prs
             .iter()
             .any(|pr| !pr.snapshot.draft && pr.needs_attention() && pr.state == state)
@@ -1038,6 +1040,23 @@ fn icon(state: MenuBarState) -> tray_icon::Icon {
                 }
                 State::ReadyForReview => unreachable!("ready for review uses the gopher artwork"),
                 State::Reviewing => unreachable!("reviewing uses the gopher artwork"),
+                State::Failed => {
+                    let points = [
+                        (11., 3.),
+                        (25., 3.),
+                        (33., 11.),
+                        (33., 25.),
+                        (25., 33.),
+                        (11., 33.),
+                        (3., 25.),
+                        (3., 11.),
+                    ];
+                    points.iter().enumerate().any(|(index, &(ax, ay))| {
+                        let (bx, by) = points[(index + 1) % points.len()];
+                        distance(px, py, ax, ay, bx, by) < 1.8
+                    }) || ((px - 18.).abs() < 1.8 && (10. ..23.).contains(&py))
+                        || ((px - 18.).abs() < 1.8 && (26. ..29.).contains(&py))
+                }
                 State::Comments => {
                     (px > 5. && px < 30. && py > 7. && py < 25.)
                         || (px > 8. && px < 14. && (25. ..30.).contains(&py))
@@ -1119,7 +1138,12 @@ mod tests {
             pr_status_symbols(pr.state, false),
             (&["hourglass"][..], "Ready for review")
         );
-        for state in [State::Comments, State::Approved, State::Reviewing] {
+        for state in [
+            State::Failed,
+            State::Comments,
+            State::Approved,
+            State::Reviewing,
+        ] {
             pr.state = state;
             pr.acknowledged = None;
             assert_eq!(
@@ -1129,6 +1153,10 @@ mod tests {
             pr.acknowledged = Some(pr.update_id.clone());
             assert_eq!(menu_bar_state(&[pr.clone()], false), MenuBarState::Idle);
         }
+        assert_eq!(
+            pr_status_symbols(State::Failed, false),
+            (&["exclamationmark.octagon"][..], "Failed")
+        );
         pr.stale = true;
         pr.acknowledged = None;
         assert_eq!(
@@ -1145,6 +1173,7 @@ mod tests {
             State::Unknown,
             State::ReadyForReview,
             State::Reviewing,
+            State::Failed,
             State::Comments,
             State::Approved,
         ] {
