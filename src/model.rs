@@ -42,18 +42,20 @@ pub enum State {
     Unknown,
     ReadyForReview,
     Reviewing,
+    Failed,
     Comments,
     Approved,
 }
 impl State {
     pub fn actionable(self) -> bool {
-        matches!(self, Self::Comments | Self::Approved)
+        matches!(self, Self::Failed | Self::Comments | Self::Approved)
     }
     pub fn label(self) -> &'static str {
         match self {
             Self::Unknown => "Unknown",
             Self::ReadyForReview => "Ready for review",
             Self::Reviewing => "Reviewing",
+            Self::Failed => "Failed",
             Self::Comments => "Comments",
             Self::Approved => "Approved",
         }
@@ -65,6 +67,7 @@ impl State {
 pub enum Verdict {
     Unknown,
     Running,
+    Failed,
     Clean,
     Findings,
     Skipped,

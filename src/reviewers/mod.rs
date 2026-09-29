@@ -123,6 +123,9 @@ pub fn aggregate(snapshot: &Snapshot, agents: &[AgentResult]) -> State {
     if agents.iter().any(|a| a.verdict == Verdict::Running) {
         return State::Reviewing;
     }
+    if agents.iter().any(|a| a.verdict == Verdict::Failed) {
+        return State::Failed;
+    }
     if agents.is_empty() || agents.iter().any(|a| a.verdict == Verdict::Unknown) {
         return State::Unknown;
     }
