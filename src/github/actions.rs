@@ -62,6 +62,18 @@ impl Github {
             .await
     }
 
+    /// GitHub recalculates mergeability asynchronously after the base branch
+    /// moves; merging before it finishes can fail with "Base branch was modified".
+    pub async fn mergeability_known(&self, pr: &PrRef) -> Result<bool> {
+        let data = self
+            .graphql(
+                "query Mergeability($id:ID!){node(id:$id){... on PullRequest{mergeable}}}",
+                json!({"id": pr.id}),
+            )
+            .await?;
+        Ok(data["node"]["mergeable"] != "UNKNOWN")
+    }
+
     pub async fn merge_pr(&self, pr: &PrRef, head: &str, method: MergeMethod) -> Result<()> {
         ensure!(!head.is_empty(), "Cannot merge without a known commit");
         let response = self

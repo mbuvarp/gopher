@@ -180,6 +180,7 @@ impl PrActions {
             Some(
                 MergeProgress::WaitingForChecks
                     | MergeProgress::Countdown(_)
+                    | MergeProgress::Queued(_)
                     | MergeProgress::Checking
             )
         ));
