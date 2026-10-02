@@ -18,6 +18,13 @@ use tokio::sync::mpsc::UnboundedSender;
 #[cfg(all(test, unix))]
 mod tests;
 
+/// Bounded, read-only wait for GitHub to recalculate mergeability (about 30s).
+const MERGEABILITY_ATTEMPTS: u32 = 15;
+#[cfg(not(test))]
+const MERGEABILITY_POLL: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const MERGEABILITY_POLL: Duration = Duration::from_millis(20);
+
 mod catalogues;
 
 pub enum ActionCommand {
@@ -88,6 +95,14 @@ impl Intent {
             repo: self.pr.snapshot.repo.clone(),
             number: self.pr.snapshot.number,
         }
+    }
+    /// An unknown base branch conservatively shares a lane with the whole repo.
+    fn shares_base(&self, other: &Intent) -> bool {
+        let (a, b) = (&self.pr.snapshot, &other.pr.snapshot);
+        repo_key(&a.repo) == repo_key(&b.repo)
+            && (a.base_branch.is_none()
+                || b.base_branch.is_none()
+                || a.base_branch == b.base_branch)
     }
     fn valid(&self, context: &Context<'_>, state: &ActionState, kind: Kind) -> bool {
         context.viewer == Some(self.viewer.as_str())
@@ -287,6 +302,9 @@ impl Coordinator {
             self.start_countdown(id, token, context);
             self.publish(context);
         }
+        if self.advance_merges(context) {
+            self.publish(context);
+        }
     }
     pub fn handle(&mut self, command: ActionCommand, context: &Context<'_>) {
         if self.shutting_down
@@ -410,7 +428,12 @@ impl Coordinator {
                             .merges
                             .insert(pr, MergeProgress::Countdown(remaining));
                     } else {
-                        self.check_merge(&pr, context);
+                        match self.merge_blocker(&pr) {
+                            Some(number) => {
+                                self.queue_merge(pr, number);
+                            }
+                            None => self.check_merge(&pr, context),
+                        }
                     }
                 }
             }
@@ -781,6 +804,57 @@ impl Coordinator {
             }
         });
     }
+    /// The PR number whose merge into the same base branch is being checked or
+    /// submitted. GitHub rejects concurrent merges with "Base branch was
+    /// modified", and mutations are never retried, so each base merges serially.
+    fn merge_blocker(&self, pr: &str) -> Option<u64> {
+        let intent = self.merges.get(pr)?;
+        self.merges
+            .iter()
+            .find(|(other, active)| {
+                *other != pr
+                    && matches!(
+                        self.state.merges.get(*other),
+                        Some(MergeProgress::Checking | MergeProgress::Merging)
+                    )
+                    && active.shares_base(intent)
+            })
+            .map(|(_, active)| active.pr.snapshot.number)
+    }
+    fn queue_merge(&mut self, pr: String, behind: u64) -> bool {
+        let progress = MergeProgress::Queued(behind);
+        if self.state.merges.get(&pr) == Some(&progress) {
+            return false;
+        }
+        tracing::info!(event="merge_queued", pr_id=%pr, behind);
+        self.state.merges.insert(pr, progress);
+        true
+    }
+    /// Starts queued merges in request order once their base branch is free.
+    /// Each one still runs the full final validation against the new base.
+    fn advance_merges(&mut self, context: &Context<'_>) -> bool {
+        if self.shutting_down {
+            return false;
+        }
+        let mut queued = self
+            .merges
+            .iter()
+            .filter(|(id, _)| matches!(self.state.merges.get(*id), Some(MergeProgress::Queued(_))))
+            .map(|(id, intent)| (intent.token, id.clone()))
+            .collect::<Vec<_>>();
+        queued.sort_unstable();
+        let mut changed = false;
+        for (_, id) in queued {
+            changed |= match self.merge_blocker(&id) {
+                Some(number) => self.queue_merge(id, number),
+                None => {
+                    self.check_merge(&id, context);
+                    true
+                }
+            };
+        }
+        changed
+    }
     fn check_merge(&mut self, pr: &str, context: &Context<'_>) {
         let Some(intent) = self.merges.get(pr).cloned() else {
             return;
@@ -796,6 +870,17 @@ impl Coordinator {
                     github.viewer().await? == intent.viewer,
                     "GitHub account changed; merge cancelled"
                 );
+                // A preceding merge moves the base branch. Reads may repeat, but
+                // the merge itself is submitted once even if this stays unknown.
+                let mut attempts = 1;
+                while !github.mergeability_known(&intent.reference()).await? {
+                    if attempts == MERGEABILITY_ATTEMPTS {
+                        tracing::info!(event="merge_mergeability_unknown", pr_id=%pr);
+                        break;
+                    }
+                    attempts += 1;
+                    tokio::time::sleep(MERGEABILITY_POLL).await;
+                }
                 let snapshot = github.snapshot(&intent.reference()).await?;
                 // Remain cancellable while checking authentication, then let the
                 // worker revalidate its latest PR state and settings before merging.

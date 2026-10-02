@@ -182,6 +182,8 @@ pub struct Labels {
 pub enum MergeProgress {
     WaitingForChecks,
     Countdown(u8),
+    /// Waiting for the numbered PR's merge into the same base branch to finish.
+    Queued(u64),
     Checking,
     Merging,
     Complete,
@@ -198,6 +200,7 @@ impl MergeProgress {
         match self {
             Self::WaitingForChecks => "Merge pending…".into(),
             Self::Countdown(seconds) => format!("Cancel ({seconds}s)"),
+            Self::Queued(number) => format!("Waiting for #{number}…"),
             Self::Checking => "Checking merge…".into(),
             Self::Merging => "Merging…".into(),
             Self::Complete => "Merged".into(),
@@ -207,7 +210,11 @@ impl MergeProgress {
     pub fn busy(&self) -> bool {
         matches!(
             self,
-            Self::WaitingForChecks | Self::Countdown(_) | Self::Checking | Self::Merging
+            Self::WaitingForChecks
+                | Self::Countdown(_)
+                | Self::Queued(_)
+                | Self::Checking
+                | Self::Merging
         )
     }
 }

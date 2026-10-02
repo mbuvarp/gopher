@@ -6,6 +6,8 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+- Fix merges failing with "Base branch was modified" when several PRs in the same repository are merged at once. Merges into the same base branch now run one after another, each showing "Waiting for #N…" until the previous merge finishes, and each is rechecked against the updated branch before merging.
+
 ## [0.5.3] - 2026-10-02
 
 - Fix PRs staying at Unknown after being marked ready for review when a reviewer skipped the draft, such as CodeRabbit reporting that automatic reviews are disabled. They now show as Ready for review, while explicitly required reviewers that skip still keep the result Unknown.
