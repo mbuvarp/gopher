@@ -6,8 +6,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub(super) struct ApiState {
     account: Option<String>,
     generation: u64,
-    cached: BTreeMap<String, Cached>,
+    cached: BTreeMap<Arc<str>, Entry>,
+    /// Endpoints by last use, oldest first, sharing the keys of `cached`.
+    recency: BTreeMap<u64, Arc<str>>,
     bytes: usize,
+    clock: u64,
+    limits: Limits,
     blocked: BTreeMap<String, Instant>,
     secondary_failures: u32,
 }
@@ -28,7 +32,31 @@ fn retry_after(headers: &BTreeMap<String, String>) -> Option<u64> {
 #[derive(Clone)]
 pub(super) struct Cached {
     pub etag: String,
-    pub body: Vec<u8>,
+    /// Shared so reading an entry under the lock never copies its body.
+    pub body: Arc<[u8]>,
+}
+struct Entry {
+    cached: Cached,
+    used: u64,
+}
+/// Counts every retained string so the byte bound covers ETags and keys too.
+fn size(endpoint: &str, etag: &str, body: &[u8]) -> usize {
+    endpoint.len() + etag.len() + body.len()
+}
+/// Polls revisit every entry in a fixed order, so least-recently-used eviction
+/// only saves requests while the cap exceeds the working set; bytes bound memory.
+#[derive(Clone, Copy)]
+struct Limits {
+    entries: usize,
+    bytes: usize,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            entries: 2048,
+            bytes: 16 * 1024 * 1024,
+        }
+    }
 }
 #[derive(Clone)]
 pub(super) struct CacheKey {
@@ -83,8 +111,7 @@ impl ApiState {
         if self.account.as_deref() != Some(account) {
             self.account = Some(account.into());
             self.generation += 1;
-            self.cached.clear();
-            self.bytes = 0;
+            self.clear();
         }
     }
     pub fn key(&self, endpoint: &str, account: Option<&str>) -> Option<CacheKey> {
@@ -103,42 +130,91 @@ impl ApiState {
     pub fn same_account(&self, key: &CacheKey) -> bool {
         self.account.as_deref() == Some(&key.account)
     }
-    pub fn get(&self, key: &CacheKey) -> Option<Cached> {
-        self.valid(key)
-            .then(|| self.cached.get(&key.endpoint).cloned())
-            .flatten()
+    pub fn get(&mut self, key: &CacheKey) -> Option<Cached> {
+        if !self.valid(key) {
+            return None;
+        }
+        let entry = self.cached.get_mut(key.endpoint.as_str())?;
+        self.clock += 1;
+        let Some(endpoint) = self.recency.remove(&entry.used) else {
+            self.reset_inconsistent();
+            return None;
+        };
+        entry.used = self.clock;
+        let cached = entry.cached.clone();
+        self.recency.insert(self.clock, endpoint);
+        Some(cached)
     }
     pub fn put(&mut self, key: &CacheKey, etag: Option<&str>, body: &[u8]) {
         if !self.valid(key) {
             return;
         }
-        if let Some(old) = self.cached.remove(&key.endpoint) {
-            self.bytes -= old.body.len();
-        }
+        self.remove(&key.endpoint);
         let Some(etag) = etag else {
             return;
         };
-        if body.len() > 1024 * 1024 || etag.len() > 1024 {
+        let needed = size(&key.endpoint, etag, body);
+        if body.len() > 1024 * 1024 || etag.len() > 1024 || needed > self.limits.bytes {
             return;
         }
-        if self.bytes + body.len() > 16 * 1024 * 1024 || self.cached.len() >= 256 {
-            self.cached.clear();
-            self.bytes = 0;
+        // Evict individually so one overflow cannot discard every conditional request;
+        // entries for superseded heads are never read again and go first.
+        let mut evicted = 0;
+        while self.bytes + needed > self.limits.bytes || self.cached.len() >= self.limits.entries {
+            let Some((_, oldest)) = self.recency.pop_first() else {
+                // Never panic under the shared lock; dropping the cache only costs requests.
+                self.reset_inconsistent();
+                break;
+            };
+            self.remove(&oldest);
+            evicted += 1;
         }
-        self.bytes += body.len();
+        self.clock += 1;
+        let endpoint: Arc<str> = key.endpoint.as_str().into();
+        self.bytes += needed;
+        self.recency.insert(self.clock, endpoint.clone());
         self.cached.insert(
-            key.endpoint.clone(),
-            Cached {
-                etag: etag.into(),
-                body: body.to_vec(),
+            endpoint,
+            Entry {
+                cached: Cached {
+                    etag: etag.into(),
+                    body: body.into(),
+                },
+                used: self.clock,
             },
         );
+        if evicted > 0 {
+            tracing::debug!(
+                event = "github_cache_evicted",
+                evicted,
+                entries = self.cached.len(),
+                bytes = self.bytes
+            );
+        }
+    }
+    fn remove(&mut self, endpoint: &str) {
+        if let Some(old) = self.cached.remove(endpoint) {
+            self.recency.remove(&old.used);
+            let size = size(endpoint, &old.cached.etag, &old.cached.body);
+            self.bytes = self.bytes.saturating_sub(size);
+        }
+    }
+    fn reset_inconsistent(&mut self) {
+        tracing::warn!(
+            event = "github_cache_inconsistent",
+            entries = self.cached.len()
+        );
+        self.clear();
+    }
+    fn clear(&mut self) {
+        self.cached.clear();
+        self.recency.clear();
+        self.bytes = 0;
     }
     pub fn invalidate(&mut self) {
         // Prevent an older in-flight GET from repopulating the cache after a credential switch.
         self.generation += 1;
-        self.cached.clear();
-        self.bytes = 0;
+        self.clear();
     }
     pub fn delay(&self, resource: Option<&str>) -> Duration {
         self.blocked
@@ -306,6 +382,125 @@ mod tests {
         state.put(&key, None, b"[]");
         assert!(state.get(&key).is_none());
         assert_eq!(state.bytes, 0);
+    }
+
+    #[test]
+    fn overflow_evicts_least_recently_used_entries_instead_of_clearing() {
+        let mut state = ApiState {
+            limits: Limits {
+                entries: 3,
+                bytes: 16,
+            },
+            ..Default::default()
+        };
+        state.identify("alice");
+        let key = |state: &ApiState, endpoint: &str| state.key(endpoint, Some("alice")).unwrap();
+        let [a, b, c, d, e, f, g] =
+            ["a", "b", "c", "d", "e", "f", "g"].map(|endpoint| key(&state, endpoint));
+        // Each entry counts its endpoint, ETag, and body: 1 + 1 + 2 bytes.
+        for key in [&a, &b, &c] {
+            state.put(key, Some("x"), b"12");
+        }
+        // Reading keeps an entry alive, so the untouched oldest one is evicted.
+        // Assertions inspect the map directly so they do not reorder recency.
+        let cached = |state: &ApiState, keys: &[&str]| {
+            keys.iter()
+                .map(|key| state.cached.contains_key(*key))
+                .collect::<Vec<_>>()
+        };
+        assert!(state.get(&a).is_some());
+        state.put(&d, Some("x"), b"12");
+        assert_eq!(
+            cached(&state, &["a", "b", "c", "d"]),
+            [true, false, true, true]
+        );
+        assert_eq!((state.cached.len(), state.bytes), (3, 12));
+        // Replacing an entry reuses its space without evicting others.
+        state.put(&a, Some("y"), b"123");
+        assert_eq!(state.cached["a"].cached.etag, "y");
+        assert_eq!((state.cached.len(), state.bytes), (3, 13));
+        // A large body evicts only as many of the oldest entries as needed to fit.
+        state.put(&e, Some("x"), b"12345");
+        assert_eq!(
+            cached(&state, &["a", "c", "d", "e"]),
+            [true, false, true, true]
+        );
+        assert_eq!((state.cached.len(), state.bytes), (3, 16));
+        // Entries larger than the whole cache are never retained or evict others.
+        state.put(&f, Some("x"), b"123456789012345");
+        assert_eq!(cached(&state, &["f"]), [false]);
+        assert_eq!((state.cached.len(), state.bytes), (3, 16));
+        // ETags count toward the bound even when the body is empty.
+        state.put(&g, Some("012345"), b"");
+        assert_eq!(
+            cached(&state, &["a", "d", "e", "g"]),
+            [false, false, true, true]
+        );
+        assert_eq!((state.cached.len(), state.bytes), (2, 14));
+        assert_eq!(state.recency.len(), state.cached.len());
+    }
+
+    #[test]
+    fn inconsistent_recency_resets_the_cache_instead_of_panicking() {
+        let mut state = ApiState {
+            limits: Limits {
+                entries: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        state.identify("alice");
+        let a = state.key("a", Some("alice")).unwrap();
+        let b = state.key("b", Some("alice")).unwrap();
+        state.put(&a, Some("x"), b"[]");
+        state.recency.clear();
+        assert!(state.get(&a).is_none());
+        assert_eq!((state.cached.len(), state.bytes), (0, 0));
+        state.put(&a, Some("x"), b"[]");
+        state.recency.clear();
+        state.put(&b, Some("x"), b"[]");
+        assert!(state.get(&b).is_some());
+        assert_eq!(
+            (state.cached.len(), state.recency.len(), state.bytes),
+            (1, 1, 4)
+        );
+    }
+
+    #[test]
+    fn polls_keep_current_heads_cached_while_superseded_heads_are_evicted() {
+        let mut state = ApiState::default();
+        state.identify("alice");
+        // 300 PRs with three endpoints per head, polled in a fixed order; one PR
+        // pushes a new head every poll, leaving its previous entries unused. Label
+        // catalogues for 20 repositories refresh every 30 polls (about 15 minutes).
+        let mut heads = [0; 300];
+        for poll in 0..1000 {
+            heads[poll % heads.len()] += 1;
+            let mut misses = 0;
+            let labels = poll % 30 == 0;
+            for repo in (0..20).filter(|_| labels) {
+                let path = format!("repos/a/{repo}/labels");
+                let key = state.key(&path, Some("alice")).unwrap();
+                if state.get(&key).is_none() {
+                    misses += 1;
+                    state.put(&key, Some("x"), b"[]");
+                }
+            }
+            for (pr, head) in heads.iter().enumerate() {
+                for endpoint in ["check-runs", "statuses", "runs"] {
+                    let path = format!("repos/a/b/{pr}/{head}/{endpoint}");
+                    let key = state.key(&path, Some("alice")).unwrap();
+                    if state.get(&key).is_none() {
+                        misses += 1;
+                        state.put(&key, Some("x"), b"[]");
+                    }
+                }
+            }
+            // After the first poll, only the new head is fetched unconditionally.
+            assert_eq!(misses, if poll == 0 { 920 } else { 3 }, "poll {poll}");
+        }
+        assert_eq!(state.cached.len(), 2048);
+        assert_eq!(state.recency.len(), 2048);
     }
 
     #[test]

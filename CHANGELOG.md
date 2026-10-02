@@ -6,6 +6,8 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+- Reduce GitHub API usage when tracking many PRs by evicting the oldest cached check, status, and label responses individually instead of discarding the whole cache when it fills up.
+
 ## [0.5.2] - 2026-10-02
 
 - Fix PR actions such as Ready for review failing, and polled PRs briefly showing as stale, when several actions are performed in quick succession.
