@@ -96,7 +96,12 @@ impl ApiState {
         })
     }
     fn valid(&self, key: &CacheKey) -> bool {
-        self.account.as_deref() == Some(&key.account) && self.generation == key.generation
+        self.same_account(key) && self.generation == key.generation
+    }
+    /// A 304 confirms the body read when the request started, even if a
+    /// mutation invalidated the cache meanwhile; only an identity change voids it.
+    pub fn same_account(&self, key: &CacheKey) -> bool {
+        self.account.as_deref() == Some(&key.account)
     }
     pub fn get(&self, key: &CacheKey) -> Option<Cached> {
         self.valid(key)
@@ -277,12 +282,14 @@ mod tests {
         state.put(&key, Some("first"), b"[]");
         assert!(state.get(&key).is_some());
         state.invalidate();
+        assert!(state.same_account(&key));
         state.put(&key, Some("late"), b"[]");
         assert!(state.get(&key).is_none());
         let key = state.key("repos/a/b/labels", Some("alice")).unwrap();
         state.put(&key, Some("second"), b"[]");
         state.identify("bob");
         assert!(state.get(&key).is_none());
+        assert!(!state.same_account(&key));
         assert!(state.key("repos/a/b/labels", Some("alice")).is_none());
         state.put(&key, Some("late"), b"[]");
         assert!(state.cached.is_empty());

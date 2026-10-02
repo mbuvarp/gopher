@@ -635,6 +635,63 @@ esac
 }
 
 #[tokio::test]
+async fn not_modified_survives_a_concurrent_mutation_for_another_pr() {
+    let (dir, github) = mock(
+        r#"
+dir="$(dirname "$0")"
+case "$*" in
+  *graphql*)
+    case "$(cat)" in
+      *ReadyForReview*) echo '{"data":{"markPullRequestReadyForReview":{"pullRequest":{"id":"PR_2","isDraft":false}}}}';;
+      *) echo '{"data":{"viewer":{"login":"test"}}}';;
+    esac
+    exit 0;;
+esac
+printf '%s\n' "$*" >> "$dir/calls"
+case "$*" in
+  *If-None-Match*)
+    touch "$dir/started"
+    while [ ! -e "$dir/release" ]; do sleep 0.02; done
+    printf 'HTTP/2.0 304 Not Modified\r\nETag: "abc"\r\n\r\n'; echo 'HTTP 304' >&2; exit 1;;
+  *) printf 'HTTP/2.0 200 OK\r\nETag: "abc"\r\n\r\n[{"name":"bug","color":"112233"}]';;
+esac
+"#,
+    );
+    github.viewer().await.unwrap();
+    let labels = github.repository_labels("owner/repo").await.unwrap();
+    let pending = tokio::spawn({
+        let github = github.clone();
+        async move { github.repository_labels("owner/repo").await }
+    });
+    for _ in 0..500 {
+        if dir.path().join("started").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(dir.path().join("started").exists());
+    // Another PR's mutation invalidates the shared cache while the conditional
+    // request for this PR is still waiting for GitHub's 304.
+    github
+        .ready_for_review(&gopher::github::PrRef {
+            id: "PR_2".into(),
+            repo: "owner/repo".into(),
+            number: 2,
+        })
+        .await
+        .unwrap();
+    std::fs::write(dir.path().join("release"), "").unwrap();
+    assert_eq!(pending.await.unwrap().unwrap(), labels);
+    // The late 304 must not repopulate the invalidated cache.
+    github.repository_labels("owner/repo").await.unwrap();
+    let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+    let calls: Vec<_> = calls.lines().collect();
+    assert_eq!(calls.len(), 3);
+    assert!(calls[1].contains("If-None-Match: \"abc\""));
+    assert!(!calls[2].contains("If-None-Match"));
+}
+
+#[tokio::test]
 async fn secondary_limit_pauses_other_clients_without_retrying_a_mutation() {
     let (dir, github) = mock(
         r#"
