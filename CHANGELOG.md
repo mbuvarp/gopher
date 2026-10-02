@@ -6,6 +6,11 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-10-02
+
+- Fix PRs staying at Unknown after being marked ready for review when a reviewer skipped the draft, such as CodeRabbit reporting that automatic reviews are disabled. They now show as Ready for review, while explicitly required reviewers that skip still keep the result Unknown.
+- Treat a Codex usage-limit comment as a skipped review, and show more specific reasons for skipped reviews (subscription limit, paused, or automatic reviews disabled).
+- Fix PRs staying at Reviewing after a Codex usage-limit notice, or showing as Ready for review when a manual review was posted after a skipped one.
 - Reduce GitHub API usage when tracking many PRs by evicting the oldest cached check, status, and label responses individually instead of discarding the whole cache when it fills up.
 
 ## [0.5.2] - 2026-10-02
