@@ -1637,3 +1637,59 @@ fn required_reviewer_that_never_ran_keeps_waiting_after_a_push() {
         State::ReadyForReview
     );
 }
+
+#[test]
+fn current_codex_review_with_a_stale_summary_is_not_awaiting() {
+    let mut s = snapshot();
+    s.comments.push(codex_summary(&HEAD[..7]));
+    let approved = transition(s.clone(), None, None, 100, 0);
+    s.head = NEW_HEAD.into();
+    s.reviews.push(Review {
+        commit: NEW_HEAD.into(),
+        ..review(Agent::Codex, "Requested changes")
+    });
+    s.threads.push(Thread {
+        author: "chatgpt-codex-connector[bot]".into(),
+        ..thread()
+    });
+    let pushed = transition(s, Some(&approved), None, 130, 0);
+    assert_eq!(pushed.state, State::Unknown);
+    assert_eq!(codex(&pushed).verdict, Verdict::Unknown);
+}
+
+#[test]
+fn required_reviewer_skip_is_not_participation_after_a_push() {
+    let expected = Some(&[Agent::Codex, Agent::CodeRabbit][..]);
+    let mut s = snapshot();
+    s.comments.push(codex_summary(&HEAD[..7]));
+    s.checks.push(skipped_coderabbit());
+    let skipped = transition(s.clone(), None, expected, 100, 0);
+    assert_eq!(skipped.state, State::Unknown);
+    s.head = NEW_HEAD.into();
+    s.checks.clear();
+    let pushed = transition(s, Some(&skipped), expected, 130, 0);
+    assert_eq!(pushed.state, State::Unknown);
+    let coderabbit = pushed
+        .agents
+        .iter()
+        .find(|a| a.agent == Agent::CodeRabbit)
+        .unwrap();
+    assert_eq!(coderabbit.verdict, Verdict::Unknown);
+    assert_eq!(codex(&pushed).verdict, Verdict::Pending);
+}
+
+#[test]
+fn inferred_skip_is_not_participation_after_a_push() {
+    let mut s = snapshot();
+    s.reviews.push(Review {
+        commit: "1111111".into(),
+        ..review(Agent::Cubic, "0 issues found")
+    });
+    s.checks.push(cubic_branch_rewrite());
+    let skipped = transition(s.clone(), None, None, 100, 0);
+    assert_eq!(skipped.agents[0].verdict, Verdict::Skipped);
+    s.head = NEW_HEAD.into();
+    s.checks.clear();
+    let pushed = transition(s, Some(&skipped), None, 130, 0);
+    assert_eq!(pushed.agents[0].verdict, Verdict::Unknown);
+}

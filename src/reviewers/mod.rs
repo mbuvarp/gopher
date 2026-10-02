@@ -53,7 +53,7 @@ pub fn evaluate(
             }
             if expected.is_some() && result.verdict == Verdict::Skipped {
                 result.verdict = Verdict::Unknown;
-                result.reason = format!("Required reviewer did not run: {}", result.reason);
+                result.reason = format!("{REQUIRED_SKIP}: {}", result.reason);
             }
             result
         })
@@ -71,13 +71,18 @@ fn observed_new_head(snapshot: &Snapshot, previous: Option<&PullRequest>, agent:
     pr.agents.iter().filter(|a| a.agent == agent).any(|a| {
         let waiting = a.verdict == Verdict::Pending
             || (a.verdict == Verdict::Unknown && a.reason.contains(NOT_STARTED));
-        let participated = !matches!(a.verdict, Verdict::Unknown | Verdict::Skipped)
-            || !a.run_id.is_empty()
-            || observed_agents(&pr.snapshot).contains(&agent);
+        // Explicit skips are not participation, including required reviewers
+        // whose skip was reported as unknown.
+        let skipped = a.verdict == Verdict::Skipped || a.reason.starts_with(REQUIRED_SKIP);
+        let participated = !skipped
+            && (a.verdict != Verdict::Unknown
+                || !a.run_id.is_empty()
+                || observed_agents(&pr.snapshot).contains(&agent));
         waiting || (pr.snapshot.head != snapshot.head && participated)
     })
 }
 
+const REQUIRED_SKIP: &str = "Required reviewer did not run";
 const NOT_STARTED: &str = "has not started reviewing the new commit within";
 
 /// Once the grace period after a new head has passed, reviewers that still have

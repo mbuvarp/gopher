@@ -70,6 +70,16 @@ pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResul
             .filter(|row| matches_commit(row.split('|').nth(3).unwrap_or(""), &s.head))
             .collect();
         if current_rows.is_empty() {
+            // A current-commit review shows Codex already started, so the
+            // stale summary is missing evidence rather than awaiting a review.
+            if current_review(s, agent).is_some() {
+                return result(
+                    agent,
+                    Verdict::Unknown,
+                    &summary.id,
+                    "Codex summary is missing current-commit evidence",
+                );
+            }
             return result(
                 agent,
                 Verdict::Pending,
