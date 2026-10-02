@@ -6,6 +6,11 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-02
+
+- Fix PR actions such as Ready for review failing, and polled PRs briefly showing as stale, when several actions are performed in quick succession.
+- Reduce GitHub API usage after PR actions by reusing cached check, status, and label responses instead of re-downloading them for every tracked PR.
+
 ## [0.5.1] - 2026-09-29
 
 - Show a Failed status with distinct PR and menu bar icons when Codex explicitly reports a failed review for the current commit.
