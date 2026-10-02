@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub(super) struct ApiState {
     account: Option<String>,
     generation: u64,
-    cached: BTreeMap<String, Entry>,
-    /// Endpoints by last use, oldest first.
-    recency: BTreeMap<u64, String>,
+    cached: BTreeMap<Arc<str>, Entry>,
+    /// Endpoints by last use, oldest first, sharing the keys of `cached`.
+    recency: BTreeMap<u64, Arc<str>>,
     bytes: usize,
     clock: u64,
     limits: Limits,
@@ -32,15 +32,16 @@ fn retry_after(headers: &BTreeMap<String, String>) -> Option<u64> {
 #[derive(Clone)]
 pub(super) struct Cached {
     pub etag: String,
-    pub body: Vec<u8>,
+    /// Shared so reading an entry under the lock never copies its body.
+    pub body: Arc<[u8]>,
 }
 struct Entry {
     cached: Cached,
     used: u64,
 }
 /// Counts every retained string so the byte bound covers ETags and keys too.
-fn size(endpoint: &str, cached: &Cached) -> usize {
-    endpoint.len() + cached.etag.len() + cached.body.len()
+fn size(endpoint: &str, etag: &str, body: &[u8]) -> usize {
+    endpoint.len() + etag.len() + body.len()
 }
 /// Polls revisit every entry in a fixed order, so least-recently-used eviction
 /// only saves requests while the cap exceeds the working set; bytes bound memory.
@@ -133,15 +134,16 @@ impl ApiState {
         if !self.valid(key) {
             return None;
         }
-        let entry = self.cached.get_mut(&key.endpoint)?;
+        let entry = self.cached.get_mut(key.endpoint.as_str())?;
         self.clock += 1;
-        let endpoint = self
-            .recency
-            .remove(&entry.used)
-            .expect("cached endpoints track recency");
+        let Some(endpoint) = self.recency.remove(&entry.used) else {
+            self.reset_inconsistent();
+            return None;
+        };
         entry.used = self.clock;
+        let cached = entry.cached.clone();
         self.recency.insert(self.clock, endpoint);
-        Some(entry.cached.clone())
+        Some(cached)
     }
     pub fn put(&mut self, key: &CacheKey, etag: Option<&str>, body: &[u8]) {
         if !self.valid(key) {
@@ -151,7 +153,7 @@ impl ApiState {
         let Some(etag) = etag else {
             return;
         };
-        let needed = key.endpoint.len() + etag.len() + body.len();
+        let needed = size(&key.endpoint, etag, body);
         if body.len() > 1024 * 1024 || etag.len() > 1024 || needed > self.limits.bytes {
             return;
         }
@@ -159,26 +161,24 @@ impl ApiState {
         // entries for superseded heads are never read again and go first.
         let mut evicted = 0;
         while self.bytes + needed > self.limits.bytes || self.cached.len() >= self.limits.entries {
-            let (_, oldest) = self
-                .recency
-                .pop_first()
-                .expect("a nonempty cache tracks recency");
-            let old = self
-                .cached
-                .remove(&oldest)
-                .expect("recency only tracks cached endpoints");
-            self.bytes -= size(&oldest, &old.cached);
+            let Some((_, oldest)) = self.recency.pop_first() else {
+                // Never panic under the shared lock; dropping the cache only costs requests.
+                self.reset_inconsistent();
+                break;
+            };
+            self.remove(&oldest);
             evicted += 1;
         }
         self.clock += 1;
+        let endpoint: Arc<str> = key.endpoint.as_str().into();
         self.bytes += needed;
-        self.recency.insert(self.clock, key.endpoint.clone());
+        self.recency.insert(self.clock, endpoint.clone());
         self.cached.insert(
-            key.endpoint.clone(),
+            endpoint,
             Entry {
                 cached: Cached {
                     etag: etag.into(),
-                    body: body.to_vec(),
+                    body: body.into(),
                 },
                 used: self.clock,
             },
@@ -195,8 +195,16 @@ impl ApiState {
     fn remove(&mut self, endpoint: &str) {
         if let Some(old) = self.cached.remove(endpoint) {
             self.recency.remove(&old.used);
-            self.bytes -= size(endpoint, &old.cached);
+            let size = size(endpoint, &old.cached.etag, &old.cached.body);
+            self.bytes = self.bytes.saturating_sub(size);
         }
+    }
+    fn reset_inconsistent(&mut self) {
+        tracing::warn!(
+            event = "github_cache_inconsistent",
+            entries = self.cached.len()
+        );
+        self.clear();
     }
     fn clear(&mut self) {
         self.cached.clear();
@@ -394,34 +402,68 @@ mod tests {
             state.put(key, Some("x"), b"12");
         }
         // Reading keeps an entry alive, so the untouched oldest one is evicted.
+        // Assertions inspect the map directly so they do not reorder recency.
+        let cached = |state: &ApiState, keys: &[&str]| {
+            keys.iter()
+                .map(|key| state.cached.contains_key(*key))
+                .collect::<Vec<_>>()
+        };
         assert!(state.get(&a).is_some());
         state.put(&d, Some("x"), b"12");
-        assert!(state.get(&b).is_none());
-        for key in [&a, &c, &d] {
-            assert!(state.get(key).is_some());
-        }
+        assert_eq!(
+            cached(&state, &["a", "b", "c", "d"]),
+            [true, false, true, true]
+        );
         assert_eq!((state.cached.len(), state.bytes), (3, 12));
         // Replacing an entry reuses its space without evicting others.
         state.put(&a, Some("y"), b"123");
-        assert_eq!(state.get(&a).unwrap().etag, "y");
+        assert_eq!(state.cached["a"].cached.etag, "y");
         assert_eq!((state.cached.len(), state.bytes), (3, 13));
         // A large body evicts only as many of the oldest entries as needed to fit.
         state.put(&e, Some("x"), b"12345");
-        assert!(state.get(&c).is_none());
-        for key in [&a, &d, &e] {
-            assert!(state.get(key).is_some());
-        }
+        assert_eq!(
+            cached(&state, &["a", "c", "d", "e"]),
+            [true, false, true, true]
+        );
         assert_eq!((state.cached.len(), state.bytes), (3, 16));
         // Entries larger than the whole cache are never retained or evict others.
         state.put(&f, Some("x"), b"123456789012345");
-        assert!(state.get(&f).is_none());
+        assert_eq!(cached(&state, &["f"]), [false]);
         assert_eq!((state.cached.len(), state.bytes), (3, 16));
         // ETags count toward the bound even when the body is empty.
         state.put(&g, Some("012345"), b"");
-        assert!(state.get(&a).is_none() && state.get(&d).is_none());
-        assert!(state.get(&e).is_some() && state.get(&g).is_some());
+        assert_eq!(
+            cached(&state, &["a", "d", "e", "g"]),
+            [false, false, true, true]
+        );
         assert_eq!((state.cached.len(), state.bytes), (2, 14));
         assert_eq!(state.recency.len(), state.cached.len());
+    }
+
+    #[test]
+    fn inconsistent_recency_resets_the_cache_instead_of_panicking() {
+        let mut state = ApiState {
+            limits: Limits {
+                entries: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        state.identify("alice");
+        let a = state.key("a", Some("alice")).unwrap();
+        let b = state.key("b", Some("alice")).unwrap();
+        state.put(&a, Some("x"), b"[]");
+        state.recency.clear();
+        assert!(state.get(&a).is_none());
+        assert_eq!((state.cached.len(), state.bytes), (0, 0));
+        state.put(&a, Some("x"), b"[]");
+        state.recency.clear();
+        state.put(&b, Some("x"), b"[]");
+        assert!(state.get(&b).is_some());
+        assert_eq!(
+            (state.cached.len(), state.recency.len(), state.bytes),
+            (1, 1, 4)
+        );
     }
 
     #[test]
