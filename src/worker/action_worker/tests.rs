@@ -197,7 +197,7 @@ case "$input" in *viewer*) echo '{"data":{"viewer":{"login":"test"}}}'; exit 0;;
         std::fs::write(&gh, format!(r#"#!/bin/sh
 if [ "$1" = auth ]; then echo test-credential; exit 0; fi
 case "$*" in
- *'--method PUT'*) cat > "$(dirname "$0")/merge.json"; echo '{{"merged":true}}'; exit 0;;
+ *'--method PUT'*) printf '%s\n' "$*" >> "$(dirname "$0")/merges.log"; cat > "$(dirname "$0")/merge.json"; echo '{{"merged":true}}'; exit 0;;
  *'--method POST'*|*'--method DELETE'*) printf '%s\n' "$*" >> "$(dirname "$0")/labels.log"; cat >/dev/null; echo '[]'; exit 0;;
 esac
 {fixture}
@@ -276,13 +276,51 @@ esac
         }
     }
     fn start_merge(&mut self) -> u64 {
+        self.merge("PR_1")
+    }
+    fn merge(&mut self, pr: &str) -> u64 {
         self.request(Request::Merge {
             on_green: false,
-            pr: "PR_1".into(),
+            pr: pr.into(),
             head: "head".into(),
-            update: self.prs["PR_1"].update_id.clone(),
+            update: self.prs[pr].update_id.clone(),
         });
-        self.coordinator.merges["PR_1"].token
+        self.coordinator.merges[pr].token
+    }
+    /// Ends the countdown immediately instead of waiting five seconds.
+    fn finish_countdown(&mut self, pr: &str) {
+        let token = self.coordinator.merges[pr].token;
+        self.handle(ActionCommand::Tick {
+            pr: pr.into(),
+            token,
+            remaining: 0,
+        });
+    }
+    fn patch_gh(&self, from: &str, to: &str) {
+        let gh = self.config.gh_path.as_ref().unwrap();
+        let script = std::fs::read_to_string(gh).unwrap();
+        assert!(script.contains(from));
+        std::fs::write(gh, script.replacen(from, to, 1)).unwrap();
+    }
+    fn merge_log(&self) -> Vec<String> {
+        std::fs::read_to_string(self.directory.path().join("merges.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+    fn progress(&self, pr: &str) -> Option<&MergeProgress> {
+        self.coordinator.state.merges.get(pr)
+    }
+    fn reconcile(&mut self) {
+        self.coordinator.reconcile(&Context {
+            store: &self.store,
+            prs: &self.prs,
+            viewer: Some(self.viewer),
+            config: &self.config,
+            sender: &self.sender,
+            sink: &self.sink,
+        });
     }
     async fn step(&mut self) {
         let command = tokio::time::timeout(Duration::from_secs(8), self.receiver.recv())
@@ -294,17 +332,20 @@ esac
         }
     }
     async fn refresh_pr(&mut self) {
+        self.add_pr("PR_1", 1).await;
+    }
+    async fn add_pr(&mut self, id: &str, number: u64) {
         let snapshot = Github::new(&self.config)
             .unwrap()
             .snapshot(&PrRef {
-                id: "PR_1".into(),
+                id: id.into(),
                 repo: "owner/repo".into(),
-                number: 1,
+                number,
             })
             .await
             .unwrap();
         self.prs
-            .insert("PR_1".into(), transition(snapshot, None, None, 100, 0));
+            .insert(id.into(), transition(snapshot, None, None, 100, 0));
     }
     fn assert_no_merge(&self) {
         assert!(!self.directory.path().join("merge.json").exists());
@@ -1380,4 +1421,268 @@ async fn cancelled_queue_ignores_late_validation_after_requeue() {
         MergeProgress::WaitingForChecks
     );
     h.assert_no_merge();
+}
+
+async fn two_queued_merges() -> Harness {
+    let mut h = Harness::new();
+    h.refresh_pr().await;
+    h.add_pr("PR_2", 2).await;
+    assert_eq!(h.prs["PR_2"].snapshot.base_branch.as_deref(), Some("main"));
+    h.merge("PR_1");
+    h.merge("PR_2");
+    h.finish_countdown("PR_1");
+    h.finish_countdown("PR_2");
+    assert_eq!(h.progress("PR_1"), Some(&MergeProgress::Checking));
+    assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Queued(1)));
+    h
+}
+
+#[tokio::test]
+async fn merges_into_the_same_base_branch_are_submitted_one_at_a_time() {
+    let mut h = two_queued_merges().await;
+    for _ in 0..40 {
+        if h.progress("PR_2") == Some(&MergeProgress::Complete) {
+            break;
+        }
+        if matches!(
+            h.progress("PR_2"),
+            Some(MergeProgress::Checking | MergeProgress::Merging)
+        ) {
+            assert_eq!(h.progress("PR_1"), Some(&MergeProgress::Complete));
+        }
+        h.step().await;
+    }
+    assert_eq!(h.progress("PR_1"), Some(&MergeProgress::Complete));
+    assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Complete));
+    let log = h.merge_log();
+    assert_eq!(log.len(), 2);
+    assert!(log[0].contains("pulls/1/merge"));
+    assert!(log[1].contains("pulls/2/merge"));
+}
+
+#[tokio::test]
+async fn a_failed_merge_does_not_block_the_next_queued_merge() {
+    let mut h = Harness::new();
+    h.patch_gh(
+        " *'--method PUT'*)",
+        " *pulls/1/merge*) cat >/dev/null; echo '{\"merged\":false,\"message\":\"Blocked by branch protection\"}'; exit 0;;\n *'--method PUT'*)",
+    );
+    h.refresh_pr().await;
+    h.add_pr("PR_2", 2).await;
+    h.merge("PR_1");
+    h.merge("PR_2");
+    h.finish_countdown("PR_1");
+    h.finish_countdown("PR_2");
+    assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Queued(1)));
+    for _ in 0..40 {
+        if h.progress("PR_2") == Some(&MergeProgress::Complete) {
+            break;
+        }
+        h.step().await;
+    }
+    assert_eq!(
+        h.progress("PR_1"),
+        Some(&MergeProgress::Failed(
+            "GitHub: Blocked by branch protection".into()
+        ))
+    );
+    assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Complete));
+    let log = h.merge_log();
+    assert_eq!(log.len(), 1, "a failed merge must not be retried");
+    assert!(log[0].contains("pulls/2/merge"));
+}
+
+#[tokio::test]
+async fn merges_into_different_base_branches_run_independently() {
+    let mut h = Harness::new();
+    h.refresh_pr().await;
+    h.add_pr("PR_2", 2).await;
+    h.add_pr("PR_3", 3).await;
+    h.prs.get_mut("PR_2").unwrap().snapshot.base_branch = Some("release".into());
+    h.prs.get_mut("PR_3").unwrap().snapshot.repo = "owner/other".into();
+    let preferences = h.coordinator.state.preferences("owner/repo");
+    h.coordinator
+        .state
+        .preferences
+        .insert(repo_key("owner/other"), preferences);
+    for pr in ["PR_1", "PR_2", "PR_3"] {
+        h.merge(pr);
+    }
+    for pr in ["PR_1", "PR_2", "PR_3"] {
+        h.finish_countdown(pr);
+        assert_eq!(h.progress(pr), Some(&MergeProgress::Checking));
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_base_branch_shares_a_queue_with_the_whole_repository() {
+    let mut h = Harness::new();
+    h.refresh_pr().await;
+    h.add_pr("PR_2", 2).await;
+    h.prs.get_mut("PR_2").unwrap().snapshot.base_branch = None;
+    h.merge("PR_1");
+    h.merge("PR_2");
+    h.finish_countdown("PR_1");
+    h.finish_countdown("PR_2");
+    assert_eq!(h.progress("PR_1"), Some(&MergeProgress::Checking));
+    assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Queued(1)));
+}
+
+#[tokio::test]
+async fn countdown_delivery_order_cannot_overtake_an_earlier_request() {
+    let mut h = Harness::new();
+    h.refresh_pr().await;
+    h.add_pr("PR_2", 2).await;
+    h.merge("PR_1");
+    h.merge("PR_2");
+    // Countdowns started together may deliver their final ticks in any order.
+    h.finish_countdown("PR_2");
+    assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Queued(1)));
+    h.finish_countdown("PR_1");
+    assert_eq!(h.progress("PR_1"), Some(&MergeProgress::Checking));
+    assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Queued(1)));
+}
+
+#[tokio::test]
+async fn a_merge_waiting_for_checks_does_not_hold_the_queue() {
+    let mut h = Harness::new();
+    h.refresh_pr().await;
+    h.add_pr("PR_2", 2).await;
+    h.prs.get_mut("PR_1").unwrap().snapshot.check_state = Some(crate::model::CheckState::Running);
+    h.request(Request::Merge {
+        on_green: true,
+        pr: "PR_1".into(),
+        head: "head".into(),
+        update: h.prs["PR_1"].update_id.clone(),
+    });
+    assert_eq!(h.progress("PR_1"), Some(&MergeProgress::WaitingForChecks));
+    // Checks may never turn green, so a ready merge must not wait behind them.
+    h.merge("PR_2");
+    h.finish_countdown("PR_2");
+    assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Checking));
+}
+
+#[tokio::test]
+async fn retargeting_a_pending_merge_cancels_it() {
+    let mut h = two_queued_merges().await;
+    h.prs.get_mut("PR_2").unwrap().snapshot.base_branch = Some("release".into());
+    h.reconcile();
+    assert!(matches!(h.progress("PR_2"), Some(MergeProgress::Failed(_))));
+    assert!(!h.coordinator.merges.contains_key("PR_2"));
+
+    let mut h = Harness::new();
+    h.refresh_pr().await;
+    let token = h.start_merge();
+    let mut snapshot = h.prs["PR_1"].snapshot.clone();
+    snapshot.base_branch = Some("release".into());
+    h.handle(ActionCommand::MergeChecked {
+        pr: "PR_1".into(),
+        token,
+        result: Ok((Box::new(snapshot), Github::new(&h.config).unwrap())),
+    });
+    assert!(matches!(h.progress("PR_1"), Some(MergeProgress::Failed(_))));
+    h.assert_no_merge();
+}
+
+#[tokio::test]
+async fn queued_merges_start_in_request_order() {
+    let mut h = Harness::new();
+    h.refresh_pr().await;
+    h.add_pr("PR_2", 2).await;
+    h.add_pr("PR_3", 3).await;
+    h.merge("PR_1");
+    h.merge("PR_3");
+    h.merge("PR_2");
+    h.finish_countdown("PR_1");
+    h.finish_countdown("PR_2");
+    h.finish_countdown("PR_3");
+    assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Queued(1)));
+    assert_eq!(h.progress("PR_3"), Some(&MergeProgress::Queued(1)));
+    h.request(Request::CancelMerge("PR_1".into()));
+    assert_eq!(h.progress("PR_3"), Some(&MergeProgress::Checking));
+    assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Queued(3)));
+}
+
+#[tokio::test]
+async fn queued_merges_can_be_cancelled_or_invalidated_without_submission() {
+    for case in 0..3 {
+        let mut h = two_queued_merges().await;
+        match case {
+            0 => h.request(Request::CancelMerge("PR_2".into())),
+            1 => {
+                h.prs.get_mut("PR_2").unwrap().snapshot.check_state =
+                    Some(crate::model::CheckState::Conflicts);
+                h.reconcile();
+                assert!(matches!(h.progress("PR_2"), Some(MergeProgress::Failed(_))));
+            }
+            _ => {
+                h.prs.get_mut("PR_2").unwrap().snapshot.head = "new-head".into();
+                h.reconcile();
+            }
+        }
+        assert!(!h.coordinator.merges.contains_key("PR_2"));
+        for _ in 0..40 {
+            if h.progress("PR_1") == Some(&MergeProgress::Complete) {
+                break;
+            }
+            h.step().await;
+        }
+        assert_eq!(h.progress("PR_1"), Some(&MergeProgress::Complete));
+        let log = h.merge_log();
+        assert_eq!(log.len(), 1, "case {case}");
+        assert!(log[0].contains("pulls/1/merge"));
+    }
+}
+
+#[tokio::test]
+async fn shutdown_drains_the_submitted_merge_but_drops_the_queue() {
+    let mut h = two_queued_merges().await;
+    while !h.coordinator.has_submissions() {
+        h.step().await;
+    }
+    h.coordinator.begin_shutdown();
+    while h.coordinator.has_submissions() {
+        h.step().await;
+    }
+    assert!(!h.coordinator.merges.contains_key("PR_2"));
+    let log = h.merge_log();
+    assert_eq!(log.len(), 1);
+    assert!(log[0].contains("pulls/1/merge"));
+}
+
+#[tokio::test]
+async fn merge_waits_for_github_to_recalculate_mergeability() {
+    let mergeability = |delay: &str, limit: u32| {
+        format!(
+            "case \"$input\" in *'query Mergeability'*) echo x >> \"$(dirname \"$0\")/mergeability.log\"; {delay} if [ $(wc -l < \"$(dirname \"$0\")/mergeability.log\") -le {limit} ]; then m=UNKNOWN; else m=MERGEABLE; fi; echo \"{{\\\"data\\\":{{\\\"node\\\":{{\\\"mergeable\\\":\\\"$m\\\"}}}}}}\"; exit 0;; esac\ncase \"$input\" in *viewer*)"
+        )
+    };
+    // Recalculated after two reads; never recalculated; one slow request.
+    for (delay, limit) in [("", 2), ("", 1000), ("sleep 5;", 1000)] {
+        let mut h = Harness::new();
+        h.patch_gh("case \"$input\" in *viewer*)", &mergeability(delay, limit));
+        h.refresh_pr().await;
+        h.start_merge();
+        let start = std::time::Instant::now();
+        h.finish_countdown("PR_1");
+        for _ in 0..20 {
+            if h.progress("PR_1") == Some(&MergeProgress::Complete) {
+                break;
+            }
+            h.step().await;
+        }
+        assert_eq!(h.progress("PR_1"), Some(&MergeProgress::Complete));
+        // The wall-clock bound includes request latency.
+        assert!(start.elapsed() < Duration::from_secs(4), "{delay:?}");
+        let polls = std::fs::read_to_string(h.directory.path().join("mergeability.log"))
+            .unwrap()
+            .lines()
+            .count();
+        match (delay, limit) {
+            ("", 2) => assert_eq!(polls, 3),
+            ("", _) => assert!(polls > 2),
+            _ => assert_eq!(polls, 1),
+        }
+        assert_eq!(h.merge_log().len(), 1);
+    }
 }
