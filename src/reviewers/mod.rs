@@ -37,6 +37,11 @@ pub fn evaluate(
             Agent::CodeRabbit => coderabbit::detect(snapshot),
         })
         .map(|mut result| {
+            if result.verdict == Verdict::Pending
+                && !observed_new_head(snapshot, previous, result.agent)
+            {
+                result.verdict = Verdict::Unknown;
+            }
             if expected.is_none()
                 && !observed.contains(&result.agent)
                 && result.verdict == Verdict::Unknown
@@ -53,6 +58,47 @@ pub fn evaluate(
             result
         })
         .collect()
+}
+
+/// Waiting for a reviewer to start is only safe after Gopher observed the head
+/// change itself, for a reviewer that participated on the earlier head. Without
+/// that (such as on a cold start), the reviewer may have been stalled on this
+/// commit for a long time, so the evidence stays unknown.
+fn observed_new_head(snapshot: &Snapshot, previous: Option<&PullRequest>, agent: Agent) -> bool {
+    let Some(pr) = previous.filter(|pr| pr.fetched_at > 0) else {
+        return false;
+    };
+    pr.agents.iter().filter(|a| a.agent == agent).any(|a| {
+        let waiting = a.verdict == Verdict::Pending
+            || (a.verdict == Verdict::Unknown && a.reason.contains(NOT_STARTED));
+        let participated = !matches!(a.verdict, Verdict::Unknown | Verdict::Skipped)
+            || !a.run_id.is_empty()
+            || observed_agents(&pr.snapshot).contains(&agent);
+        waiting || (pr.snapshot.head != snapshot.head && participated)
+    })
+}
+
+const NOT_STARTED: &str = "has not started reviewing the new commit within";
+
+/// Once the grace period after a new head has passed, reviewers that still have
+/// not started are unknown. Keeping the reason marks the fallback as settled.
+pub fn expire_pending(agents: &mut [AgentResult], grace_seconds: u64) {
+    for agent in agents.iter_mut().filter(|a| a.verdict == Verdict::Pending) {
+        agent.verdict = Verdict::Unknown;
+        agent.reason = format!(
+            "{} {NOT_STARTED} {}",
+            agent.agent.label(),
+            duration_label(grace_seconds)
+        );
+    }
+}
+
+fn duration_label(seconds: u64) -> String {
+    match (seconds / 60, seconds % 60) {
+        (0, seconds) => format!("{seconds}s"),
+        (minutes, 0) => format!("{minutes}m"),
+        (minutes, seconds) => format!("{minutes}m {seconds}s"),
+    }
 }
 
 fn observed_agents(snapshot: &Snapshot) -> BTreeSet<Agent> {
@@ -112,6 +158,8 @@ pub fn ready_for_review(
             agent
                 .reason
                 .starts_with("Previously participating reviewer has no current activity")
+                // Reviewers that never started on a new head participated earlier.
+                || agent.reason.contains(NOT_STARTED)
         })
         && !previous.is_some_and(|pr| {
             let observed = observed_agents(&pr.snapshot);
@@ -138,6 +186,11 @@ pub fn aggregate(snapshot: &Snapshot, agents: &[AgentResult]) -> State {
     }
     if agents.is_empty() || agents.iter().any(|a| a.verdict == Verdict::Unknown) {
         return State::Unknown;
+    }
+    // Results from reviewers that already finished cannot be final while
+    // another reviewer has yet to start on the current commit.
+    if agents.iter().any(|a| a.verdict == Verdict::Pending) {
+        return State::ReadyForReview;
     }
     if snapshot.threads.iter().any(|t| !t.resolved) {
         return State::Comments;

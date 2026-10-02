@@ -4,6 +4,9 @@ discovery_seconds = 120
 request_timeout_seconds = 20
 # Confirm a completed result across polls before announcing it.
 settle_seconds = 30
+# After a new commit, show reviewers that reviewed earlier commits as awaiting
+# review for this long before treating their missing evidence as unknown.
+review_start_grace_seconds = 600
 notifications = true
 log_level = "info" # Use "debug" for request timing.
 # gh_path = "/opt/homebrew/bin/gh"

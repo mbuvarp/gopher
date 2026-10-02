@@ -3,6 +3,8 @@ use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::{collections::BTreeMap, path::PathBuf};
 
+pub const DEFAULT_REVIEW_START_GRACE_SECONDS: u64 = 600;
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -10,6 +12,9 @@ pub struct Config {
     pub discovery_seconds: u64,
     pub request_timeout_seconds: u64,
     pub settle_seconds: u64,
+    /// How long a reviewer that participated on an earlier commit may take to
+    /// start on a new head before its missing evidence is shown as unknown.
+    pub review_start_grace_seconds: u64,
     pub gh_path: Option<PathBuf>,
     pub log_level: String,
     pub notifications: bool,
@@ -31,6 +36,7 @@ impl Default for Config {
             discovery_seconds: 120,
             request_timeout_seconds: 20,
             settle_seconds: 30,
+            review_start_grace_seconds: DEFAULT_REVIEW_START_GRACE_SECONDS,
             gh_path: None,
             log_level: "info".into(),
             notifications: true,
@@ -68,6 +74,10 @@ impl Config {
         ensure!(
             config.settle_seconds <= 600,
             "settle_seconds must be <= 600"
+        );
+        ensure!(
+            config.review_start_grace_seconds <= 3600,
+            "review_start_grace_seconds must be <= 3600"
         );
         tracing_subscriber::EnvFilter::try_new(&config.log_level).context("Invalid log_level")?;
         Ok(config)

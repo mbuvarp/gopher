@@ -1,6 +1,6 @@
 //! Mutations are explicitly requested, checked in the worker, and never retried
 //! automatically. Pending merges are memory-only and disappear on shutdown.
-use super::{Command, Sink, UiEvent, transition};
+use super::{Command, Sink, UiEvent, transition_with_grace};
 use crate::{
     actions::*,
     config::Config,
@@ -418,7 +418,7 @@ impl Coordinator {
                 if let Some(intent) = self.merges.get(&pr).filter(|i| i.token == token).cloned() {
                     let checked = result.and_then(|(snapshot, github)| {
                         let expected = context.config.repositories.get(&snapshot.repo).and_then(|r| r.reviewers.as_deref());
-                        let fresh = transition(*snapshot, Some(&intent.pr), expected, chrono::Utc::now().timestamp(), context.config.settle_seconds);
+                        let fresh = transition_with_grace(*snapshot, Some(&intent.pr), expected, chrono::Utc::now().timestamp(), context.config.settle_seconds, context.config.review_start_grace_seconds);
                         if intent.valid(context, &self.state, Kind::Merge) && intent.preferences.allows(Kind::Merge, &fresh) && fresh.snapshot.head == intent.pr.snapshot.head && fresh.update_id == intent.pr.update_id && (!intent.on_green || (fresh.snapshot.check_state == Some(CheckState::Green) && context.prs.get(&pr).is_some_and(|current| current.snapshot.check_state == Some(CheckState::Green)))) {
                             Ok(github)
                         } else { Err("Merge cancelled: the commit, review state, checks, or action settings changed.".into()) }

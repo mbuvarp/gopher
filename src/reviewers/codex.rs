@@ -72,9 +72,9 @@ pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResul
         if current_rows.is_empty() {
             return result(
                 agent,
-                Verdict::Unknown,
+                Verdict::Pending,
                 &summary.id,
-                "Codex summary is missing current-commit evidence",
+                "Codex summary has no review for the current commit yet",
             );
         }
         if current_rows.iter().any(|row| {
@@ -247,8 +247,8 @@ pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResul
     }
     result(
         agent,
-        Verdict::Unknown,
+        Verdict::Pending,
         "",
-        "Codex reaction cannot be tied to the current commit",
+        "No Codex activity is tied to the current commit yet",
     )
 }

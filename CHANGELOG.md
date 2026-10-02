@@ -6,6 +6,8 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+- Show PRs as Ready for review instead of Unknown right after a new commit is pushed, while Codex, Cubic, or CodeRabbit have not started reviewing it yet. If a reviewer still has not started after 10 minutes (configurable with `review_start_grace_seconds`), the PR shows as Unknown with that reason. Earlier approvals are never carried over to the new commit.
+
 ## [0.5.3] - 2026-10-02
 
 - Fix PRs staying at Unknown after being marked ready for review when a reviewer skipped the draft, such as CodeRabbit reporting that automatic reviews are disabled. They now show as Ready for review, while explicitly required reviewers that skip still keep the result Unknown.

@@ -64,6 +64,14 @@ pub(super) fn detect(s: &Snapshot) -> AgentResult {
             );
         }
     }
+    if checks.is_empty() && current_review(s, agent).is_none() {
+        return result(
+            agent,
+            Verdict::Pending,
+            "",
+            "No Cubic check or review for the current commit yet",
+        );
+    }
     result(
         agent,
         Verdict::Unknown,
