@@ -590,16 +590,22 @@ async fn ignored_lookup_still_rejects_query_and_field_errors() {
 }
 
 #[tokio::test]
-async fn rest_etags_reuse_bodies_across_clients_and_mutations_invalidate_them() {
+async fn rest_etags_reuse_bodies_across_clients_and_survive_mutations() {
     let (dir, github) = mock(
         r#"
+dir="$(dirname "$0")"
 case "$*" in
   *graphql*) cat >/dev/null; echo '{"data":{"viewer":{"login":"test"}}}'; exit 0;;
-  *'--method DELETE'*) printf 'HTTP/2.0 204 No Content\r\n\r\n'; exit 0;;
+  *'--method DELETE'*) touch "$dir/mutated"; printf 'HTTP/2.0 204 No Content\r\n\r\n'; exit 0;;
 esac
-printf '%s\n' "$*" >> "$(dirname "$0")/calls"
+printf '%s\n' "$*" >> "$dir/calls"
 case "$*" in
-  *If-None-Match*) printf 'HTTP/2.0 304 Not Modified\r\nETag: "abc"\r\n\r\n'; echo 'HTTP 304' >&2; exit 1;;
+  *'If-None-Match: "abc"'*)
+    if [ -e "$dir/mutated" ]; then
+      printf 'HTTP/2.0 200 OK\r\nETag: "def"\r\n\r\n[{"name":"docs","color":"445566"}]'; exit 0
+    fi
+    printf 'HTTP/2.0 304 Not Modified\r\nETag: "abc"\r\n\r\n'; echo 'HTTP 304' >&2; exit 1;;
+  *'If-None-Match: "def"'*) printf 'HTTP/2.0 304 Not Modified\r\nETag: "def"\r\n\r\n'; echo 'HTTP 304' >&2; exit 1;;
   *) printf 'HTTP/2.0 200 OK\r\nETag: "abc"\r\n\r\n[{"name":"bug","color":"112233"}]';;
 esac
 "#,
@@ -625,13 +631,20 @@ esac
     )
     .await
     .unwrap();
-    next.repository_labels("owner/repo").await.unwrap();
+    // The mutation keeps the cached ETag; GitHub decides whether it is still current.
+    let changed = next.repository_labels("owner/repo").await.unwrap();
+    assert_eq!(changed[0].name, "docs");
+    assert_eq!(
+        github.repository_labels("owner/repo").await.unwrap(),
+        changed
+    );
     let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
     let calls: Vec<_> = calls.lines().collect();
-    assert_eq!(calls.len(), 3);
+    assert_eq!(calls.len(), 4);
     assert!(!calls[0].contains("If-None-Match"));
     assert!(calls[1].contains("If-None-Match: \"abc\""));
-    assert!(!calls[2].contains("If-None-Match"));
+    assert!(calls[2].contains("If-None-Match: \"abc\""));
+    assert!(calls[3].contains("If-None-Match: \"def\""));
 }
 
 #[tokio::test]
@@ -670,8 +683,8 @@ esac
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(dir.path().join("started").exists());
-    // Another PR's mutation invalidates the shared cache while the conditional
-    // request for this PR is still waiting for GitHub's 304.
+    // Another PR's mutation completes while the conditional request for this
+    // PR is still waiting for GitHub's 304.
     github
         .ready_for_review(&gopher::github::PrRef {
             id: "PR_2".into(),
@@ -682,13 +695,13 @@ esac
         .unwrap();
     std::fs::write(dir.path().join("release"), "").unwrap();
     assert_eq!(pending.await.unwrap().unwrap(), labels);
-    // The late 304 must not repopulate the invalidated cache.
+    // The mutation keeps the cached ETag for the next read.
     github.repository_labels("owner/repo").await.unwrap();
     let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
     let calls: Vec<_> = calls.lines().collect();
     assert_eq!(calls.len(), 3);
     assert!(calls[1].contains("If-None-Match: \"abc\""));
-    assert!(!calls[2].contains("If-None-Match"));
+    assert!(calls[2].contains("If-None-Match: \"abc\""));
 }
 
 #[tokio::test]

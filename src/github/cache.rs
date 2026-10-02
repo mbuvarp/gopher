@@ -99,7 +99,7 @@ impl ApiState {
         self.same_account(key) && self.generation == key.generation
     }
     /// A 304 confirms the body read when the request started, even if a
-    /// mutation invalidated the cache meanwhile; only an identity change voids it.
+    /// credential switch invalidated the cache meanwhile; only an identity change voids it.
     pub fn same_account(&self, key: &CacheKey) -> bool {
         self.account.as_deref() == Some(&key.account)
     }
@@ -135,7 +135,7 @@ impl ApiState {
         );
     }
     pub fn invalidate(&mut self) {
-        // Prevent an older in-flight GET from repopulating the cache after a mutation.
+        // Prevent an older in-flight GET from repopulating the cache after a credential switch.
         self.generation += 1;
         self.cached.clear();
         self.bytes = 0;
