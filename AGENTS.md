@@ -42,6 +42,7 @@ Show assigned labels after the unresolved-thread count as compact colored pills 
 ## Review states
 
 - **Unknown:** Evidence is missing, ambiguous, or insufficient to establish the current result.
+- **Ready for review:** A non-draft PR without unresolved threads whose reviewers have not participated yet. Explicit skips are not participation, including skips posted while the PR was a draft.
 - **Reviewing:** A participating reviewer is still running. This takes precedence over comments already posted.
 - **Failed:** A current-commit reviewer summary explicitly reports a failed run. This takes precedence over missing evidence once no participating reviewer is still running.
 - **Comments:** All participating reviewers have finished and unresolved review threads remain.
@@ -49,7 +50,7 @@ Show assigned labels after the unresolved-thread count as compact colored pills 
 
 Detect participating agents per PR; subscriptions and repository settings vary. Support repository overrides for expected reviewers. Track the current commit and observed review runs, including reruns on the same commit. Never carry an old approval forward without current evidence, or interpret missing activity as approval.
 
-Exclude explicit subscription-limit/paused-review skips and Cubic’s automatic-review skips after branch rewrites from inferred participation, while displaying the reason. For a branch rewrite, explain that a manual Cubic review is required to review the rewritten content. An explicitly required reviewer that skips keeps the result Unknown. Confirm actionable results across polls before notifying (30-second default).
+Exclude explicit subscription-limit/paused/disabled-review skips, Codex usage-limit notices strictly newer than its other activity (including `eyes`), and Cubic’s automatic-review skips after branch rewrites from inferred participation, while displaying the reason. For a branch rewrite, explain that a manual Cubic review is required to review the rewritten content. An explicitly required reviewer that skips keeps the result Unknown. Confirm actionable results across polls before notifying (30-second default).
 
 Do not infer participation solely from a cached Skipped result when that reviewer's activity disappears. Fresh activity reintroduces the reviewer; previously participating reviewers with missing results and explicitly required reviewers still block. Log when a skipped reviewer drops out, and identify historical participation in missing-evidence reasons.
 

@@ -82,8 +82,10 @@ fn observed_agents(snapshot: &Snapshot) -> BTreeSet<Agent> {
 }
 
 /// A fresh, non-draft PR can wait for its first review without implying a
-/// detection failure. Once a reviewer has participated, missing evidence stays
-/// unknown until a current result is observed.
+/// detection failure. Explicit skips (such as reviews skipped for drafts or
+/// paused subscriptions) are not participation. Once a reviewer has
+/// participated, missing evidence stays unknown until a current result is
+/// observed.
 pub fn ready_for_review(
     snapshot: &Snapshot,
     previous: Option<&PullRequest>,
@@ -94,10 +96,18 @@ pub fn ready_for_review(
         && snapshot.open
         && !snapshot.draft
         && !snapshot.threads.iter().any(|thread| !thread.resolved)
-        && observed_agents(snapshot)
+        // Required reviewers never report Skipped, so their activity always blocks.
+        && observed_agents(snapshot).iter().all(|agent| {
+            agents
+                .iter()
+                .find(|result| result.agent == *agent)
+                .map_or(expected.is_some(), |result| {
+                    result.verdict == Verdict::Skipped
+                })
+        })
+        && agents
             .iter()
-            .all(|agent| expected.is_some() && !agents.iter().any(|result| result.agent == *agent))
-        && agents.iter().all(|agent| agent.verdict == Verdict::Unknown)
+            .all(|agent| matches!(agent.verdict, Verdict::Unknown | Verdict::Skipped))
         && !agents.iter().any(|agent| {
             agent
                 .reason
@@ -201,10 +211,13 @@ pub(super) fn check_gate(s: &Snapshot, agent: Agent) -> Option<AgentResult> {
     }
     let branch_rewrite_skip =
         |c: &&Check| agent == Agent::Cubic && cubic::branch_rewrite_skip(&c.summary);
+    // A current-commit review posted after the skip (such as a manual run)
+    // is participation, so let the detector evaluate it instead.
     if !checks.is_empty()
         && checks
             .iter()
             .all(|c| explicitly_skipped(&c.summary) || branch_rewrite_skip(c))
+        && review_after_checks(s, agent).is_none()
     {
         return Some(result(
             agent,
@@ -217,11 +230,24 @@ pub(super) fn check_gate(s: &Snapshot, agent: Agent) -> Option<AgentResult> {
             if checks.iter().any(branch_rewrite_skip) {
                 "Review skipped — branch history rewritten; Cubic requires a manual review"
             } else {
-                "Review skipped — subscription limit or reviewer paused"
+                skip_reason(&checks)
             },
         ));
     }
     None
+}
+fn skip_reason(checks: &[&Check]) -> &'static str {
+    let summaries: Vec<_> = checks.iter().map(|c| c.summary.to_lowercase()).collect();
+    let any = |text: &str| summaries.iter().any(|summary| summary.contains(text));
+    if any("review limit") {
+        "Review skipped — subscription limit reached"
+    } else if any("paused") {
+        "Review skipped — reviews are paused"
+    } else if any("automatic reviews are disabled") {
+        "Review skipped — automatic reviews are disabled"
+    } else {
+        "Review skipped by the reviewer"
+    }
 }
 fn explicitly_skipped(summary: &str) -> bool {
     let summary = summary.to_lowercase();

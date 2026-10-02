@@ -190,6 +190,175 @@ fn draft_or_unresolved_threads_are_not_ready_for_review() {
     assert_eq!(transition(s, None, None, 100, 0).state, State::Unknown);
 }
 #[test]
+fn explicitly_skipped_reviewers_do_not_block_ready_for_review() {
+    let mut s = snapshot();
+    s.draft = true;
+    s.checks.push(skipped_coderabbit());
+    let draft = transition(s.clone(), None, None, 100, 0);
+    assert_eq!(draft.state, State::Unknown);
+
+    s.draft = false;
+    let ready = transition(s.clone(), Some(&draft), None, 130, 30);
+    assert_eq!(ready.state, State::ReadyForReview);
+    assert!(!ready.needs_attention());
+    let coderabbit = &ready.agents[0];
+    assert_eq!(coderabbit.verdict, Verdict::Skipped);
+    assert_eq!(
+        coderabbit.reason,
+        "Review skipped — automatic reviews are disabled"
+    );
+
+    s.reactions.push(eyes());
+    let reviewing = transition(s.clone(), Some(&ready), None, 160, 30);
+    assert_eq!(reviewing.state, State::Reviewing);
+
+    s.reactions.clear();
+    let required = transition(
+        s.clone(),
+        Some(&draft),
+        Some(&[Agent::Codex, Agent::CodeRabbit]),
+        130,
+        30,
+    );
+    assert_eq!(required.state, State::Unknown);
+    let codex_only = transition(s, Some(&draft), Some(&[Agent::Codex]), 130, 30);
+    assert_eq!(codex_only.state, State::ReadyForReview);
+}
+#[test]
+fn review_after_an_explicit_skip_replaces_the_skip() {
+    let mut s = snapshot();
+    s.checks.push(skipped_coderabbit());
+    let mut manual = review(Agent::CodeRabbit, "No actionable comments were generated");
+    manual.submitted_at = "2026-09-07T16:20:00Z".into(); // Before the skip check started.
+    s.reviews.push(manual);
+    assert_eq!(
+        reviewers::evaluate(&s, None, None)[0].verdict,
+        Verdict::Skipped
+    );
+    assert_eq!(
+        transition(s.clone(), None, None, 100, 0).state,
+        State::ReadyForReview
+    );
+
+    s.reviews[0].submitted_at = "2026-09-07T16:30:00Z".into();
+    assert_eq!(
+        reviewers::evaluate(&s, None, None)[0].verdict,
+        Verdict::Clean
+    );
+    assert_eq!(
+        transition(s.clone(), None, None, 100, 0).state,
+        State::Approved
+    );
+    s.reviews[0].body = "Actionable comments posted: 2".into();
+    s.threads.push(Thread {
+        author: "coderabbitai[bot]".into(),
+        resolved: true,
+        ..thread()
+    });
+    // Resolved findings are reviewed, not waiting for a first review.
+    assert_eq!(transition(s, None, None, 100, 0).state, State::Unknown);
+}
+fn usage_limit(updated_at: &str) -> Comment {
+    Comment {
+        id: "limit-1".into(),
+        updated_at: updated_at.into(),
+        ..summary(include_str!("fixtures/codex-usage-limit.md"))
+    }
+}
+#[test]
+fn codex_usage_limit_is_an_explicit_skip_until_newer_codex_activity() {
+    let mut s = snapshot();
+    s.checks.push(skipped_coderabbit());
+    s.comments.push(usage_limit("2026-09-07T16:35:00Z"));
+    let agents = reviewers::evaluate(&s, None, None);
+    let codex = agents.iter().find(|a| a.agent == Agent::Codex).unwrap();
+    assert_eq!(codex.verdict, Verdict::Skipped);
+    assert_eq!(codex.run_id, "limit-1");
+    assert_eq!(codex.reason, "Review skipped — Codex usage limit reached");
+    assert_eq!(
+        transition(s.clone(), None, None, 100, 0).state,
+        State::ReadyForReview
+    );
+    let required = reviewers::evaluate(&s, None, Some(&[Agent::Codex]));
+    assert_eq!(required[0].verdict, Verdict::Unknown);
+    assert!(required[0].reason.contains("Required reviewer did not run"));
+
+    // An older summary or review does not hide a newer notice.
+    let clean = "<!-- codex-pull-request-review-summary -->\n| Code Review | Completed — no findings | `abcdef0` | New commits |";
+    s.comments.push(summary(clean));
+    s.reviews.push(Review {
+        state: "APPROVED".into(),
+        ..review(Agent::Codex, "")
+    });
+    assert_eq!(state(&s), State::Unknown);
+
+    // Codex activity after the notice takes over again.
+    s.reactions.push(Reaction {
+        created_at: "2026-09-07T16:40:00Z".into(),
+        ..thumb()
+    });
+    assert_ne!(
+        reviewers::evaluate(&s, None, None)
+            .iter()
+            .find(|a| a.agent == Agent::Codex)
+            .unwrap()
+            .verdict,
+        Verdict::Skipped
+    );
+    s.reactions.clear();
+    s.reviews[0].submitted_at = "2026-09-07T16:40:00Z".into();
+    assert_eq!(state(&s), State::Approved);
+    s.reviews.clear();
+    s.comments[1].updated_at = "2026-09-07T16:40:00Z".into();
+    assert_eq!(state(&s), State::Approved);
+    s.comments.truncate(1);
+
+    // A leftover eyes reaction from before the notice does not keep it running.
+    s.reactions.push(eyes());
+    assert_eq!(state(&s), State::Unknown);
+    s.reactions[0].created_at = "2026-09-07T16:40:00Z".into();
+    assert_eq!(state(&s), State::Reviewing);
+}
+#[test]
+fn codex_usage_limit_tied_with_other_activity_is_not_a_skip() {
+    let codex = |s: &Snapshot| {
+        reviewers::evaluate(s, None, None)
+            .into_iter()
+            .find(|a| a.agent == Agent::Codex)
+            .unwrap()
+            .verdict
+    };
+    let tie = "2026-09-07T16:30:00Z";
+    let mut s = snapshot();
+    s.comments.push(usage_limit(tie));
+    assert_eq!(codex(&s), Verdict::Skipped);
+    // A second, newer notice is not activity that clears the skip.
+    s.comments.push(Comment {
+        id: "limit-2".into(),
+        ..usage_limit("2026-09-07T16:31:00Z")
+    });
+    assert_eq!(codex(&s), Verdict::Skipped);
+    s.comments.pop();
+
+    let mut summary_tie = s.clone();
+    summary_tie
+        .comments
+        .push(summary(include_str!("fixtures/codex-running.md")));
+    assert_eq!(codex(&summary_tie), Verdict::Running);
+    let mut review_tie = s.clone();
+    review_tie.reviews.push(Review {
+        state: "APPROVED".into(),
+        submitted_at: tie.into(),
+        ..review(Agent::Codex, "")
+    });
+    assert_eq!(codex(&review_tie), Verdict::Clean);
+    s.reactions.push(Reaction {
+        created_at: tie.into(),
+        ..eyes()
+    });
+    assert_eq!(codex(&s), Verdict::Running);
+}
+#[test]
 fn cubic_zero_issues_is_clean_even_without_formal_approval() {
     let mut s = snapshot();
     s.reviews.push(review(
