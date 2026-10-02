@@ -18,10 +18,14 @@ use tokio::sync::mpsc::UnboundedSender;
 #[cfg(all(test, unix))]
 mod tests;
 
-/// Bounded, read-only wait for GitHub to recalculate mergeability (about 30s).
-const MERGEABILITY_ATTEMPTS: u32 = 15;
+/// Read-only wait for GitHub to recalculate mergeability, bounded by wall-clock
+/// time so slow requests cannot hold a base branch's merge queue.
+#[cfg(not(test))]
+const MERGEABILITY_WAIT: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
 const MERGEABILITY_POLL: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const MERGEABILITY_WAIT: Duration = Duration::from_millis(300);
 #[cfg(test)]
 const MERGEABILITY_POLL: Duration = Duration::from_millis(20);
 
@@ -96,13 +100,20 @@ impl Intent {
             number: self.pr.snapshot.number,
         }
     }
-    /// An unknown base branch conservatively shares a lane with the whole repo.
-    fn shares_base(&self, other: &Intent) -> bool {
-        let (a, b) = (&self.pr.snapshot, &other.pr.snapshot);
-        repo_key(&a.repo) == repo_key(&b.repo)
-            && (a.base_branch.is_none()
-                || b.base_branch.is_none()
-                || a.base_branch == b.base_branch)
+    /// The merge lane from the latest PR state, so a retargeted PR cannot be
+    /// treated as independent of merges into its new base branch.
+    fn lane(&self, context: &Context<'_>) -> (String, Option<String>) {
+        let snapshot = context
+            .prs
+            .get(&self.pr.snapshot.id)
+            .map_or(&self.pr.snapshot, |pr| &pr.snapshot);
+        (
+            repo_key(&snapshot.repo),
+            snapshot
+                .base_branch
+                .clone()
+                .or_else(|| self.pr.snapshot.base_branch.clone()),
+        )
     }
     fn valid(&self, context: &Context<'_>, state: &ActionState, kind: Kind) -> bool {
         context.viewer == Some(self.viewer.as_str())
@@ -114,6 +125,7 @@ impl Intent {
                     && preferences.allows(kind, pr)
                     && (kind != Kind::Merge
                         || (pr.snapshot.head == self.pr.snapshot.head
+                            && !retargeted(&self.pr.snapshot, &pr.snapshot)
                             && pr.update_id == self.pr.update_id
                             && (!self.on_green
                                 || matches!(
@@ -122,6 +134,17 @@ impl Intent {
                                 ))))
             })
     }
+}
+/// An unknown base branch conservatively shares a lane with the whole repo.
+fn shares_lane(a: &(String, Option<String>), b: &(String, Option<String>)) -> bool {
+    a.0 == b.0 && (a.1.is_none() || b.1.is_none() || a.1 == b.1)
+}
+/// Merging into a different base than the one displayed changes the action.
+fn retargeted(displayed: &Snapshot, current: &Snapshot) -> bool {
+    matches!(
+        (&displayed.base_branch, &current.base_branch),
+        (Some(displayed), Some(current)) if displayed != current
+    )
 }
 #[derive(Clone)]
 struct LabelJob {
@@ -428,7 +451,7 @@ impl Coordinator {
                             .merges
                             .insert(pr, MergeProgress::Countdown(remaining));
                     } else {
-                        match self.merge_blocker(&pr) {
+                        match self.merge_blocker(&pr, context) {
                             Some(number) => {
                                 self.queue_merge(pr, number);
                             }
@@ -442,7 +465,7 @@ impl Coordinator {
                     let checked = result.and_then(|(snapshot, github)| {
                         let expected = context.config.repositories.get(&snapshot.repo).and_then(|r| r.reviewers.as_deref());
                         let fresh = transition(*snapshot, Some(&intent.pr), expected, chrono::Utc::now().timestamp(), context.config.settle_seconds);
-                        if intent.valid(context, &self.state, Kind::Merge) && intent.preferences.allows(Kind::Merge, &fresh) && fresh.snapshot.head == intent.pr.snapshot.head && fresh.update_id == intent.pr.update_id && (!intent.on_green || (fresh.snapshot.check_state == Some(CheckState::Green) && context.prs.get(&pr).is_some_and(|current| current.snapshot.check_state == Some(CheckState::Green)))) {
+                        if intent.valid(context, &self.state, Kind::Merge) && intent.preferences.allows(Kind::Merge, &fresh) && fresh.snapshot.head == intent.pr.snapshot.head && !retargeted(&intent.pr.snapshot, &fresh.snapshot) && fresh.update_id == intent.pr.update_id && (!intent.on_green || (fresh.snapshot.check_state == Some(CheckState::Green) && context.prs.get(&pr).is_some_and(|current| current.snapshot.check_state == Some(CheckState::Green)))) {
                             Ok(github)
                         } else { Err("Merge cancelled: the commit, review state, checks, or action settings changed.".into()) }
                     });
@@ -804,20 +827,35 @@ impl Coordinator {
             }
         });
     }
-    /// The PR number whose merge into the same base branch is being checked or
-    /// submitted. GitHub rejects concurrent merges with "Base branch was
-    /// modified", and mutations are never retried, so each base merges serially.
-    fn merge_blocker(&self, pr: &str) -> Option<u64> {
+    /// The PR number this merge must wait for: a same-base merge being checked
+    /// or submitted, or an earlier request whose countdown or queue is pending.
+    /// GitHub rejects concurrent merges with "Base branch was modified", and
+    /// mutations are never retried, so each base merges serially in request
+    /// order regardless of which countdown timer is delivered first.
+    fn merge_blocker(&self, pr: &str, context: &Context<'_>) -> Option<u64> {
         let intent = self.merges.get(pr)?;
+        let lane = intent.lane(context);
         self.merges
             .iter()
-            .find(|(other, active)| {
+            .filter(|(other, active)| {
                 *other != pr
-                    && matches!(
+                    && match self.state.merges.get(*other) {
+                        Some(MergeProgress::Checking | MergeProgress::Merging) => true,
+                        Some(MergeProgress::Countdown(_) | MergeProgress::Queued(_)) => {
+                            active.token < intent.token
+                        }
+                        _ => false,
+                    }
+                    && shares_lane(&active.lane(context), &lane)
+            })
+            .min_by_key(|(other, active)| {
+                (
+                    !matches!(
                         self.state.merges.get(*other),
                         Some(MergeProgress::Checking | MergeProgress::Merging)
-                    )
-                    && active.shares_base(intent)
+                    ),
+                    active.token,
+                )
             })
             .map(|(_, active)| active.pr.snapshot.number)
     }
@@ -845,7 +883,7 @@ impl Coordinator {
         queued.sort_unstable();
         let mut changed = false;
         for (_, id) in queued {
-            changed |= match self.merge_blocker(&id) {
+            changed |= match self.merge_blocker(&id, context) {
                 Some(number) => self.queue_merge(id, number),
                 None => {
                     self.check_merge(&id, context);
@@ -872,14 +910,15 @@ impl Coordinator {
                 );
                 // A preceding merge moves the base branch. Reads may repeat, but
                 // the merge itself is submitted once even if this stays unknown.
-                let mut attempts = 1;
-                while !github.mergeability_known(&intent.reference()).await? {
-                    if attempts == MERGEABILITY_ATTEMPTS {
-                        tracing::info!(event="merge_mergeability_unknown", pr_id=%pr);
-                        break;
+                let poll = async {
+                    while !github.mergeability_known(&intent.reference()).await? {
+                        tokio::time::sleep(MERGEABILITY_POLL).await;
                     }
-                    attempts += 1;
-                    tokio::time::sleep(MERGEABILITY_POLL).await;
+                    anyhow::Ok(())
+                };
+                match tokio::time::timeout(MERGEABILITY_WAIT, poll).await {
+                    Ok(result) => result?,
+                    Err(_) => tracing::info!(event="merge_mergeability_unknown", pr_id=%pr),
                 }
                 let snapshot = github.snapshot(&intent.reference()).await?;
                 // Remain cancellable while checking authentication, then let the
