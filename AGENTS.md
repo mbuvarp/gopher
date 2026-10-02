@@ -33,6 +33,7 @@ Highlight by stable PR identity with a rounded white background at 8% opacity, e
 
 Show assigned labels after the unresolved-thread count as compact colored pills using the same 11-point font. Wrap overflow above the buttons. Fetch labels with normal paginated PR snapshots and persist them; label changes must not alter review update IDs or acknowledgements. Apply successful local label changes immediately and discard older in-flight poll results.
 
+- Clicking a red PR action failure or an orange rejected-action banner dismisses that displayed error in the worker; never clear in-progress actions or newer errors, and keep polling/authentication errors visible.
 - The PR Actions menu contains Configure, a separator, enabled actions, a separator, then Ignore. Hide the redundant separator when no optional actions are enabled. Keep the alternative standard menu unchanged.
 - Configure replaces the list with `Configure repo • organization` and a right-aligned Back button. The table columns are Action, Enabled, Condition, and Merge method (empty for Label). Save repository-wide changes immediately to SQLite; preserve settings across account changes and cache pruning.
 - Both actions default disabled. Conditions are Always, Reviewing, Comments, Approved; a configured action remains visible but disabled when its condition fails or data is stale. Confirmed conflicts disable Merge and cancel an unsubmitted merge. Merge defaults to Approved and Merge commit; Label defaults to Always. Support Squash and Rebase as merge methods.

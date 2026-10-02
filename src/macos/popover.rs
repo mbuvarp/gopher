@@ -3,7 +3,7 @@
 use super::{Action, AppEvent, pr_status_image, repo_heading, repo_parts};
 use crate::model::{CheckState, PullRequest, State};
 use crate::{
-    actions::{ActionState, Request, Setting},
+    actions::{ActionState, DisplayedError, Request, Setting},
     worker::Command,
 };
 use tokio::sync::mpsc::UnboundedSender;
@@ -160,6 +160,16 @@ fn set_text(field: &NSTextField, text: &str) {
         field.setStringValue(&NSString::from_str(text));
     }
 }
+/// Invisible click target laid over an error label, so the label keeps its
+/// wrapping layout while clicks dispatch through the shared tag table.
+fn dismiss_button(target: &ActionTarget, mtm: MainThreadMarker) -> Retained<NSButton> {
+    let button = target.button("", AppEvent::RefreshPopover, mtm);
+    button.setBordered(false);
+    button.setTransparent(true);
+    button.setToolTip(Some(&NSString::from_str("Click to dismiss")));
+    button.setHidden(true);
+    button
+}
 fn set_status(field: &NSTextField, text: &str, checks: Option<CheckState>) {
     let suffix = checks
         .map(|state| format!(" · {}", state.label()))
@@ -297,6 +307,7 @@ struct Row {
     ignore: Retained<NSButton>,
     actions: PrActions,
     action_message: Retained<NSTextField>,
+    dismiss: Retained<NSButton>,
     details: Retained<NSTextField>,
 }
 impl Row {
@@ -335,6 +346,7 @@ impl Row {
         let actions = PrActions::new(pr, target, mtm);
         let action_message = label("", 11.0, false, mtm);
         action_message.setTextColor(Some(&NSColor::systemRedColor()));
+        let dismiss = dismiss_button(target, mtm);
         details.setSelectable(true);
         for child in [
             &*icon as &NSView,
@@ -347,6 +359,7 @@ impl Row {
             &*actions.button,
             &*actions.cancel,
             &*action_message,
+            &*dismiss,
         ] {
             view.addSubview(child);
         }
@@ -364,6 +377,7 @@ impl Row {
             details,
             actions,
             action_message,
+            dismiss,
         }
     }
     fn set_blue(&self, blue: bool) {
@@ -505,28 +519,37 @@ impl Row {
         let action_error = if ignored {
             None
         } else {
-            match action_state.ready.get(&pr.snapshot.id) {
-                Some(crate::actions::ReadyProgress::Failed(error)) => Some(error.as_str()),
-                _ => match action_state.merges.get(&pr.snapshot.id) {
-                    Some(crate::actions::MergeProgress::Failed(error)) => Some(error.as_str()),
+            let pr = pr.snapshot.id.clone();
+            match action_state.ready.get(&pr) {
+                Some(crate::actions::ReadyProgress::Failed(failure)) => Some((
+                    DisplayedError::Ready { pr, id: failure.id },
+                    &failure.message,
+                )),
+                _ => match action_state.merges.get(&pr) {
+                    Some(crate::actions::MergeProgress::Failed(failure)) => Some((
+                        DisplayedError::Merge { pr, id: failure.id },
+                        &failure.message,
+                    )),
                     _ => None,
                 },
             }
         };
         self.action_message.setHidden(action_error.is_none());
+        self.dismiss.setHidden(action_error.is_none());
         let mut extra = label_height;
-        if let Some(error) = action_error {
-            set_text(&self.action_message, error);
+        if let Some((error, message)) = action_error {
+            set_text(&self.action_message, message);
             let height = self
                 .action_message
                 .sizeThatFits(NSSize::new(CONTENT_WIDTH - 12.0, 10000.0))
                 .height;
-            self.action_message.setFrame(rect(
-                4.0,
-                88.0 + label_height,
-                CONTENT_WIDTH - 12.0,
-                height,
-            ));
+            let frame = rect(4.0, 88.0 + label_height, CONTENT_WIDTH - 12.0, height);
+            self.action_message.setFrame(frame);
+            self.dismiss.setFrame(frame);
+            target.bind(
+                &self.dismiss,
+                AppEvent::PrAction(Request::DismissError(error)),
+            );
             extra += height + 8.0;
         }
         if expanded {
@@ -545,7 +568,13 @@ impl Row {
     fn remove(&self, target: &ActionTarget) {
         self.view.removeFromSuperview();
         self.actions.remove(target);
-        for button in [&self.title, &self.open, &self.disclosure, &self.ignore] {
+        for button in [
+            &self.title,
+            &self.open,
+            &self.disclosure,
+            &self.ignore,
+            &self.dismiss,
+        ] {
             target.ivars().actions.borrow_mut().remove(&button.tag());
         }
     }
@@ -574,6 +603,7 @@ pub(super) struct ReviewPopover {
     navigation: [Navigation; 2],
     pub(super) keyboard_state: super::keyboard::State,
     banner: Retained<NSTextField>,
+    banner_dismiss: Retained<NSButton>,
     empty: Retained<NSTextField>,
     login: Retained<NSMenuItem>,
     update_item: Retained<NSMenuItem>,
@@ -678,6 +708,8 @@ impl ReviewPopover {
         banner.setTextColor(Some(&NSColor::systemOrangeColor()));
         banner.setSelectable(true);
         document.addSubview(&banner);
+        let banner_dismiss = dismiss_button(&target, mtm);
+        document.addSubview(&banner_dismiss);
         let empty = label(
             "No open pull requests. Gopher will keep checking for you.",
             13.0,
@@ -708,6 +740,7 @@ impl ReviewPopover {
             navigation: Default::default(),
             keyboard_state: Default::default(),
             banner,
+            banner_dismiss,
             empty,
             login: login.unwrap(),
             update_item: update_item.unwrap(),
@@ -1011,7 +1044,12 @@ impl ReviewPopover {
             set_text(&self.title, &detail.title());
             self.title
                 .setToolTip(Some(&NSString::from_str(&detail.title())));
-            let message = self.action_state.error.as_deref().or(error);
+            let message = self
+                .action_state
+                .error
+                .as_ref()
+                .map(|failure| failure.message.as_str())
+                .or(error);
             set_text(&self.summary, message.unwrap_or(detail.subtitle()));
             self.summary
                 .setToolTip(message.map(NSString::from_str).as_deref());
@@ -1108,16 +1146,31 @@ impl ReviewPopover {
         self.navigation[usize::from(ignored)]
             .update(sorted.iter().map(|pr| pr.snapshot.id.clone()).collect());
         let mut y = 8.0;
-        let error = self.action_state.error.as_deref().or(error);
+        // Only rejected action requests are dismissible; polling and
+        // authentication errors describe ongoing state and return on the next poll.
+        let action_error = self.action_state.error.clone();
+        let error = action_error
+            .as_ref()
+            .map(|failure| failure.message.as_str())
+            .or(error);
         self.banner.setHidden(error.is_none());
+        self.banner_dismiss.setHidden(action_error.is_none());
         if let Some(error) = error {
             set_text(&self.banner, error);
             let height = self
                 .banner
                 .sizeThatFits(NSSize::new(CONTENT_WIDTH, 10000.0))
                 .height;
-            self.banner.setFrame(rect(16.0, y, CONTENT_WIDTH, height));
+            let frame = rect(16.0, y, CONTENT_WIDTH, height);
+            self.banner.setFrame(frame);
+            self.banner_dismiss.setFrame(frame);
             y += height + 16.0;
+        }
+        if let Some(failure) = action_error {
+            self.target.bind(
+                &self.banner_dismiss,
+                AppEvent::PrAction(Request::DismissError(DisplayedError::Request(failure.id))),
+            );
         }
         let mut last_repo = "";
         for pr in sorted {

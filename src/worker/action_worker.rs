@@ -226,6 +226,12 @@ impl Coordinator {
         self.sequence += 1;
         self.sequence
     }
+    fn failure(&mut self, message: impl Into<String>) -> Failure {
+        Failure {
+            id: self.token(),
+            message: message.into(),
+        }
+    }
     pub fn publish(&self, context: &Context<'_>) {
         (context.sink)(UiEvent::ActionsChanged(self.state.clone()));
     }
@@ -300,12 +306,9 @@ impl Coordinator {
         if !cancelled.is_empty() {
             for id in cancelled {
                 self.merges.remove(&id);
-                self.state.merges.insert(
-                    id,
-                    MergeProgress::Failed(
-                        "Merge cancelled: the PR, checks, or action settings changed.".into(),
-                    ),
-                );
+                let failure =
+                    self.failure("Merge cancelled: the PR, checks, or action settings changed.");
+                self.state.merges.insert(id, MergeProgress::Failed(failure));
             }
             self.publish(context);
         }
@@ -349,7 +352,8 @@ impl Coordinator {
             ActionCommand::Request(request) => {
                 if let Err(error) = self.request(request, context) {
                     tracing::warn!(event="pr_action_rejected", error=%error);
-                    self.state.error = Some(error.to_string());
+                    let failure = self.failure(error.to_string());
+                    self.state.error = Some(failure);
                     if let Some(pr) = &save_pr
                         && let Some(labels) = self.state.labels.get_mut(pr)
                     {
@@ -383,7 +387,8 @@ impl Coordinator {
                         Err(error) => {
                             self.ready.remove(&pr);
                             if context.prs.get(&pr).is_none_or(|p| p.snapshot.draft) {
-                                self.state.ready.insert(pr, ReadyProgress::Failed(error));
+                                let failure = self.failure(error);
+                                self.state.ready.insert(pr, ReadyProgress::Failed(failure));
                             }
                         }
                         Ok(github) => {
@@ -429,7 +434,8 @@ impl Coordinator {
                         Err(error) => {
                             tracing::warn!(event="ready_for_review_failed", pr_id=%pr, error=%error);
                             if current && context.prs.get(&pr).is_none_or(|p| p.snapshot.draft) {
-                                self.state.ready.insert(pr, ReadyProgress::Failed(error));
+                                let failure = self.failure(error);
+                                self.state.ready.insert(pr, ReadyProgress::Failed(failure));
                             }
                         }
                     }
@@ -472,7 +478,8 @@ impl Coordinator {
                     match checked {
                         Err(error) => {
                             self.merges.remove(&pr);
-                            self.state.merges.insert(pr, MergeProgress::Failed(error));
+                            let failure = self.failure(error);
+                            self.state.merges.insert(pr, MergeProgress::Failed(failure));
                         }
                         Ok(github) => {
                             self.state.merges.insert(pr.clone(), MergeProgress::Merging);
@@ -515,7 +522,8 @@ impl Coordinator {
                         }
                         Err(error) => {
                             tracing::warn!(event="merge_failed", pr_id=%pr, error=%error);
-                            self.state.merges.insert(pr, MergeProgress::Failed(error));
+                            let failure = self.failure(error);
+                            self.state.merges.insert(pr, MergeProgress::Failed(failure));
                         }
                     }
                 }
@@ -610,8 +618,42 @@ impl Coordinator {
         }
     }
 
+    /// Removes only the failure the user saw; in-progress actions and newer
+    /// failures are left untouched.
+    fn dismiss(&mut self, error: DisplayedError) {
+        let (pr, dismissed) = match error {
+            DisplayedError::Ready { pr, id } => {
+                let shown = matches!(
+                    self.state.ready.get(&pr),
+                    Some(ReadyProgress::Failed(current)) if current.id == id
+                );
+                let dismissed = shown && self.state.ready.remove(&pr).is_some();
+                (Some(pr), dismissed)
+            }
+            DisplayedError::Merge { pr, id } => {
+                let shown = matches!(
+                    self.state.merges.get(&pr),
+                    Some(MergeProgress::Failed(current)) if current.id == id
+                );
+                let dismissed = shown && self.state.merges.remove(&pr).is_some();
+                (Some(pr), dismissed)
+            }
+            DisplayedError::Request(id) => {
+                let shown = self
+                    .state
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.id == id);
+                (None, shown && self.state.error.take().is_some())
+            }
+        };
+        tracing::info!(event = "action_error_dismissed", pr_id = ?pr, dismissed);
+    }
     fn request(&mut self, request: Request, context: &Context<'_>) -> Result<()> {
-        self.state.error = None;
+        // Dismissing one error must not clear a different, unseen request error.
+        if !matches!(request, Request::DismissError(_)) {
+            self.state.error = None;
+        }
         match request {
             Request::ReadyForReview { pr, head, update } => {
                 ensure!(
@@ -765,6 +807,7 @@ impl Coordinator {
                     labels.error = None;
                 }
             }
+            Request::DismissError(error) => self.dismiss(error),
             Request::SaveLabels { pr, name } => {
                 let names: Vec<String> = {
                     let labels = self

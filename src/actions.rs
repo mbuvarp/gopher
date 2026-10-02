@@ -160,6 +160,22 @@ pub enum Request {
         pr: String,
         name: Option<String>,
     },
+    DismissError(DisplayedError),
+}
+/// An action error with a worker-unique ID, so identical repeated messages
+/// remain distinct occurrences.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failure {
+    pub id: u64,
+    pub message: String,
+}
+/// The specific failure occurrence the popover displayed, so dismissing it
+/// cannot clear a newer failure that arrived after the user saw the old one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DisplayedError {
+    Ready { pr: String, id: u64 },
+    Merge { pr: String, id: u64 },
+    Request(u64),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,13 +203,13 @@ pub enum MergeProgress {
     Checking,
     Merging,
     Complete,
-    Failed(String),
+    Failed(Failure),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadyProgress {
     Checking,
     Submitting,
-    Failed(String),
+    Failed(Failure),
 }
 impl MergeProgress {
     pub fn text(&self) -> String {
@@ -204,7 +220,7 @@ impl MergeProgress {
             Self::Checking => "Checking merge…".into(),
             Self::Merging => "Merging…".into(),
             Self::Complete => "Merged".into(),
-            Self::Failed(error) => error.clone(),
+            Self::Failed(failure) => failure.message.clone(),
         }
     }
     pub fn busy(&self) -> bool {
@@ -224,7 +240,7 @@ pub struct ActionState {
     pub merges: BTreeMap<String, MergeProgress>,
     pub ready: BTreeMap<String, ReadyProgress>,
     pub labels: BTreeMap<String, Labels>,
-    pub error: Option<String>,
+    pub error: Option<Failure>,
 }
 pub fn repo_key(repo: &str) -> String {
     repo.to_ascii_lowercase()

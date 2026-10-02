@@ -410,8 +410,9 @@ async fn ready_for_review_rejects_an_update_that_changed_while_menu_was_open() {
         h.coordinator
             .state
             .error
-            .as_deref()
+            .as_ref()
             .unwrap()
+            .message
             .contains("review changed")
     );
     assert!(!h.directory.path().join("ready.json").exists());
@@ -442,7 +443,7 @@ fn ready_failure_clears_when_another_actor_marks_the_pr_ready() {
     let mut h = Harness::new();
     h.coordinator.state.ready.insert(
         "PR_1".into(),
-        ReadyProgress::Failed("Ready for review cancelled".into()),
+        ReadyProgress::Failed(failure(1, "Ready for review cancelled")),
     );
     h.coordinator.reconcile(&Context {
         store: &h.store,
@@ -453,6 +454,103 @@ fn ready_failure_clears_when_another_actor_marks_the_pr_ready() {
         sink: &h.sink,
     });
     assert!(!h.coordinator.state.ready.contains_key("PR_1"));
+}
+
+fn failure(id: u64, message: &str) -> Failure {
+    Failure {
+        id,
+        message: message.into(),
+    }
+}
+
+#[test]
+fn dismissing_an_error_removes_only_the_displayed_failure() {
+    let mut h = Harness::new();
+    // Ready failures are only kept for drafts.
+    h.prs.get_mut("PR_1").unwrap().snapshot.draft = true;
+    h.coordinator
+        .state
+        .ready
+        .insert("PR_1".into(), ReadyProgress::Failed(failure(1, "failed")));
+    h.coordinator
+        .state
+        .merges
+        .insert("PR_1".into(), MergeProgress::Failed(failure(2, "failed")));
+    h.coordinator.state.error = Some(failure(3, "failed"));
+
+    // Other occurrences, even with identical messages, are kept.
+    for stale in [
+        DisplayedError::Ready {
+            pr: "PR_1".into(),
+            id: 2,
+        },
+        DisplayedError::Merge {
+            pr: "PR_1".into(),
+            id: 1,
+        },
+        DisplayedError::Request(1),
+    ] {
+        h.request(Request::DismissError(stale));
+    }
+    assert!(h.coordinator.state.ready.contains_key("PR_1"));
+    assert!(h.progress("PR_1").is_some());
+    assert_eq!(h.coordinator.state.error, Some(failure(3, "failed")));
+
+    h.request(Request::DismissError(DisplayedError::Ready {
+        pr: "PR_1".into(),
+        id: 1,
+    }));
+    assert!(!h.coordinator.state.ready.contains_key("PR_1"));
+    assert_eq!(
+        h.progress("PR_1"),
+        Some(&MergeProgress::Failed(failure(2, "failed")))
+    );
+    assert_eq!(h.coordinator.state.error, Some(failure(3, "failed")));
+
+    h.request(Request::DismissError(DisplayedError::Merge {
+        pr: "PR_1".into(),
+        id: 2,
+    }));
+    assert!(h.progress("PR_1").is_none());
+    assert_eq!(h.coordinator.state.error, Some(failure(3, "failed")));
+
+    h.request(Request::DismissError(DisplayedError::Request(3)));
+    assert!(h.coordinator.state.error.is_none());
+}
+
+#[test]
+fn repeated_failures_with_the_same_message_are_distinct() {
+    let mut h = Harness::new();
+    h.request(Request::LoadLabels("missing".into()));
+    let first = h.coordinator.state.error.clone().unwrap();
+    h.request(Request::LoadLabels("missing".into()));
+    let second = h.coordinator.state.error.clone().unwrap();
+    assert_eq!(first.message, second.message);
+    assert_ne!(first.id, second.id);
+
+    // A click bound to the first occurrence must not hide the second.
+    h.request(Request::DismissError(DisplayedError::Request(first.id)));
+    assert_eq!(h.coordinator.state.error, Some(second.clone()));
+    h.request(Request::DismissError(DisplayedError::Request(second.id)));
+    assert!(h.coordinator.state.error.is_none());
+}
+
+#[tokio::test]
+async fn dismissing_an_old_merge_error_keeps_a_newer_pending_merge() {
+    let mut h = Harness::new();
+    h.coordinator
+        .state
+        .merges
+        .insert("PR_1".into(), MergeProgress::Failed(failure(1, "failed")));
+    let displayed = DisplayedError::Merge {
+        pr: "PR_1".into(),
+        id: 1,
+    };
+    let token = h.start_merge();
+    h.request(Request::DismissError(displayed));
+    assert_eq!(h.coordinator.merges["PR_1"].token, token);
+    assert!(h.progress("PR_1").is_some_and(MergeProgress::busy));
+    h.request(Request::CancelMerge("PR_1".into()));
 }
 
 #[tokio::test]
@@ -962,8 +1060,9 @@ async fn merge_rejects_unseen_same_head_evidence_before_starting_countdown() {
         h.coordinator
             .state
             .error
-            .as_deref()
+            .as_ref()
             .unwrap()
+            .message
             .contains("review changed")
     );
     h.assert_no_merge();
@@ -1481,12 +1580,11 @@ async fn a_failed_merge_does_not_block_the_next_queued_merge() {
         }
         h.step().await;
     }
-    assert_eq!(
+    assert!(matches!(
         h.progress("PR_1"),
-        Some(&MergeProgress::Failed(
-            "GitHub: Blocked by branch protection".into()
-        ))
-    );
+        Some(MergeProgress::Failed(failure))
+            if failure.message == "GitHub: Blocked by branch protection"
+    ));
     assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Complete));
     let log = h.merge_log();
     assert_eq!(log.len(), 1, "a failed merge must not be retried");
