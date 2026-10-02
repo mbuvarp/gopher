@@ -521,19 +521,15 @@ impl Row {
         } else {
             let pr = pr.snapshot.id.clone();
             match action_state.ready.get(&pr) {
-                Some(crate::actions::ReadyProgress::Failed(message)) => {
-                    Some(DisplayedError::Ready {
-                        pr,
-                        message: message.clone(),
-                    })
-                }
+                Some(crate::actions::ReadyProgress::Failed(failure)) => Some((
+                    DisplayedError::Ready { pr, id: failure.id },
+                    &failure.message,
+                )),
                 _ => match action_state.merges.get(&pr) {
-                    Some(crate::actions::MergeProgress::Failed(message)) => {
-                        Some(DisplayedError::Merge {
-                            pr,
-                            message: message.clone(),
-                        })
-                    }
+                    Some(crate::actions::MergeProgress::Failed(failure)) => Some((
+                        DisplayedError::Merge { pr, id: failure.id },
+                        &failure.message,
+                    )),
                     _ => None,
                 },
             }
@@ -541,8 +537,8 @@ impl Row {
         self.action_message.setHidden(action_error.is_none());
         self.dismiss.setHidden(action_error.is_none());
         let mut extra = label_height;
-        if let Some(error) = action_error {
-            set_text(&self.action_message, error.message());
+        if let Some((error, message)) = action_error {
+            set_text(&self.action_message, message);
             let height = self
                 .action_message
                 .sizeThatFits(NSSize::new(CONTENT_WIDTH - 12.0, 10000.0))
@@ -1048,7 +1044,12 @@ impl ReviewPopover {
             set_text(&self.title, &detail.title());
             self.title
                 .setToolTip(Some(&NSString::from_str(&detail.title())));
-            let message = self.action_state.error.as_deref().or(error);
+            let message = self
+                .action_state
+                .error
+                .as_ref()
+                .map(|failure| failure.message.as_str())
+                .or(error);
             set_text(&self.summary, message.unwrap_or(detail.subtitle()));
             self.summary
                 .setToolTip(message.map(NSString::from_str).as_deref());
@@ -1148,7 +1149,10 @@ impl ReviewPopover {
         // Only rejected action requests are dismissible; polling and
         // authentication errors describe ongoing state and return on the next poll.
         let action_error = self.action_state.error.clone();
-        let error = action_error.as_deref().or(error);
+        let error = action_error
+            .as_ref()
+            .map(|failure| failure.message.as_str())
+            .or(error);
         self.banner.setHidden(error.is_none());
         self.banner_dismiss.setHidden(action_error.is_none());
         if let Some(error) = error {
@@ -1162,10 +1166,10 @@ impl ReviewPopover {
             self.banner_dismiss.setFrame(frame);
             y += height + 16.0;
         }
-        if let Some(message) = action_error {
+        if let Some(failure) = action_error {
             self.target.bind(
                 &self.banner_dismiss,
-                AppEvent::PrAction(Request::DismissError(DisplayedError::Request(message))),
+                AppEvent::PrAction(Request::DismissError(DisplayedError::Request(failure.id))),
             );
         }
         let mut last_repo = "";
