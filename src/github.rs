@@ -187,7 +187,7 @@ impl Github {
             }
             if status == 304 {
                 let cached = cached.context("GitHub returned 304 without a cached response")?;
-                // A concurrent mutation may have invalidated the cache meanwhile. The
+                // A credential switch may have invalidated the cache meanwhile. The
                 // 304 is as fresh as a 200 would be, so return the body read at request
                 // start without caching it again; the worker discards superseded results.
                 ensure!(
@@ -229,9 +229,9 @@ impl Github {
                 bail!("{}", failure.message);
             }
             let response = parsed.context("GitHub CLI returned invalid JSON")?;
-            if matches!(policy, ResponsePolicy::Mutation) {
-                api.lock().unwrap().invalidate();
-            } else if status == 200
+            // Mutations keep cached bodies: every reuse is a conditional request,
+            // so GitHub replaces any representation the mutation changed.
+            if status == 200
                 && response.get("errors").is_none()
                 && let Some(key) = &key
             {
