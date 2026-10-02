@@ -610,8 +610,38 @@ impl Coordinator {
         }
     }
 
+    /// Removes only the failure the user saw; in-progress actions and newer
+    /// failures are left untouched.
+    fn dismiss(&mut self, error: DisplayedError) {
+        let (pr, dismissed) = match error {
+            DisplayedError::Ready { pr, message } => {
+                let shown = matches!(
+                    self.state.ready.get(&pr),
+                    Some(ReadyProgress::Failed(current)) if *current == message
+                );
+                let dismissed = shown && self.state.ready.remove(&pr).is_some();
+                (Some(pr), dismissed)
+            }
+            DisplayedError::Merge { pr, message } => {
+                let shown = matches!(
+                    self.state.merges.get(&pr),
+                    Some(MergeProgress::Failed(current)) if *current == message
+                );
+                let dismissed = shown && self.state.merges.remove(&pr).is_some();
+                (Some(pr), dismissed)
+            }
+            DisplayedError::Request(message) => {
+                let shown = self.state.error.as_ref() == Some(&message);
+                (None, shown && self.state.error.take().is_some())
+            }
+        };
+        tracing::info!(event = "action_error_dismissed", pr_id = ?pr, dismissed);
+    }
     fn request(&mut self, request: Request, context: &Context<'_>) -> Result<()> {
-        self.state.error = None;
+        // Dismissing one error must not clear a different, unseen request error.
+        if !matches!(request, Request::DismissError(_)) {
+            self.state.error = None;
+        }
         match request {
             Request::ReadyForReview { pr, head, update } => {
                 ensure!(
@@ -765,6 +795,7 @@ impl Coordinator {
                     labels.error = None;
                 }
             }
+            Request::DismissError(error) => self.dismiss(error),
             Request::SaveLabels { pr, name } => {
                 let names: Vec<String> = {
                     let labels = self

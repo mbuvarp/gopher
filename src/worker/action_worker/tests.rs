@@ -455,6 +455,81 @@ fn ready_failure_clears_when_another_actor_marks_the_pr_ready() {
     assert!(!h.coordinator.state.ready.contains_key("PR_1"));
 }
 
+#[test]
+fn dismissing_an_error_removes_only_the_displayed_failure() {
+    let mut h = Harness::new();
+    // Ready failures are only kept for drafts.
+    h.prs.get_mut("PR_1").unwrap().snapshot.draft = true;
+    h.coordinator
+        .state
+        .ready
+        .insert("PR_1".into(), ReadyProgress::Failed("ready failed".into()));
+    h.coordinator
+        .state
+        .merges
+        .insert("PR_1".into(), MergeProgress::Failed("merge failed".into()));
+    h.coordinator.state.error = Some("request failed".into());
+
+    // Errors that changed since the popover displayed them are kept.
+    for stale in [
+        DisplayedError::Ready {
+            pr: "PR_1".into(),
+            message: "older ready failure".into(),
+        },
+        DisplayedError::Merge {
+            pr: "PR_1".into(),
+            message: "older merge failure".into(),
+        },
+        DisplayedError::Request("older request failure".into()),
+    ] {
+        h.request(Request::DismissError(stale));
+    }
+    assert!(h.coordinator.state.ready.contains_key("PR_1"));
+    assert!(h.progress("PR_1").is_some());
+    assert_eq!(h.coordinator.state.error.as_deref(), Some("request failed"));
+
+    h.request(Request::DismissError(DisplayedError::Ready {
+        pr: "PR_1".into(),
+        message: "ready failed".into(),
+    }));
+    assert!(!h.coordinator.state.ready.contains_key("PR_1"));
+    assert_eq!(
+        h.progress("PR_1"),
+        Some(&MergeProgress::Failed("merge failed".into()))
+    );
+    assert_eq!(h.coordinator.state.error.as_deref(), Some("request failed"));
+
+    h.request(Request::DismissError(DisplayedError::Merge {
+        pr: "PR_1".into(),
+        message: "merge failed".into(),
+    }));
+    assert!(h.progress("PR_1").is_none());
+    assert_eq!(h.coordinator.state.error.as_deref(), Some("request failed"));
+
+    h.request(Request::DismissError(DisplayedError::Request(
+        "request failed".into(),
+    )));
+    assert!(h.coordinator.state.error.is_none());
+}
+
+#[tokio::test]
+async fn dismissing_an_old_merge_error_keeps_a_newer_pending_merge() {
+    let mut h = Harness::new();
+    h.coordinator
+        .state
+        .merges
+        .insert("PR_1".into(), MergeProgress::Failed("merge failed".into()));
+    let displayed = DisplayedError::Merge {
+        pr: "PR_1".into(),
+        message: "merge failed".into(),
+    };
+    let token = h.start_merge();
+    h.request(Request::DismissError(displayed));
+    assert_eq!(h.coordinator.merges["PR_1"].token, token);
+    assert!(h.progress("PR_1").is_some_and(MergeProgress::busy));
+    h.request(Request::CancelMerge("PR_1".into()));
+}
+
 #[tokio::test]
 async fn merge_countdown_completes_without_ui_events_and_pins_the_commit() {
     let mut h = Harness::new();

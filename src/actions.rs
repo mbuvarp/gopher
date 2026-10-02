@@ -160,6 +160,24 @@ pub enum Request {
         pr: String,
         name: Option<String>,
     },
+    DismissError(DisplayedError),
+}
+/// An action error exactly as the popover displayed it, so dismissing it cannot
+/// clear a newer failure that arrived after the user saw the old one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DisplayedError {
+    Ready { pr: String, message: String },
+    Merge { pr: String, message: String },
+    Request(String),
+}
+impl DisplayedError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Ready { message, .. } | Self::Merge { message, .. } | Self::Request(message) => {
+                message
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
