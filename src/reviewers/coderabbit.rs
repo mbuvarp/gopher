@@ -28,6 +28,14 @@ pub(super) fn detect(s: &Snapshot) -> AgentResult {
             return result(agent, v, &r.id, "Current-commit CodeRabbit review verdict");
         }
     }
+    if latest_checks(s, agent).is_empty() && current_review(s, agent).is_none() {
+        return result(
+            agent,
+            Verdict::Pending,
+            "",
+            "No CodeRabbit check or review for the current commit yet",
+        );
+    }
     // A successful check can mean a skipped/limited review; do not equate success with approval.
     result(
         agent,

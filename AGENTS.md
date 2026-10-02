@@ -42,7 +42,7 @@ Show assigned labels after the unresolved-thread count as compact colored pills 
 ## Review states
 
 - **Unknown:** Evidence is missing, ambiguous, or insufficient to establish the current result.
-- **Ready for review:** A non-draft PR without unresolved threads whose reviewers have not participated yet. Explicit skips are not participation, including skips posted while the PR was a draft.
+- **Ready for review:** A non-draft PR without unresolved threads whose reviewers have not participated yet. Explicit skips are not participation, including skips posted while the PR was a draft. Also shown after Gopher observes a new head while reviewers from earlier commits have not started on it (Pending), regardless of unresolved threads, until `review_start_grace_seconds` (default 10 minutes, from `head_since`) passes; then they become Unknown with a not-started reason. Pending is never a result: finished reviewers cannot produce Comments or Approved while another is Pending, and cold starts without an observed head change stay Unknown.
 - **Reviewing:** A participating reviewer is still running. This takes precedence over comments already posted.
 - **Failed:** A current-commit reviewer summary explicitly reports a failed run. This takes precedence over missing evidence once no participating reviewer is still running.
 - **Comments:** All participating reviewers have finished and unresolved review threads remain.

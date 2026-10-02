@@ -71,6 +71,9 @@ pub enum Verdict {
     Clean,
     Findings,
     Skipped,
+    /// The reviewer participated on an earlier commit and has not started on
+    /// the current head yet. Never evidence of a result.
+    Pending,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

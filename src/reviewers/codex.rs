@@ -70,11 +70,21 @@ pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResul
             .filter(|row| matches_commit(row.split('|').nth(3).unwrap_or(""), &s.head))
             .collect();
         if current_rows.is_empty() {
+            // A current-commit review shows Codex already started, so the
+            // stale summary is missing evidence rather than awaiting a review.
+            if current_review(s, agent).is_some() {
+                return result(
+                    agent,
+                    Verdict::Unknown,
+                    &summary.id,
+                    "Codex summary is missing current-commit evidence",
+                );
+            }
             return result(
                 agent,
-                Verdict::Unknown,
+                Verdict::Pending,
                 &summary.id,
-                "Codex summary is missing current-commit evidence",
+                "Codex summary has no review for the current commit yet",
             );
         }
         if current_rows.iter().any(|row| {
@@ -247,8 +257,8 @@ pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResul
     }
     result(
         agent,
-        Verdict::Unknown,
+        Verdict::Pending,
         "",
-        "Codex reaction cannot be tied to the current commit",
+        "No Codex activity is tied to the current commit yet",
     )
 }

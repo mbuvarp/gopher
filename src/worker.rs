@@ -720,12 +720,13 @@ async fn run(
                                         .repositories
                                         .get(&snapshot.repo)
                                         .and_then(|r| r.reviewers.as_deref());
-                                    let pr = transition(
+                                    let pr = transition_with_grace(
                                         snapshot,
                                         previous,
                                         expected,
                                         now,
                                         config.settle_seconds,
+                                        config.review_start_grace_seconds,
                                     );
                                     if previous.is_none_or(|old| {
                                         old.update_id != pr.update_id || old.agents != pr.agents
@@ -856,12 +857,14 @@ fn apply_ready_saved(pr: &mut PullRequest, expected: Option<&[Agent]>) {
     pr.snapshot.draft = false;
     pr.ready_pending = true;
     if matches!(pr.state, State::Unknown | State::ReadyForReview)
-        && reviewers::ready_for_review(&pr.snapshot, Some(pr), &pr.agents, expected)
+        && (reviewers::ready_for_review(&pr.snapshot, Some(pr), &pr.agents, expected)
+            || reviewers::aggregate(&pr.snapshot, &pr.agents) == State::ReadyForReview)
     {
         pr.state = State::ReadyForReview;
     }
 }
 
+/// Applies the default reviewer start grace period.
 pub fn transition(
     snapshot: Snapshot,
     previous: Option<&PullRequest>,
@@ -869,7 +872,31 @@ pub fn transition(
     now: i64,
     settle_seconds: u64,
 ) -> PullRequest {
-    let agents = reviewers::evaluate(&snapshot, previous, expected);
+    transition_with_grace(
+        snapshot,
+        previous,
+        expected,
+        now,
+        settle_seconds,
+        crate::config::DEFAULT_REVIEW_START_GRACE_SECONDS,
+    )
+}
+
+pub fn transition_with_grace(
+    snapshot: Snapshot,
+    previous: Option<&PullRequest>,
+    expected: Option<&[Agent]>,
+    now: i64,
+    settle_seconds: u64,
+    grace_seconds: u64,
+) -> PullRequest {
+    let head_since = previous
+        .filter(|p| p.snapshot.head == snapshot.head)
+        .map_or(now, |p| p.head_since);
+    let mut agents = reviewers::evaluate(&snapshot, previous, expected);
+    if now.saturating_sub(head_since) >= grace_seconds as i64 {
+        reviewers::expire_pending(&mut agents, grace_seconds);
+    }
     let raw = reviewers::aggregate(&snapshot, &agents);
     let raw = if raw == State::Unknown
         && reviewers::ready_for_review(&snapshot, previous, &agents, expected)
@@ -898,9 +925,6 @@ pub fn transition(
     } else {
         hash(format!("{review_id}:ready:{ready_generation}"))
     };
-    let head_since = previous
-        .filter(|p| p.snapshot.head == snapshot.head)
-        .map_or(now, |p| p.head_since);
     let reviewing_since = (state == State::Reviewing).then(|| {
         previous
             .filter(|p| p.state == State::Reviewing && p.snapshot.head == snapshot.head)
@@ -952,6 +976,30 @@ mod tests {
         let confirmed = transition(draft.snapshot.clone(), Some(&draft), None, 130, 0);
         assert_eq!(confirmed.state, State::ReadyForReview);
         assert!(confirmed.ready_pending);
+    }
+
+    #[test]
+    fn ready_action_shows_reviewers_awaiting_a_new_draft_head() {
+        let mut draft = transition(
+            Snapshot {
+                id: "PR_1".into(),
+                open: true,
+                draft: true,
+                ..Default::default()
+            },
+            None,
+            None,
+            100,
+            0,
+        );
+        draft.agents = vec![AgentResult {
+            agent: Agent::Codex,
+            verdict: Verdict::Pending,
+            run_id: String::new(),
+            reason: "No Codex activity is tied to the current commit yet".into(),
+        }];
+        apply_ready_saved(&mut draft, None);
+        assert_eq!(draft.state, State::ReadyForReview);
     }
 
     #[test]

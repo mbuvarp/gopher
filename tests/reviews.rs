@@ -1,4 +1,9 @@
-use gopher::{model::*, reviewers, store::Store, worker::transition};
+use gopher::{
+    model::*,
+    reviewers,
+    store::Store,
+    worker::{self, transition},
+};
 
 const HEAD: &str = "abcdef0123456789012345678901234567890123";
 
@@ -512,8 +517,11 @@ fn changed_head_does_not_bind_new_thumb_to_old_run() {
     let previous = transition(s.clone(), None, None, 100, 0);
     s.head = "1234567890123456789012345678901234567890".into();
     s.reactions = vec![thumb()];
+    let pushed = transition(s.clone(), Some(&previous), None, 130, 0);
+    assert_eq!(pushed.state, State::ReadyForReview);
+    assert_eq!(pushed.agents[0].verdict, Verdict::Pending);
     assert_eq!(
-        transition(s, Some(&previous), None, 130, 0).state,
+        transition(s, Some(&pushed), None, 130 + 600, 0).state,
         State::Unknown
     );
 }
@@ -1342,4 +1350,361 @@ fn ignored_lifecycle_hides_closed_and_recovers_reopened_without_losing_evidence(
     store.update_ignored_status(&identity).unwrap();
     assert!(store.load_ignored().unwrap().is_empty());
     assert!(store.ignored().unwrap().is_empty());
+}
+
+const NEW_HEAD: &str = "1234567890123456789012345678901234567890";
+
+fn codex_summary(commit: &str) -> Comment {
+    summary(&format!(
+        "<!-- codex-pull-request-review-summary -->\n| Code Review | Completed — no findings | `{commit}` | New commits |"
+    ))
+}
+
+fn codex(pr: &PullRequest) -> &AgentResult {
+    pr.agents.iter().find(|a| a.agent == Agent::Codex).unwrap()
+}
+
+#[test]
+fn push_after_approval_awaits_review_without_carrying_approval_forward() {
+    let mut s = snapshot();
+    s.comments.push(codex_summary(&HEAD[..7]));
+    let approved = transition(s.clone(), None, None, 100, 0);
+    assert_eq!(approved.state, State::Approved);
+
+    s.head = NEW_HEAD.into();
+    let pushed = transition(s.clone(), Some(&approved), None, 130, 30);
+    assert_eq!(pushed.state, State::ReadyForReview);
+    assert_eq!(codex(&pushed).verdict, Verdict::Pending);
+    assert_eq!(pushed.head_since, 130);
+    assert_ne!(pushed.update_id, approved.update_id);
+    assert!(!pushed.needs_attention());
+
+    let waiting = transition(s.clone(), Some(&pushed), None, 160, 30);
+    assert_eq!(waiting.state, State::ReadyForReview);
+    assert_eq!(waiting.update_id, pushed.update_id);
+
+    s.reactions.push(eyes());
+    let reviewing = transition(s, Some(&waiting), None, 190, 30);
+    assert_eq!(reviewing.state, State::Reviewing);
+}
+
+#[test]
+fn reviewer_that_never_starts_falls_back_to_unknown_after_the_grace_period() {
+    let mut s = snapshot();
+    s.comments.push(codex_summary(&HEAD[..7]));
+    let approved = transition(s.clone(), None, None, 100, 0);
+    s.head = NEW_HEAD.into();
+    let pushed = transition(s.clone(), Some(&approved), None, 1000, 0);
+    let almost = transition(s.clone(), Some(&pushed), None, 1599, 0);
+    assert_eq!(almost.state, State::ReadyForReview);
+    let expired = transition(s.clone(), Some(&almost), None, 1600, 0);
+    assert_eq!(expired.state, State::Unknown);
+    assert_eq!(codex(&expired).verdict, Verdict::Unknown);
+    assert_eq!(
+        codex(&expired).reason,
+        "Codex has not started reviewing the new commit within 10m"
+    );
+    // The fallback is stable, so later polls neither log nor reset anything.
+    let later = transition(s.clone(), Some(&expired), None, 1630, 0);
+    assert_eq!(later.agents, expired.agents);
+    assert_eq!(later.update_id, expired.update_id);
+
+    let custom = worker::transition_with_grace(s, Some(&pushed), None, 1060, 0, 60);
+    assert_eq!(custom.state, State::Unknown);
+    assert_eq!(
+        codex(&custom).reason,
+        "Codex has not started reviewing the new commit within 1m"
+    );
+}
+
+#[test]
+fn awaiting_window_survives_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let mut s = snapshot();
+    s.comments.push(codex_summary(&HEAD[..7]));
+    let approved = transition(s.clone(), None, None, 100, 0);
+    s.head = NEW_HEAD.into();
+    store
+        .save(&transition(s.clone(), Some(&approved), None, 1000, 0))
+        .unwrap();
+    let restored = store.load().unwrap().remove(0);
+    assert!(restored.stale);
+    let resumed = transition(s.clone(), Some(&restored), None, 1300, 0);
+    assert_eq!(resumed.state, State::ReadyForReview);
+    assert_eq!(resumed.head_since, 1000);
+    assert_eq!(
+        transition(s, Some(&restored), None, 1600, 0).state,
+        State::Unknown
+    );
+}
+
+#[test]
+fn cold_start_on_an_unreviewed_head_stays_unknown() {
+    let mut s = snapshot();
+    s.comments.push(codex_summary("1111111"));
+    let first = transition(s.clone(), None, None, 100, 0);
+    assert_eq!(first.state, State::Unknown);
+    assert_eq!(codex(&first).verdict, Verdict::Unknown);
+    // A same-head poll after an unknown result does not open the window.
+    assert_eq!(
+        transition(s, Some(&first), None, 130, 0).state,
+        State::Unknown
+    );
+}
+
+#[test]
+fn identity_only_previous_does_not_open_the_awaiting_window() {
+    let mut s = snapshot();
+    s.comments.push(codex_summary("1111111"));
+    let mut identity = PullRequest::unreviewed(Snapshot {
+        head: "1111111".into(),
+        ..s.clone()
+    });
+    identity.agents = vec![];
+    assert_eq!(
+        transition(s, Some(&identity), None, 100, 0).state,
+        State::Unknown
+    );
+}
+
+#[test]
+fn codex_activity_that_ends_without_a_result_is_not_awaiting() {
+    let mut s = snapshot();
+    s.comments.push(codex_summary("1111111"));
+    s.reactions.push(eyes());
+    let running = transition(s.clone(), None, None, 100, 0);
+    assert_eq!(running.state, State::Reviewing);
+    s.reactions.clear();
+    let ended = transition(s, Some(&running), None, 130, 0);
+    assert_eq!(ended.state, State::Unknown);
+}
+
+#[test]
+fn finished_reviewer_cannot_approve_while_another_has_not_started() {
+    let mut s = snapshot();
+    s.comments.push(codex_summary(&HEAD[..7]));
+    s.reviews.push(review(Agent::Cubic, "0 issues found"));
+    let approved = transition(s.clone(), None, None, 100, 0);
+    assert_eq!(approved.state, State::Approved);
+
+    s.head = NEW_HEAD.into();
+    let pushed = transition(s.clone(), Some(&approved), None, 130, 0);
+    assert_eq!(pushed.state, State::ReadyForReview);
+    for agent in &pushed.agents {
+        assert_eq!(agent.verdict, Verdict::Pending, "{agent:?}");
+    }
+
+    s.reviews.push(Review {
+        id: "review-2".into(),
+        commit: NEW_HEAD.into(),
+        ..review(Agent::Cubic, "0 issues found")
+    });
+    let cubic_done = transition(s.clone(), Some(&pushed), None, 160, 0);
+    assert_eq!(cubic_done.state, State::ReadyForReview);
+
+    s.reviews.push(Review {
+        id: "review-3".into(),
+        commit: NEW_HEAD.into(),
+        ..review(Agent::Cubic, "2 issues found")
+    });
+    s.threads.push(Thread {
+        resolved: false,
+        ..thread()
+    });
+    let findings = transition(s, Some(&cubic_done), None, 190, 0);
+    assert_eq!(findings.state, State::ReadyForReview);
+    assert!(!findings.needs_attention());
+}
+
+#[test]
+fn unresolved_threads_from_the_previous_commit_still_await_review() {
+    let mut s = snapshot();
+    s.reviews.push(review(Agent::Cubic, "1 issue found"));
+    s.threads.push(thread());
+    let comments = transition(s.clone(), None, None, 100, 0);
+    assert_eq!(comments.state, State::Comments);
+    s.head = NEW_HEAD.into();
+    let pushed = transition(s, Some(&comments), None, 130, 0);
+    assert_eq!(pushed.state, State::ReadyForReview);
+}
+
+#[test]
+fn check_only_reviewers_await_their_check_on_a_new_head() {
+    let mut s = snapshot();
+    s.checks.push(Check {
+        app: "coderabbitai".into(),
+        name: "CodeRabbit".into(),
+        ..check("completed")
+    });
+    s.reviews.push(review(
+        Agent::CodeRabbit,
+        "No actionable comments were generated",
+    ));
+    let approved = transition(s.clone(), None, None, 100, 0);
+    assert_eq!(approved.state, State::Approved);
+
+    s.head = NEW_HEAD.into();
+    s.checks.clear();
+    let pushed = transition(s.clone(), Some(&approved), None, 130, 0);
+    assert_eq!(pushed.state, State::ReadyForReview);
+
+    s.checks.push(Check {
+        app: "coderabbitai".into(),
+        name: "CodeRabbit".into(),
+        ..check("in_progress")
+    });
+    assert_eq!(
+        transition(s, Some(&pushed), None, 160, 0).state,
+        State::Reviewing
+    );
+}
+
+#[test]
+fn successful_check_without_a_verdict_is_still_unknown_not_awaiting() {
+    let mut s = snapshot();
+    s.reviews.push(review(
+        Agent::CodeRabbit,
+        "No actionable comments were generated",
+    ));
+    let approved = transition(s.clone(), None, None, 100, 0);
+    s.head = NEW_HEAD.into();
+    s.checks.push(Check {
+        app: "coderabbitai".into(),
+        name: "CodeRabbit".into(),
+        ..check("completed")
+    });
+    assert_eq!(
+        transition(s, Some(&approved), None, 130, 0).state,
+        State::Unknown
+    );
+}
+
+#[test]
+fn required_reviewer_awaits_review_after_a_push_but_never_approves() {
+    let expected = Some(&[Agent::Codex, Agent::Cubic][..]);
+    let mut s = snapshot();
+    s.comments.push(codex_summary(&HEAD[..7]));
+    s.reviews.push(review(Agent::Cubic, "0 issues found"));
+    let approved = transition(s.clone(), None, expected, 100, 0);
+    assert_eq!(approved.state, State::Approved);
+    s.head = NEW_HEAD.into();
+    s.comments = vec![codex_summary(&NEW_HEAD[..7])];
+    let pushed = transition(s.clone(), Some(&approved), expected, 130, 0);
+    assert_eq!(pushed.state, State::ReadyForReview);
+    assert_eq!(
+        transition(s, Some(&pushed), expected, 130 + 600, 0).state,
+        State::Unknown
+    );
+}
+
+#[test]
+fn expired_check_only_reviewer_stays_unknown_across_polls() {
+    let mut s = snapshot();
+    s.checks.push(Check {
+        conclusion: "success".into(),
+        summary: "No issues found".into(),
+        ..check("completed")
+    });
+    let approved = transition(s.clone(), None, None, 100, 0);
+    assert_eq!(approved.state, State::Approved);
+    s.head = NEW_HEAD.into();
+    s.checks.clear();
+    let pushed = transition(s.clone(), Some(&approved), None, 1000, 0);
+    assert_eq!(pushed.state, State::ReadyForReview);
+    let expired = transition(s.clone(), Some(&pushed), None, 1600, 0);
+    assert_eq!(expired.state, State::Unknown);
+    let later = transition(s, Some(&expired), None, 1630, 0);
+    assert_eq!(later.state, State::Unknown);
+    assert_eq!(later.agents, expired.agents);
+}
+
+#[test]
+fn required_reviewer_that_never_ran_keeps_waiting_after_a_push() {
+    let expected = Some(&[Agent::Codex][..]);
+    let s = snapshot();
+    let fresh = transition(s.clone(), None, expected, 100, 0);
+    assert_eq!(fresh.state, State::ReadyForReview);
+    let pushed_snapshot = Snapshot {
+        head: NEW_HEAD.into(),
+        ..s
+    };
+    let pushed = transition(pushed_snapshot.clone(), Some(&fresh), expected, 130, 0);
+    assert_eq!(pushed.state, State::ReadyForReview);
+    assert_eq!(codex(&pushed).verdict, Verdict::Unknown);
+    assert_eq!(
+        transition(pushed_snapshot, Some(&pushed), expected, 130 + 600, 0).state,
+        State::ReadyForReview
+    );
+}
+
+#[test]
+fn current_codex_review_with_a_stale_summary_is_not_awaiting() {
+    let mut s = snapshot();
+    s.comments.push(codex_summary(&HEAD[..7]));
+    let approved = transition(s.clone(), None, None, 100, 0);
+    s.head = NEW_HEAD.into();
+    s.reviews.push(Review {
+        commit: NEW_HEAD.into(),
+        ..review(Agent::Codex, "Requested changes")
+    });
+    s.threads.push(Thread {
+        author: "chatgpt-codex-connector[bot]".into(),
+        ..thread()
+    });
+    let pushed = transition(s, Some(&approved), None, 130, 0);
+    assert_eq!(pushed.state, State::Unknown);
+    assert_eq!(codex(&pushed).verdict, Verdict::Unknown);
+}
+
+#[test]
+fn required_reviewer_skip_is_not_participation_after_a_push() {
+    let expected = Some(&[Agent::Codex, Agent::CodeRabbit][..]);
+    let mut s = snapshot();
+    s.comments.push(codex_summary(&HEAD[..7]));
+    s.checks.push(skipped_coderabbit());
+    let skipped = transition(s.clone(), None, expected, 100, 0);
+    assert_eq!(skipped.state, State::Unknown);
+    s.head = NEW_HEAD.into();
+    s.checks.clear();
+    let pushed = transition(s, Some(&skipped), expected, 130, 0);
+    assert_eq!(pushed.state, State::Unknown);
+    let coderabbit = pushed
+        .agents
+        .iter()
+        .find(|a| a.agent == Agent::CodeRabbit)
+        .unwrap();
+    assert_eq!(coderabbit.verdict, Verdict::Unknown);
+    assert_eq!(codex(&pushed).verdict, Verdict::Pending);
+}
+
+#[test]
+fn inferred_skip_is_not_participation_after_a_push() {
+    let mut s = snapshot();
+    s.reviews.push(Review {
+        commit: "1111111".into(),
+        ..review(Agent::Cubic, "0 issues found")
+    });
+    s.checks.push(cubic_branch_rewrite());
+    let skipped = transition(s.clone(), None, None, 100, 0);
+    assert_eq!(skipped.agents[0].verdict, Verdict::Skipped);
+    s.head = NEW_HEAD.into();
+    s.checks.clear();
+    let pushed = transition(s, Some(&skipped), None, 130, 0);
+    assert_eq!(pushed.agents[0].verdict, Verdict::Unknown);
+}
+
+#[test]
+fn draft_awaiting_review_is_unknown_until_marked_ready() {
+    let mut s = snapshot();
+    s.comments.push(codex_summary(&HEAD[..7]));
+    let approved = transition(s.clone(), None, None, 100, 0);
+    s.head = NEW_HEAD.into();
+    s.draft = true;
+    let draft = transition(s.clone(), Some(&approved), None, 130, 0);
+    assert_eq!(draft.state, State::Unknown);
+    assert_eq!(codex(&draft).verdict, Verdict::Pending);
+    s.draft = false;
+    let ready = transition(s, Some(&draft), None, 160, 0);
+    assert_eq!(ready.state, State::ReadyForReview);
 }
