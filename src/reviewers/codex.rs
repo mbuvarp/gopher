@@ -1,27 +1,28 @@
 use super::*;
 
 /// Codex comments instead of reviewing when its usage limit is reached. The
-/// notice stays on the PR, so it only counts while no newer Codex activity exists.
+/// notice stays on the PR, so it only counts while it is strictly newer than all
+/// other Codex activity, including a leftover eyes reaction. Ties are ambiguous.
 fn usage_limit<'a>(s: &'a Snapshot, reactions: &[&Reaction]) -> Option<&'a Comment> {
-    let notice = s
-        .comments
-        .iter()
-        .filter(|c| {
-            Agent::from_login(&c.author) == Some(Agent::Codex)
-                && c.body
-                    .to_lowercase()
-                    .contains("reached your codex usage limit")
-        })
+    let is_notice = |c: &Comment| {
+        c.body
+            .to_lowercase()
+            .contains("reached your codex usage limit")
+    };
+    let codex_comments = || {
+        s.comments
+            .iter()
+            .filter(|c| Agent::from_login(&c.author) == Some(Agent::Codex))
+    };
+    let notice = codex_comments()
+        .filter(|c| is_notice(c))
         .max_by_key(|c| &c.updated_at)?;
-    let newer_comment = s.comments.iter().any(|c| {
-        Agent::from_login(&c.author) == Some(Agent::Codex)
-            && c.id != notice.id
-            && c.updated_at > notice.updated_at
-    });
+    let since = notice.updated_at.as_str();
+    let newer_comment = codex_comments().any(|c| !is_notice(c) && c.updated_at.as_str() >= since);
     let newer_review = s.reviews.iter().any(|r| {
-        Agent::from_login(&r.author) == Some(Agent::Codex) && r.submitted_at > notice.updated_at
+        Agent::from_login(&r.author) == Some(Agent::Codex) && r.submitted_at.as_str() >= since
     });
-    let newer_reaction = reactions.iter().any(|r| r.created_at > notice.updated_at);
+    let newer_reaction = reactions.iter().any(|r| r.created_at.as_str() >= since);
     (!newer_comment && !newer_review && !newer_reaction).then_some(notice)
 }
 
@@ -32,20 +33,20 @@ pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResul
         .iter()
         .filter(|r| Agent::from_login(&r.author) == Some(agent))
         .collect();
-    if let Some(eyes) = reactions.iter().find(|r| r.content == "EYES") {
-        return result(
-            agent,
-            Verdict::Running,
-            &eyes.id,
-            "Codex eyes reaction is present",
-        );
-    }
     if let Some(notice) = usage_limit(s, &reactions) {
         return result(
             agent,
             Verdict::Skipped,
             &notice.id,
             "Review skipped — Codex usage limit reached",
+        );
+    }
+    if let Some(eyes) = reactions.iter().find(|r| r.content == "EYES") {
+        return result(
+            agent,
+            Verdict::Running,
+            &eyes.id,
+            "Codex eyes reaction is present",
         );
     }
     let summary = s

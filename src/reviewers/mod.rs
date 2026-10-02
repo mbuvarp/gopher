@@ -211,10 +211,13 @@ pub(super) fn check_gate(s: &Snapshot, agent: Agent) -> Option<AgentResult> {
     }
     let branch_rewrite_skip =
         |c: &&Check| agent == Agent::Cubic && cubic::branch_rewrite_skip(&c.summary);
+    // A current-commit review posted after the skip (such as a manual run)
+    // is participation, so let the detector evaluate it instead.
     if !checks.is_empty()
         && checks
             .iter()
             .all(|c| explicitly_skipped(&c.summary) || branch_rewrite_skip(c))
+        && review_after_checks(s, agent).is_none()
     {
         return Some(result(
             agent,
