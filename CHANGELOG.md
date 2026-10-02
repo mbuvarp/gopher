@@ -6,6 +6,9 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-02
+
+- Dismiss a failed PR action or a rejected-action banner by clicking it. Newer failures, in-progress merges, and polling or authentication errors stay visible.
 - Show PRs as Ready for review instead of Unknown right after a new commit is pushed, while Codex, Cubic, or CodeRabbit have not started reviewing it yet. If a reviewer still has not started after 10 minutes (configurable with `review_start_grace_seconds`), the PR shows as Unknown with that reason. Earlier approvals are never carried over to the new commit.
 - Fix merges failing with "Base branch was modified" when several PRs in the same repository are merged at once. Merges into the same base branch now run one after another, each showing "Waiting for #N…" until the previous merge finishes, and each is rechecked against the updated branch before merging.
 
