@@ -1544,6 +1544,25 @@ async fn countdown_delivery_order_cannot_overtake_an_earlier_request() {
 }
 
 #[tokio::test]
+async fn a_merge_waiting_for_checks_does_not_hold_the_queue() {
+    let mut h = Harness::new();
+    h.refresh_pr().await;
+    h.add_pr("PR_2", 2).await;
+    h.prs.get_mut("PR_1").unwrap().snapshot.check_state = Some(crate::model::CheckState::Running);
+    h.request(Request::Merge {
+        on_green: true,
+        pr: "PR_1".into(),
+        head: "head".into(),
+        update: h.prs["PR_1"].update_id.clone(),
+    });
+    assert_eq!(h.progress("PR_1"), Some(&MergeProgress::WaitingForChecks));
+    // Checks may never turn green, so a ready merge must not wait behind them.
+    h.merge("PR_2");
+    h.finish_countdown("PR_2");
+    assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Checking));
+}
+
+#[tokio::test]
 async fn retargeting_a_pending_merge_cancels_it() {
     let mut h = two_queued_merges().await;
     h.prs.get_mut("PR_2").unwrap().snapshot.base_branch = Some("release".into());
