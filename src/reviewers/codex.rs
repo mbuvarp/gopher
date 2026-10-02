@@ -1,5 +1,30 @@
 use super::*;
 
+/// Codex comments instead of reviewing when its usage limit is reached. The
+/// notice stays on the PR, so it only counts while no newer Codex activity exists.
+fn usage_limit<'a>(s: &'a Snapshot, reactions: &[&Reaction]) -> Option<&'a Comment> {
+    let notice = s
+        .comments
+        .iter()
+        .filter(|c| {
+            Agent::from_login(&c.author) == Some(Agent::Codex)
+                && c.body
+                    .to_lowercase()
+                    .contains("reached your codex usage limit")
+        })
+        .max_by_key(|c| &c.updated_at)?;
+    let newer_comment = s.comments.iter().any(|c| {
+        Agent::from_login(&c.author) == Some(Agent::Codex)
+            && c.id != notice.id
+            && c.updated_at > notice.updated_at
+    });
+    let newer_review = s.reviews.iter().any(|r| {
+        Agent::from_login(&r.author) == Some(Agent::Codex) && r.submitted_at > notice.updated_at
+    });
+    let newer_reaction = reactions.iter().any(|r| r.created_at > notice.updated_at);
+    (!newer_comment && !newer_review && !newer_reaction).then_some(notice)
+}
+
 pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResult {
     let agent = Agent::Codex;
     let reactions: Vec<_> = s
@@ -13,6 +38,14 @@ pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResul
             Verdict::Running,
             &eyes.id,
             "Codex eyes reaction is present",
+        );
+    }
+    if let Some(notice) = usage_limit(s, &reactions) {
+        return result(
+            agent,
+            Verdict::Skipped,
+            &notice.id,
+            "Review skipped — Codex usage limit reached",
         );
     }
     let summary = s

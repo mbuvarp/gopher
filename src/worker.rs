@@ -955,6 +955,34 @@ mod tests {
     }
 
     #[test]
+    fn ready_action_ignores_reviewers_that_skipped_the_draft() {
+        let mut draft = transition(
+            Snapshot {
+                id: "PR_1".into(),
+                open: true,
+                draft: true,
+                checks: vec![Check {
+                    id: "1".into(),
+                    app: "coderabbitai".into(),
+                    name: "CodeRabbit".into(),
+                    status: "completed".into(),
+                    conclusion: "success".into(),
+                    summary: "Review skipped: automatic reviews are disabled".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            None,
+            None,
+            100,
+            0,
+        );
+        assert_eq!(draft.state, State::Unknown);
+        apply_ready_saved(&mut draft, None);
+        assert_eq!(draft.state, State::ReadyForReview);
+    }
+
+    #[test]
     fn ready_action_respects_an_explicit_empty_reviewer_set() {
         let mut draft = transition(
             Snapshot {
