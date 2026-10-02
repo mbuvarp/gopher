@@ -857,7 +857,8 @@ fn apply_ready_saved(pr: &mut PullRequest, expected: Option<&[Agent]>) {
     pr.snapshot.draft = false;
     pr.ready_pending = true;
     if matches!(pr.state, State::Unknown | State::ReadyForReview)
-        && reviewers::ready_for_review(&pr.snapshot, Some(pr), &pr.agents, expected)
+        && (reviewers::ready_for_review(&pr.snapshot, Some(pr), &pr.agents, expected)
+            || reviewers::aggregate(&pr.snapshot, &pr.agents) == State::ReadyForReview)
     {
         pr.state = State::ReadyForReview;
     }
@@ -975,6 +976,30 @@ mod tests {
         let confirmed = transition(draft.snapshot.clone(), Some(&draft), None, 130, 0);
         assert_eq!(confirmed.state, State::ReadyForReview);
         assert!(confirmed.ready_pending);
+    }
+
+    #[test]
+    fn ready_action_shows_reviewers_awaiting_a_new_draft_head() {
+        let mut draft = transition(
+            Snapshot {
+                id: "PR_1".into(),
+                open: true,
+                draft: true,
+                ..Default::default()
+            },
+            None,
+            None,
+            100,
+            0,
+        );
+        draft.agents = vec![AgentResult {
+            agent: Agent::Codex,
+            verdict: Verdict::Pending,
+            run_id: String::new(),
+            reason: "No Codex activity is tied to the current commit yet".into(),
+        }];
+        apply_ready_saved(&mut draft, None);
+        assert_eq!(draft.state, State::ReadyForReview);
     }
 
     #[test]

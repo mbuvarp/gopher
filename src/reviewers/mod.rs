@@ -193,9 +193,14 @@ pub fn aggregate(snapshot: &Snapshot, agents: &[AgentResult]) -> State {
         return State::Unknown;
     }
     // Results from reviewers that already finished cannot be final while
-    // another reviewer has yet to start on the current commit.
+    // another reviewer has yet to start on the current commit. Drafts are
+    // never ready for review.
     if agents.iter().any(|a| a.verdict == Verdict::Pending) {
-        return State::ReadyForReview;
+        return if snapshot.open && !snapshot.draft {
+            State::ReadyForReview
+        } else {
+            State::Unknown
+        };
     }
     if snapshot.threads.iter().any(|t| !t.resolved) {
         return State::Comments;

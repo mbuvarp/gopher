@@ -1693,3 +1693,18 @@ fn inferred_skip_is_not_participation_after_a_push() {
     let pushed = transition(s, Some(&skipped), None, 130, 0);
     assert_eq!(pushed.agents[0].verdict, Verdict::Unknown);
 }
+
+#[test]
+fn draft_awaiting_review_is_unknown_until_marked_ready() {
+    let mut s = snapshot();
+    s.comments.push(codex_summary(&HEAD[..7]));
+    let approved = transition(s.clone(), None, None, 100, 0);
+    s.head = NEW_HEAD.into();
+    s.draft = true;
+    let draft = transition(s.clone(), Some(&approved), None, 130, 0);
+    assert_eq!(draft.state, State::Unknown);
+    assert_eq!(codex(&draft).verdict, Verdict::Pending);
+    s.draft = false;
+    let ready = transition(s, Some(&draft), None, 160, 0);
+    assert_eq!(ready.state, State::ReadyForReview);
+}
