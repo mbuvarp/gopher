@@ -187,10 +187,13 @@ impl Github {
             }
             if status == 304 {
                 let cached = cached.context("GitHub returned 304 without a cached response")?;
+                // A concurrent mutation may have invalidated the cache meanwhile. The
+                // 304 is as fresh as a 200 would be, so return the body read at request
+                // start without caching it again; the worker discards superseded results.
                 ensure!(
                     key.as_ref()
-                        .is_some_and(|key| api.lock().unwrap().get(key).is_some()),
-                    "GitHub response cache changed during the request; retry next poll"
+                        .is_some_and(|key| api.lock().unwrap().same_account(key)),
+                    "GitHub account changed during the request; retry next poll"
                 );
                 tracing::debug!(event = "github_not_modified", resource);
                 return serde_json::from_slice(&cached.body).context("Invalid cached GitHub JSON");
