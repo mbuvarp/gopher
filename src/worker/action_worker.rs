@@ -180,6 +180,8 @@ pub(super) struct Coordinator {
     submissions: BTreeSet<u64>,
     submitted_ready: BTreeMap<u64, ReadyIntent>,
     submitted_labels: BTreeMap<u64, LabelJob>,
+    /// PRs GitHub confirmed merged, awaiting the worker's merged display window.
+    merged: Vec<String>,
 }
 impl Coordinator {
     pub fn new(store: &Store) -> Result<Self> {
@@ -202,6 +204,7 @@ impl Coordinator {
             submissions: BTreeSet::new(),
             submitted_ready: BTreeMap::new(),
             submitted_labels: BTreeMap::new(),
+            merged: Vec::new(),
         })
     }
     pub fn begin_shutdown(&mut self) {
@@ -221,6 +224,11 @@ impl Coordinator {
 
     pub fn has_submissions(&self) -> bool {
         !self.submissions.is_empty()
+    }
+    /// PRs merged since the last call, so the worker can keep them displayed
+    /// briefly instead of treating the merge as a polling failure.
+    pub fn take_merged(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.merged)
     }
     fn token(&mut self) -> u64 {
         self.sequence += 1;
@@ -300,7 +308,12 @@ impl Coordinator {
         self.state
             .ready
             .retain(|id, _| context.prs.get(id).is_none_or(|pr| pr.snapshot.draft));
-        if self.state.ready.len() != ready_count {
+        // A completed merge is displayed only while its PR remains listed.
+        let merge_count = self.state.merges.len();
+        self.state.merges.retain(|id, progress| {
+            *progress != MergeProgress::Complete || context.prs.contains_key(id)
+        });
+        if self.state.ready.len() != ready_count || self.state.merges.len() != merge_count {
             self.publish(context);
         }
         self.sync_labels(context);
@@ -538,6 +551,7 @@ impl Coordinator {
                     match result {
                         Ok(()) => {
                             tracing::info!(event="pr_merged", pr_id=%pr);
+                            self.merged.push(pr.clone());
                             self.state.merges.insert(pr, MergeProgress::Complete);
                             let _ = context.sender.send(Command::Refresh);
                         }
