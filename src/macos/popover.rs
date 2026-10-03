@@ -1,7 +1,7 @@
 //! Native, persistent review inbox. Controls retain their identity across polls;
 //! actions capture the update displayed at activation, before entering the actor.
 use super::{Action, AppEvent, pr_status_image, repo_heading, repo_parts};
-use crate::model::{CheckState, PullRequest, State};
+use crate::model::{CheckProgress, CheckState, PullRequest, State};
 use crate::{
     actions::{ActionState, DisplayedError, Request, Setting},
     worker::Command,
@@ -170,9 +170,15 @@ fn dismiss_button(target: &ActionTarget, mtm: MainThreadMarker) -> Retained<NSBu
     button.setHidden(true);
     button
 }
-fn set_status(field: &NSTextField, text: &str, checks: Option<CheckState>) {
+fn set_status(
+    field: &NSTextField,
+    text: &str,
+    checks: Option<(CheckState, Option<CheckProgress>)>,
+) {
+    let checks = checks.map(|(state, progress)| (state, state.label_with(progress)));
     let suffix = checks
-        .map(|state| format!(" · {}", state.label()))
+        .as_ref()
+        .map(|(_, label)| format!(" · {label}"))
         .unwrap_or_default();
     let value = NSMutableAttributedString::initWithString(
         NSMutableAttributedString::alloc(),
@@ -188,14 +194,14 @@ fn set_status(field: &NSTextField, text: &str, checks: Option<CheckState>) {
             &NSColor::secondaryLabelColor(),
             all,
         );
-        if let Some(state) = checks {
+        if let Some((state, label)) = checks {
             let color = match state {
                 CheckState::Running => NSColor::systemYellowColor(),
                 CheckState::Failed => NSColor::systemRedColor(),
                 CheckState::Conflicts => NSColor::systemOrangeColor(),
                 CheckState::Green => NSColor::systemGreenColor(),
             };
-            let length = state.label().encode_utf16().count();
+            let length = label.encode_utf16().count();
             value.addAttribute_value_range(
                 NSForegroundColorAttributeName,
                 &color,
@@ -443,7 +449,9 @@ impl Row {
             if ignored || pr.stale {
                 None
             } else {
-                pr.snapshot.check_state
+                pr.snapshot
+                    .check_state
+                    .map(|state| (state, pr.snapshot.check_progress))
             },
         );
         let label_height = self.labels.update(
