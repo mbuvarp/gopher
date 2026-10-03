@@ -146,6 +146,34 @@ impl CheckState {
             Self::Green => "Checks green",
         }
     }
+    /// Label shown in the detail row, with the finished share while checks run.
+    pub fn label_with(self, progress: Option<CheckProgress>) -> String {
+        match progress {
+            Some(progress) if self == Self::Running && progress.total > 0 => {
+                format!("Checks running ({}%)", progress.percent())
+            }
+            _ => self.label().to_owned(),
+        }
+    }
+}
+/// Counted checks and how many of them have finished, from the same latest
+/// results that determine the aggregate check state.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CheckProgress {
+    pub completed: u32,
+    pub total: u32,
+}
+impl CheckProgress {
+    pub fn record(&mut self, state: CheckState) {
+        self.total += 1;
+        if state != CheckState::Running {
+            self.completed += 1;
+        }
+    }
+    /// Floors, so checks that are still running never show 100%.
+    pub fn percent(self) -> u32 {
+        (u64::from(self.completed) * 100 / u64::from(self.total.max(1))) as u32
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrLabel {
@@ -178,6 +206,9 @@ pub struct Snapshot {
     /// None for older caches or identity-only snapshots, until a full fetch succeeds.
     #[serde(default)]
     pub check_state: Option<CheckState>,
+    /// None for older caches or identity-only snapshots, until a full fetch succeeds.
+    #[serde(default)]
+    pub check_progress: Option<CheckProgress>,
     #[serde(default)]
     pub labels: Vec<PrLabel>,
 }

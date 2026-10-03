@@ -310,6 +310,34 @@ case "$*" in *check-runs*) echo '{checks}'; exit 0 ;; esac
     assert_eq!(CheckState::Conflicts.label(), "Conflicts");
 }
 
+#[test]
+fn running_checks_show_the_floored_finished_share() {
+    use gopher::model::{CheckProgress, CheckState, Snapshot};
+    let progress = |completed, total| Some(CheckProgress { completed, total });
+    for (progress, expected) in [
+        (progress(6, 10), "Checks running (60%)"),
+        (progress(2, 3), "Checks running (66%)"),
+        (progress(199, 200), "Checks running (99%)"),
+        (progress(0, 4), "Checks running (0%)"),
+        (progress(0, 0), "Checks running..."),
+        (None, "Checks running..."),
+    ] {
+        assert_eq!(CheckState::Running.label_with(progress), expected);
+    }
+    for state in [CheckState::Green, CheckState::Failed, CheckState::Conflicts] {
+        assert_eq!(state.label_with(progress(3, 4)), state.label());
+    }
+    // Snapshots cached before progress was recorded keep loading.
+    let snapshot: Snapshot = serde_json::from_value(serde_json::json!({
+        "id":"PR_1","repo":"owner/repo","number":1,"title":"","url":"","head":"head",
+        "open":true,"draft":false,"reviews":[],"comments":[],"reactions":[],"threads":[],
+        "checks":[],"check_state":"running"
+    }))
+    .unwrap();
+    assert_eq!(snapshot.check_state, Some(CheckState::Running));
+    assert_eq!(snapshot.check_progress, None);
+}
+
 #[tokio::test]
 async fn snapshot_summarizes_all_check_pages_and_latest_legacy_contexts() {
     use gopher::model::CheckState;
@@ -369,6 +397,16 @@ esac
             .await
             .unwrap();
         assert_eq!(snapshot.check_state, Some(expected));
+        // 101 check runs plus the latest result of the single legacy context.
+        assert_eq!(
+            snapshot.check_progress,
+            Some(gopher::model::CheckProgress {
+                completed: 100
+                    + u32::from(status == "completed")
+                    + u32::from(legacy_state != "pending"),
+                total: 102,
+            })
+        );
         // CI results are summarized separately from agent review evidence.
         assert!(snapshot.checks.is_empty());
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
@@ -408,6 +446,14 @@ esac
             .await
             .unwrap();
         assert_eq!(snapshot.check_state, Some(CheckState::Running));
+        // The superseded failure counts neither as finished nor towards the total.
+        assert_eq!(
+            snapshot.check_progress,
+            Some(gopher::model::CheckProgress {
+                completed: 99,
+                total: 100,
+            })
+        );
         assert!(snapshot.checks.is_empty());
     }
 }

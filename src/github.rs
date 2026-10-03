@@ -598,7 +598,7 @@ impl Github {
                 break;
             }
         }
-        let mut check_state = snapshot.check_state.unwrap_or_default();
+        let check_state = snapshot.check_state.unwrap_or_default();
         let mut all_checks = Vec::new();
         let mut page = 1;
         loop {
@@ -645,7 +645,7 @@ impl Github {
         } else {
             BTreeMap::new()
         };
-        check_state = check_state.max(check_status::check_runs(&all_checks, &workflows));
+        let runs = check_status::check_runs(&all_checks, &workflows);
         // CodeRabbit also uses legacy commit statuses, which are separate from check runs.
         let mut statuses = Vec::new();
         let mut page = 1;
@@ -665,7 +665,9 @@ impl Github {
             page += 1;
         }
         snapshot.checks.extend(legacy_checks(&statuses));
-        snapshot.check_state = Some(check_state.max(check_status::commit_statuses(&statuses)));
+        let summary = runs.merge(check_status::commit_statuses(&statuses));
+        snapshot.check_state = Some(check_state.max(summary.state));
+        snapshot.check_progress = Some(summary.progress);
         tracing::debug!(event="snapshot_collected", repo=%reference.repo, pr=reference.number, elapsed_ms=start.elapsed().as_millis() as u64, threads=snapshot.threads.len());
         Ok(snapshot)
     }

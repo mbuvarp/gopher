@@ -16,6 +16,38 @@ enum Scope {
     Execution(u64),
 }
 
+/// Aggregate state and progress over the latest result for each counted check.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Summary {
+    pub(super) state: CheckState,
+    pub(super) progress: CheckProgress,
+}
+
+impl Summary {
+    fn record(&mut self, state: CheckState) {
+        self.state = self.state.max(state);
+        self.progress.record(state);
+    }
+
+    pub(super) fn merge(self, other: Self) -> Self {
+        Self {
+            state: self.state.max(other.state),
+            progress: CheckProgress {
+                completed: self.progress.completed + other.progress.completed,
+                total: self.progress.total + other.progress.total,
+            },
+        }
+    }
+}
+
+impl FromIterator<CheckState> for Summary {
+    fn from_iter<I: IntoIterator<Item = CheckState>>(states: I) -> Self {
+        let mut summary = Self::default();
+        states.into_iter().for_each(|state| summary.record(state));
+        summary
+    }
+}
+
 struct RankedCheck<'a> {
     order: (u64, u64),
     check: &'a Value,
@@ -82,16 +114,16 @@ pub(super) async fn workflow_runs(
     }
 }
 
-pub(super) fn check_runs(checks: &[Value], workflows: &BTreeMap<u64, WorkflowRun>) -> CheckState {
+pub(super) fn check_runs(checks: &[Value], workflows: &BTreeMap<u64, WorkflowRun>) -> Summary {
     // Names alone do not establish replacement: independent Actions workflows
     // often both use `test`. Only verified workflow identity can join suites.
     let mut latest: BTreeMap<(String, Scope, &str), RankedCheck<'_>> = BTreeMap::new();
-    let mut state = CheckState::Green;
+    let mut summary = Summary::default();
     for check in checks {
         // Replacement semantics are specific to GitHub Actions. Other apps
         // can publish independent checks with identical names in one suite.
         if check["app"]["slug"] != "github-actions" {
-            state = state.max(check_run(check));
+            summary.record(check_run(check));
             continue;
         }
         let app = check["app"]["id"]
@@ -108,7 +140,7 @@ pub(super) fn check_runs(checks: &[Value], workflows: &BTreeMap<u64, WorkflowRun
             check["id"].as_u64(),
             check["check_suite"]["id"].as_u64(),
         ) else {
-            state = state.max(check_run(check));
+            summary.record(check_run(check));
             continue;
         };
         let workflow = workflows.get(&suite);
@@ -138,9 +170,10 @@ pub(super) fn check_runs(checks: &[Value], workflows: &BTreeMap<u64, WorkflowRun
             *current = RankedCheck { order, check };
         }
     }
-    latest
-        .values()
-        .fold(state, |state, ranked| state.max(check_run(ranked.check)))
+    for ranked in latest.values() {
+        summary.record(check_run(ranked.check));
+    }
+    summary
 }
 
 pub(super) fn check_run(check: &Value) -> CheckState {
@@ -153,7 +186,7 @@ pub(super) fn check_run(check: &Value) -> CheckState {
     }
 }
 
-pub(super) fn commit_statuses(statuses: &[Value]) -> CheckState {
+pub(super) fn commit_statuses(statuses: &[Value]) -> Summary {
     // This endpoint includes historical results. Only the latest status for each
     // case-insensitive context contributes, regardless of author or pagination.
     let mut latest: BTreeMap<String, &Value> = BTreeMap::new();
@@ -171,8 +204,7 @@ pub(super) fn commit_statuses(statuses: &[Value]) -> CheckState {
             Some("pending") => CheckState::Running,
             _ => CheckState::Failed,
         })
-        .max()
-        .unwrap_or_default()
+        .collect()
 }
 
 #[cfg(test)]
@@ -190,12 +222,28 @@ mod tests {
                 json!({"id":100,"app":app,"name":"test","status":"completed","conclusion":"failure","check_suite":{"id":10}}),
                 json!({"id":200,"app":app,"name":"test","status":"completed","conclusion":"success","check_suite":{"id":10}}),
             ];
-            assert_eq!(check_runs(&checks, &BTreeMap::new()), CheckState::Failed);
+            assert_eq!(
+                check_runs(&checks, &BTreeMap::new()).state,
+                CheckState::Failed
+            );
             checks.reverse();
-            assert_eq!(check_runs(&checks, &BTreeMap::new()), CheckState::Failed);
+            assert_eq!(
+                check_runs(&checks, &BTreeMap::new()).state,
+                CheckState::Failed
+            );
             checks[1]["status"] = json!("in_progress");
             checks[1]["conclusion"] = Value::Null;
-            assert_eq!(check_runs(&checks, &BTreeMap::new()), CheckState::Running);
+            assert_eq!(
+                check_runs(&checks, &BTreeMap::new()).state,
+                CheckState::Running
+            );
+            assert_eq!(
+                check_runs(&checks, &BTreeMap::new()).progress,
+                CheckProgress {
+                    completed: 1,
+                    total: 2
+                }
+            );
         }
     }
 
@@ -231,10 +279,10 @@ mod tests {
             } else {
                 CheckState::Failed
             };
-            assert_eq!(check_runs(&checks, &workflows), expected, "{event}");
+            assert_eq!(check_runs(&checks, &workflows).state, expected, "{event}");
             workflows.get_mut(&20).unwrap().run = 10;
             assert_eq!(
-                check_runs(&checks, &workflows),
+                check_runs(&checks, &workflows).state,
                 CheckState::Green,
                 "rerun: {event}"
             );
@@ -259,26 +307,29 @@ mod tests {
             ..old.clone()
         };
         assert!(needs_workflow_identity(&checks));
-        assert_eq!(check_runs(&checks, &BTreeMap::new()), CheckState::Failed);
+        assert_eq!(
+            check_runs(&checks, &BTreeMap::new()).state,
+            CheckState::Failed
+        );
         let mut workflows = BTreeMap::from([(10, old), (20, new)]);
         // The old workflow's failed job was created after the newer run's job.
-        assert_eq!(check_runs(&checks, &workflows), CheckState::Green);
+        assert_eq!(check_runs(&checks, &workflows).state, CheckState::Green);
         workflows.get_mut(&20).unwrap().workflow = 2;
-        assert_eq!(check_runs(&checks, &workflows), CheckState::Failed);
+        assert_eq!(check_runs(&checks, &workflows).state, CheckState::Failed);
         workflows.get_mut(&20).unwrap().workflow = 1;
         workflows.get_mut(&20).unwrap().event = "push".into();
-        assert_eq!(check_runs(&checks, &workflows), CheckState::Failed);
+        assert_eq!(check_runs(&checks, &workflows).state, CheckState::Failed);
         workflows.get_mut(&20).unwrap().event = "pull_request".into();
         workflows.get_mut(&20).unwrap().branch = "other".into();
-        assert_eq!(check_runs(&checks, &workflows), CheckState::Failed);
+        assert_eq!(check_runs(&checks, &workflows).state, CheckState::Failed);
         workflows.remove(&10);
-        assert_eq!(check_runs(&checks, &workflows), CheckState::Failed);
+        assert_eq!(check_runs(&checks, &workflows).state, CheckState::Failed);
         let mut external = checks;
         for check in &mut external {
             check["app"]["slug"] = json!("other-ci");
         }
         assert!(!needs_workflow_identity(&external));
-        assert_eq!(check_runs(&external, &workflows), CheckState::Failed);
+        assert_eq!(check_runs(&external, &workflows).state, CheckState::Failed);
     }
 
     #[test]
@@ -310,14 +361,22 @@ mod tests {
                 },
             ),
         ]);
-        assert_eq!(check_runs(&checks, &workflows), CheckState::Running);
+        assert_eq!(check_runs(&checks, &workflows).state, CheckState::Running);
+        // Superseded jobs are not counted towards progress either.
+        assert_eq!(
+            check_runs(&checks, &workflows).progress,
+            CheckProgress {
+                completed: 2,
+                total: 3
+            }
+        );
         checks.reverse();
-        assert_eq!(check_runs(&checks, &workflows), CheckState::Running);
+        assert_eq!(check_runs(&checks, &workflows).state, CheckState::Running);
         checks[0]["status"] = json!("completed");
         checks[0]["conclusion"] = json!("success");
-        assert_eq!(check_runs(&checks, &workflows), CheckState::Green);
+        assert_eq!(check_runs(&checks, &workflows).state, CheckState::Green);
         checks.push(json!({"id":6,"app":{"id":1,"slug":"github-actions"},"name":"Redesign required","status":"completed","conclusion":"failure"}));
-        assert_eq!(check_runs(&checks, &workflows), CheckState::Failed);
+        assert_eq!(check_runs(&checks, &workflows).state, CheckState::Failed);
     }
 
     #[test]
@@ -329,11 +388,11 @@ mod tests {
             json!({"app":{"id":1,"slug":"github-actions"},"name":"test","status":"completed","conclusion":"failure"}),
         ] {
             assert_eq!(
-                check_runs(&[failed, successful.clone()], &BTreeMap::new()),
+                check_runs(&[failed, successful.clone()], &BTreeMap::new()).state,
                 CheckState::Failed
             );
         }
-        assert_eq!(check_runs(&[], &BTreeMap::new()), CheckState::Green);
+        assert_eq!(check_runs(&[], &BTreeMap::new()).state, CheckState::Green);
     }
 
     #[test]
@@ -381,13 +440,50 @@ mod tests {
             json!({"id":3,"context":"DEPLOY","state":"pending"}),
             json!({"id":1,"context":"tests","state":"failure"}),
         ];
-        assert_eq!(commit_statuses(&statuses), CheckState::Green);
+        assert_eq!(commit_statuses(&statuses).state, CheckState::Green);
         statuses.reverse();
-        assert_eq!(commit_statuses(&statuses), CheckState::Green);
+        assert_eq!(commit_statuses(&statuses).state, CheckState::Green);
+        assert_eq!(
+            commit_statuses(&statuses).progress,
+            CheckProgress {
+                completed: 2,
+                total: 2
+            }
+        );
         statuses.push(json!({"id":5,"context":"tests","state":"pending"}));
-        assert_eq!(commit_statuses(&statuses), CheckState::Running);
+        assert_eq!(commit_statuses(&statuses).state, CheckState::Running);
+        assert_eq!(
+            commit_statuses(&statuses).progress,
+            CheckProgress {
+                completed: 1,
+                total: 2
+            }
+        );
         statuses.push(json!({"id":6,"context":"deploy","state":"error"}));
-        assert_eq!(commit_statuses(&statuses), CheckState::Failed);
-        assert_eq!(commit_statuses(&[]), CheckState::Green);
+        assert_eq!(commit_statuses(&statuses).state, CheckState::Failed);
+        assert_eq!(commit_statuses(&[]).state, CheckState::Green);
+        assert_eq!(commit_statuses(&[]).progress, CheckProgress::default());
+    }
+
+    #[test]
+    fn summaries_merge_state_and_progress() {
+        let runs: Summary = [CheckState::Green, CheckState::Running]
+            .into_iter()
+            .collect();
+        let statuses: Summary = [CheckState::Green, CheckState::Green, CheckState::Green]
+            .into_iter()
+            .collect();
+        let merged = runs.merge(statuses);
+        assert_eq!(merged.state, CheckState::Running);
+        assert_eq!(
+            merged.progress,
+            CheckProgress {
+                completed: 4,
+                total: 5
+            }
+        );
+        let failed: Summary = [CheckState::Failed].into_iter().collect();
+        assert_eq!(merged.merge(failed).state, CheckState::Failed);
+        assert_eq!(merged.merge(failed).progress.completed, 5);
     }
 }
