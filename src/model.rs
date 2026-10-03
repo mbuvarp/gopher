@@ -236,8 +236,27 @@ pub struct PullRequest {
     /// An observed draft-to-ready transition awaiting an actionable result.
     #[serde(default)]
     pub ready_pending: bool,
+    /// Consecutive failed refreshes of this PR alone. Memory-only: a restart
+    /// shows cached data as stale until the first poll anyway.
+    #[serde(skip)]
+    pub poll_failures: u32,
 }
+
+/// Consecutive single-PR refresh failures before the PR needs attention.
+pub const POLL_FAILURE_THRESHOLD: u32 = 3;
+
 impl PullRequest {
+    /// A recent single-PR refresh failure that has not repeated often enough
+    /// to need attention. The PR stays stale, so actions remain disabled.
+    pub fn transient_poll_failure(&self) -> bool {
+        (1..POLL_FAILURE_THRESHOLD).contains(&self.poll_failures)
+    }
+
+    /// Whether the menu bar icon may use the last known state. A transient
+    /// refresh failure must neither hide an update nor show the PR as unknown.
+    pub fn icon_current(&self) -> bool {
+        !self.stale || self.transient_poll_failure()
+    }
     /// Identity-only data must never be treated as current review evidence.
     pub fn unreviewed(snapshot: Snapshot) -> Self {
         Self {
@@ -255,6 +274,7 @@ impl PullRequest {
             reviewing_since: None,
             ready_generation: 0,
             ready_pending: false,
+            poll_failures: 0,
         }
     }
     pub fn needs_attention(&self) -> bool {
