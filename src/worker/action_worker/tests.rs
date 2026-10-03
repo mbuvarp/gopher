@@ -57,6 +57,8 @@ async fn shutdown_waits_for_a_submitted_merge_even_after_intent_invalidation() {
         h.step().await;
     }
     assert!(h.directory.path().join("merge.json").exists());
+    // The worker still learns the PR merged, so it is never polled back in.
+    assert_eq!(h.coordinator.take_merged(), ["PR_1"]);
 }
 
 #[tokio::test]
@@ -619,6 +621,14 @@ async fn merge_countdown_completes_without_ui_events_and_pins_the_commit() {
     }
     assert_eq!(h.coordinator.state.merges["PR_1"], MergeProgress::Complete);
     assert!(start.elapsed() >= Duration::from_secs(5));
+    // The worker keeps the merged PR listed briefly, then removes it.
+    assert_eq!(h.coordinator.take_merged(), ["PR_1"]);
+    assert!(h.coordinator.take_merged().is_empty());
+    h.reconcile();
+    assert_eq!(h.progress("PR_1"), Some(&MergeProgress::Complete));
+    h.prs.clear();
+    h.reconcile();
+    assert_eq!(h.progress("PR_1"), None);
     let payload: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(h.directory.path().join("merge.json")).unwrap(),
     )

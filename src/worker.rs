@@ -20,6 +20,12 @@ const NOTIFICATION_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 /// Quota waits use their own cooldowns; this only spaces out failed polls.
 const MAX_ERROR_BACKOFF: Duration = Duration::from_secs(120);
 const PR_FAILURE_NOTIFICATION_PREFIX: &str = "gopher-pr-error-";
+/// How long a PR merged by Gopher stays listed, with its last known state,
+/// before it is removed.
+#[cfg(not(test))]
+const MERGED_DISPLAY: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const MERGED_DISPLAY: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 pub enum UiEvent {
@@ -93,6 +99,7 @@ pub enum Command {
     Shutdown,
     ShutdownComplete,
     PollComplete(std::result::Result<Batch, String>),
+    MergedExpired(String),
     CheckLabels,
     CredentialsProbed,
 }
@@ -191,6 +198,15 @@ fn reached_github(result: &std::result::Result<Snapshot, String>) -> bool {
         .map_or_else(|message| changed_during_fetch(message), |_| true)
 }
 
+/// Cached PRs to keep on disk. Merged PRs stay listed only in memory, so a quit
+/// during their display window cannot restore them as stale.
+fn persisted(prs: &BTreeMap<String, PullRequest>, merged: &BTreeSet<String>) -> BTreeSet<String> {
+    prs.keys()
+        .filter(|id| !merged.contains(*id))
+        .cloned()
+        .collect()
+}
+
 /// A stale, identity-only entry for a discovered PR whose details failed.
 fn unavailable(reference: &PrRef) -> PullRequest {
     PullRequest::unreviewed(Snapshot {
@@ -273,12 +289,14 @@ async fn fetch(
         .collect::<Vec<_>>();
     let heads = github.final_heads(&ids, &viewer).await?;
     for (id, result) in &mut results {
-        if let Ok(snapshot) = result
-            && !heads
-                .get(id)
-                .is_some_and(|(head, open)| head == &snapshot.head && *open == snapshot.open)
-        {
-            *result = Err(PR_CHANGED_DURING_FETCH.into());
+        if let Ok(snapshot) = result {
+            match heads.get(id) {
+                // This direct lookup confirms closure even when the PR merged or
+                // closed after its details were fetched.
+                Some((_, false)) => snapshot.open = false,
+                Some((head, true)) if head == &snapshot.head && snapshot.open => {}
+                _ => *result = Err(PR_CHANGED_DURING_FETCH.into()),
+            }
         }
     }
     Ok(Batch {
@@ -325,6 +343,10 @@ async fn run(
     let mut ignored_requested = false;
     let mut rediscover_after_poll = false;
     let mut invalidated_poll_ids = BTreeSet::new();
+    // PRs merged by Gopher this session. GitHub cannot reopen a merged PR, so
+    // polls never fetch them again or apply in-flight results for them; each
+    // stays listed until its display window expires.
+    let mut merged: BTreeSet<String> = BTreeSet::new();
     let mut failures = 0_u32;
     // Consecutive single-PR failures, including PRs not yet in `prs`.
     let mut pr_failures: BTreeMap<String, FailureStreak> = BTreeMap::new();
@@ -382,7 +404,7 @@ async fn run(
                 let config = config.clone();
                 let references = references.clone();
                 let viewer = viewer.clone();
-                let ignored = ignored.clone();
+                let ignored = ignored.union(&merged).cloned().collect();
                 let sender = sender.clone();
                 let discover = discovered_at.is_none_or(|time|time.elapsed().as_secs() >= config.discovery_seconds);
                 tokio::spawn(async move {
@@ -520,6 +542,43 @@ async fn run(
                         sink: &sink,
                     },
                 );
+                let newly_merged = pr_actions.take_merged();
+                for id in newly_merged.iter().cloned() {
+                    references.retain(|r| r.id != id);
+                    merged.insert(id.clone());
+                    let sender = sender.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(MERGED_DISPLAY).await;
+                        let _ = sender.send(Command::MergedExpired(id));
+                    });
+                }
+                if !newly_merged.is_empty() {
+                    store.retain(&persisted(&prs, &merged))?;
+                }
+            }
+            Command::MergedExpired(id) => {
+                if prs.remove(&id).is_none() {
+                    continue;
+                }
+                tracing::info!(event = "merged_pr_removed", pr_id = %id);
+                store.retain(&persisted(&prs, &merged))?;
+                // Remove the row before reconciling forgets its Merged state, so the
+                // UI never redraws the row with its Merge action in between.
+                sink(UiEvent::Updated {
+                    prs: displayed_prs(&prs, &pr_actions.state, &config),
+                    error: error.clone(),
+                    loading: polling,
+                });
+                if pr_failures
+                    .remove(&id)
+                    .is_some_and(|streak| streak.notified)
+                {
+                    let notice = failure_notification(&id);
+                    if in_flight_notifications.contains(&notice) {
+                        dismiss_after_delivery.insert(notice.clone());
+                    }
+                    sink(UiEvent::DismissNotifications(vec![notice]));
+                }
             }
             Command::Shutdown => {
                 if !shutting_down {
@@ -553,6 +612,8 @@ async fn run(
                         )?;
                         tracing::warn!(event = "notification_shutdown_unconfirmed");
                     }
+                    // An acknowledgement during a display window may have saved it again.
+                    store.retain(&persisted(&prs, &merged))?;
                     break;
                 }
                 continue;
@@ -753,8 +814,12 @@ async fn run(
                 let mut recovered = Vec::new();
                 match result {
                     Err(message) => {
-                        for pr in prs.values_mut() {
-                            pr.stale = true;
+                        for (id, pr) in &mut prs {
+                            // Merged PRs, and PRs whose merge was submitted, keep
+                            // their last state until they are removed.
+                            pr.stale |= !merged.contains(id)
+                                && pr_actions.state.merges.get(id)
+                                    != Some(&crate::actions::MergeProgress::Merging);
                         }
                         new_error = Some(message);
                     }
@@ -768,15 +833,16 @@ async fn run(
                         references = batch
                             .references
                             .into_iter()
-                            .filter(|r| !ignored.contains(&r.id))
+                            .filter(|r| !ignored.contains(&r.id) && !merged.contains(&r.id))
                             .collect();
                         if batch.discovered {
                             discovered_at = Some(Instant::now());
                             let ids: BTreeSet<_> =
                                 references.iter().map(|r| r.id.clone()).collect();
-                            prs.retain(|id, _| ids.contains(id));
+                            // Merged PRs stay listed until their display window expires.
+                            prs.retain(|id, _| ids.contains(id) || merged.contains(id));
                             pr_failures.retain(|id, streak| {
-                                let keep = ids.contains(id);
+                                let keep = ids.contains(id) || merged.contains(id);
                                 if !keep && streak.notified {
                                     recovered.push(failure_notification(id));
                                 }
@@ -804,8 +870,16 @@ async fn run(
                                     pr.poll_failures = 0;
                                 }
                             }
-                            // The user may have ignored this PR while its request was running.
-                            if ignored.contains(&id) || invalidated_poll_ids.contains(&id) {
+                            // The user may have ignored this PR while its request was
+                            // running. A PR being merged may also show as closed or
+                            // changed mid-fetch; it keeps its last state until the
+                            // merge result arrives.
+                            if ignored.contains(&id)
+                                || invalidated_poll_ids.contains(&id)
+                                || merged.contains(&id)
+                                || pr_actions.state.merges.get(&id)
+                                    == Some(&crate::actions::MergeProgress::Merging)
+                            {
                                 continue;
                             }
                             match result {
@@ -920,7 +994,7 @@ async fn run(
                                 }
                             }
                         }
-                        store.retain(&prs.keys().cloned().collect())?;
+                        store.retain(&persisted(&prs, &merged))?;
                     }
                 }
                 if let Some(message) = &new_error {
@@ -1420,6 +1494,26 @@ esac
         assert_eq!(batch.references.len(), 1);
         assert!(batch.results[0].1.as_ref().unwrap().open);
 
+        // A PR merged after its details were fetched is closed, not changed mid-fetch.
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = auth ]; then echo test-credential; exit 0; fi\n{}",
+                script.replace("\"state\":\"OPEN\"}]}}", "\"state\":\"MERGED\"}]}}")
+            ),
+        )
+        .unwrap();
+        let batch = fetch(
+            config.clone(),
+            references(),
+            true,
+            Some("test".into()),
+            BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!batch.results[0].1.as_ref().unwrap().open);
+
         // A direct closed result still reaches the worker so it can remove the PR.
         std::fs::write(
             &path,
@@ -1711,7 +1805,20 @@ esac
     async fn poll_step(
         sender: &UnboundedSender<Command>,
         ui: &mut UnboundedReceiver<UiEvent>,
-        results: Vec<(&str, std::result::Result<Snapshot, String>)>,
+        results: Vec<PollResult<'_>>,
+        marker: &str,
+    ) -> PollStep {
+        poll_step_as(sender, ui, "viewer", Ok(results), marker).await
+    }
+
+    type PollResult<'a> = (&'a str, std::result::Result<Snapshot, String>);
+
+    /// Injects a poll result for `viewer`, or a failed poll.
+    async fn poll_step_as(
+        sender: &UnboundedSender<Command>,
+        ui: &mut UnboundedReceiver<UiEvent>,
+        viewer: &str,
+        results: std::result::Result<Vec<PollResult<'_>>, String>,
         marker: &str,
     ) -> PollStep {
         let references = ["PR_1", "PR_2", "PR_3"]
@@ -1724,14 +1831,16 @@ esac
             })
             .collect();
         sender
-            .send(Command::PollComplete(Ok(Batch {
-                viewer: "viewer".into(),
-                references,
-                discovered: false,
-                results: results
-                    .into_iter()
-                    .map(|(id, result)| (id.to_owned(), result))
-                    .collect(),
+            .send(Command::PollComplete(results.map(|results| {
+                Batch {
+                    viewer: viewer.into(),
+                    references,
+                    discovered: false,
+                    results: results
+                        .into_iter()
+                        .map(|(id, result)| (id.to_owned(), result))
+                        .collect(),
+                }
             })))
             .unwrap();
         sender
@@ -1965,6 +2074,163 @@ esac
 
         sender.send(Command::Shutdown).unwrap();
         task.await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn merged_pr_keeps_its_state_until_its_display_window_ends() {
+        use crate::actions::{Condition, MergeProgress, Preferences, Request, Rule};
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        // Discovery keeps listing the merged PR, like a lagging search index.
+        let script = include_str!("../tests/fixtures/gh-snapshot.sh").replace("input=$(cat)", r#"
+input=$(cat)
+case "$input" in
+  *PollHeads*) echo '{"data":{"viewer":{"login":"test"},"nodes":[{"id":"PR_1","headRefOid":"head","state":"OPEN"}]}}'; exit 0 ;;
+  *AuthoredPrs*) echo '{"data":{"viewer":{"pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":[{"id":"PR_1","number":1,"repository":{"nameWithOwner":"owner/repo"}}]}}}}'; exit 0 ;;
+  *search*) echo '{"data":{"search":{"issueCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]}}}'; exit 0 ;;
+  *viewer*) echo '{"data":{"viewer":{"login":"test"}}}'; exit 0 ;;
+esac
+"#);
+        let gh = directory.path().join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = auth ]; then echo test-credential; exit 0; fi
+case "$*" in
+ *'--method PUT'*) cat > "$(dirname "$0")/merge.json"; echo '{{"merged":true}}'; exit 0;;
+esac
+{script}"#
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        store.set_viewer("test").unwrap();
+        store
+            .save_action_preferences(
+                "owner/repo",
+                &Preferences {
+                    merge: Rule {
+                        enabled: true,
+                        condition: Condition::Always,
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        drop(store);
+        let (sender, receiver) = unbounded_channel();
+        let (ui_sender, mut ui) = unbounded_channel();
+        let task = tokio::spawn(run(
+            directory.path().into(),
+            Config {
+                gh_path: Some(gh),
+                poll_seconds: 3600,
+                notifications: false,
+                settle_seconds: 0,
+                ..Default::default()
+            },
+            receiver,
+            sender.clone(),
+            Arc::new(move |event| {
+                let _ = ui_sender.send(event);
+            }),
+            IGNORED_CHECK_INTERVAL,
+        ));
+        let pr = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let UiEvent::Updated {
+                    prs,
+                    loading: false,
+                    ..
+                } = ui.recv().await.unwrap()
+                    && let Some(pr) = prs.into_iter().find(|p| p.snapshot.id == "PR_1")
+                    && !pr.stale
+                {
+                    break pr;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        sender
+            .send(Command::PrAction(ActionCommand::Request(Request::Merge {
+                on_green: false,
+                pr: "PR_1".into(),
+                head: pr.snapshot.head.clone(),
+                update: pr.update_id.clone(),
+            })))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(
+                ui.recv().await.unwrap(),
+                UiEvent::ActionsChanged(state)
+                    if state.merges.get("PR_1") == Some(&MergeProgress::Complete)
+            ) {}
+        })
+        .await
+        .unwrap();
+        let merged_at = Instant::now();
+        assert!(directory.path().join("merge.json").exists());
+
+        // A poll that raced the merge, or a failed refresh, keeps the last state.
+        for results in [
+            Ok(vec![("PR_1", Err(PR_CHANGED_DURING_FETCH.into()))]),
+            Err("GitHub request timed out; check connectivity".into()),
+        ] {
+            let step = poll_step_as(&sender, &mut ui, "test", results, "marker").await;
+            let shown = step.prs.iter().find(|p| p.snapshot.id == "PR_1").unwrap();
+            assert!(!shown.stale);
+            assert_eq!(shown.state, pr.state);
+        }
+        // The cached row is already gone, so quitting now cannot restore it as stale.
+        assert!(
+            Store::open(directory.path())
+                .unwrap()
+                .load()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(merged_at.elapsed() < MERGED_DISPLAY);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match ui.recv().await.unwrap() {
+                    UiEvent::Updated { prs, .. } => {
+                        if prs.iter().all(|p| p.snapshot.id != "PR_1") {
+                            break;
+                        }
+                        assert!(prs.iter().all(|p| !p.stale));
+                    }
+                    // The listed row keeps its Merged control until it is removed.
+                    UiEvent::ActionsChanged(state) => {
+                        assert_eq!(state.merges.get("PR_1"), Some(&MergeProgress::Complete))
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(merged_at.elapsed() >= MERGED_DISPLAY / 2);
+
+        // A late open result cannot bring the merged PR back.
+        let step = poll_step_as(
+            &sender,
+            &mut ui,
+            "test",
+            Ok(vec![("PR_1", Ok(pr.snapshot.clone()))]),
+            "marker",
+        )
+        .await;
+        assert!(step.prs.is_empty());
+
+        sender.send(Command::Shutdown).unwrap();
+        task.await.unwrap().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        assert!(store.load().unwrap().is_empty());
     }
 
     async fn poll_started(ui: &mut UnboundedReceiver<UiEvent>) {

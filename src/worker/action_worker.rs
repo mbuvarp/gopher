@@ -180,6 +180,8 @@ pub(super) struct Coordinator {
     submissions: BTreeSet<u64>,
     submitted_ready: BTreeMap<u64, ReadyIntent>,
     submitted_labels: BTreeMap<u64, LabelJob>,
+    /// PRs GitHub confirmed merged, awaiting the worker's merged display window.
+    merged: Vec<String>,
 }
 impl Coordinator {
     pub fn new(store: &Store) -> Result<Self> {
@@ -202,6 +204,7 @@ impl Coordinator {
             submissions: BTreeSet::new(),
             submitted_ready: BTreeMap::new(),
             submitted_labels: BTreeMap::new(),
+            merged: Vec::new(),
         })
     }
     pub fn begin_shutdown(&mut self) {
@@ -221,6 +224,11 @@ impl Coordinator {
 
     pub fn has_submissions(&self) -> bool {
         !self.submissions.is_empty()
+    }
+    /// PRs merged since the last call, so the worker can keep them displayed
+    /// briefly instead of treating the merge as a polling failure.
+    pub fn take_merged(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.merged)
     }
     fn token(&mut self) -> u64 {
         self.sequence += 1;
@@ -303,6 +311,11 @@ impl Coordinator {
         if self.state.ready.len() != ready_count {
             self.publish(context);
         }
+        // A completed merge is displayed only while its PR remains listed. The
+        // worker publishes the row removal first, so forgetting it needs no update.
+        self.state.merges.retain(|id, progress| {
+            *progress != MergeProgress::Complete || context.prs.contains_key(id)
+        });
         self.sync_labels(context);
         let cancelled = self
             .merges
@@ -533,13 +546,17 @@ impl Coordinator {
             }
             ActionCommand::Merged { pr, token, result } => {
                 self.submissions.remove(&token);
+                // GitHub merged the PR even if an account change discarded its intent.
+                if result.is_ok() {
+                    tracing::info!(event="pr_merged", pr_id=%pr);
+                    self.merged.push(pr.clone());
+                    let _ = context.sender.send(Command::Refresh);
+                }
                 if self.merges.get(&pr).is_some_and(|i| i.token == token) {
                     self.merges.remove(&pr);
                     match result {
                         Ok(()) => {
-                            tracing::info!(event="pr_merged", pr_id=%pr);
                             self.state.merges.insert(pr, MergeProgress::Complete);
-                            let _ = context.sender.send(Command::Refresh);
                         }
                         Err(error) => {
                             tracing::warn!(event="merge_failed", pr_id=%pr, error=%error);
