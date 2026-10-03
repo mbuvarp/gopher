@@ -220,6 +220,12 @@ impl PullRequest {
     pub fn transient_poll_failure(&self) -> bool {
         (1..POLL_FAILURE_THRESHOLD).contains(&self.poll_failures)
     }
+
+    /// Whether the menu bar icon may use the last known state. A transient
+    /// refresh failure must neither hide an update nor show the PR as unknown.
+    pub fn icon_current(&self) -> bool {
+        !self.stale || self.transient_poll_failure()
+    }
     /// Identity-only data must never be treated as current review evidence.
     pub fn unreviewed(snapshot: Snapshot) -> Self {
         Self {

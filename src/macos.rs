@@ -977,28 +977,31 @@ fn menu_bar_state(prs: &[PullRequest], service_error: bool, local_error: bool) -
     if local_error {
         return MenuBarState::Review(State::Unknown);
     }
+    let unacknowledged = |pr: &&PullRequest| pr.acknowledged.as_deref() != Some(&pr.update_id);
+    // A PR whose own refresh failed briefly keeps its last known icon; the
+    // list still marks it as cached.
     for state in [State::Failed, State::Comments, State::Approved] {
         if prs
             .iter()
-            .any(|pr| !pr.snapshot.draft && pr.needs_attention() && pr.state == state)
+            .filter(|pr| !pr.snapshot.draft)
+            .filter(unacknowledged)
+            .any(|pr| pr.icon_current() && pr.state == state)
         {
             return MenuBarState::Review(state);
         }
     }
-    let unacknowledged = |pr: &&PullRequest| pr.acknowledged.as_deref() != Some(&pr.update_id);
     if prs
         .iter()
         .filter(|pr| !pr.snapshot.draft)
         .filter(unacknowledged)
-        .any(|pr| !pr.stale && pr.state == State::Reviewing)
+        .any(|pr| pr.icon_current() && pr.state == State::Reviewing)
     {
         MenuBarState::Review(State::Reviewing)
     } else if prs
         .iter()
         .filter(|pr| !pr.snapshot.draft)
         .filter(unacknowledged)
-        // A PR whose own refresh failed briefly is marked in the list only.
-        .any(|pr| (pr.stale && !pr.transient_poll_failure()) || pr.state == State::Unknown)
+        .any(|pr| !pr.icon_current() || pr.state == State::Unknown)
     {
         MenuBarState::Review(State::Unknown)
     } else {
@@ -1267,14 +1270,23 @@ mod tests {
             menu_bar_state(&[pr.clone()], false, false),
             MenuBarState::Review(State::Unknown)
         );
-        // Single-PR refresh failures reach the icon only once they repeat.
-        for (failures, expected) in [
-            (1, MenuBarState::Idle),
-            (POLL_FAILURE_THRESHOLD - 1, MenuBarState::Idle),
-            (POLL_FAILURE_THRESHOLD, MenuBarState::Review(State::Unknown)),
-        ] {
-            pr.poll_failures = failures;
-            assert_eq!(menu_bar_state(&[pr.clone()], false, false), expected);
+        // Brief single-PR refresh failures keep the last known icon; repeated
+        // failures show the PR as unknown.
+        for state in [State::Comments, State::Reviewing, State::ReadyForReview] {
+            pr.state = state;
+            let last_known = if state.actionable() || state == State::Reviewing {
+                MenuBarState::Review(state)
+            } else {
+                MenuBarState::Idle
+            };
+            for (failures, expected) in [
+                (1, last_known),
+                (POLL_FAILURE_THRESHOLD - 1, last_known),
+                (POLL_FAILURE_THRESHOLD, MenuBarState::Review(State::Unknown)),
+            ] {
+                pr.poll_failures = failures;
+                assert_eq!(menu_bar_state(&[pr.clone()], false, false), expected);
+            }
         }
     }
 
