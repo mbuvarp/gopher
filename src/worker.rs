@@ -779,20 +779,29 @@ async fn run(
                             match result {
                                 Err(message) => {
                                     let reference = references.iter().find(|r| r.id == id);
-                                    let streak = (isolated && !changed_during_fetch(&message))
-                                        .then(|| {
-                                            let streak = pr_failures.entry(id.clone()).or_default();
-                                            streak.count = streak.count.saturating_add(1);
-                                            let notify = streak.count >= POLL_FAILURE_THRESHOLD
-                                                && !streak.notified;
-                                            streak.notified |= notify;
-                                            (streak.count, notify)
-                                        });
+                                    let changed = changed_during_fetch(&message);
+                                    // A new head reached GitHub, ending any failure streak;
+                                    // its old evidence must no longer drive the icon.
+                                    if changed
+                                        && pr_failures.remove(&id).is_some_and(|s| s.notified)
+                                    {
+                                        recovered.push(failure_notification(&id));
+                                    }
+                                    let streak = (isolated && !changed).then(|| {
+                                        let streak = pr_failures.entry(id.clone()).or_default();
+                                        streak.count = streak.count.saturating_add(1);
+                                        let notify = streak.count >= POLL_FAILURE_THRESHOLD
+                                            && !streak.notified;
+                                        streak.notified |= notify;
+                                        (streak.count, notify)
+                                    });
                                     let consecutive = streak.map(|(count, _)| count);
                                     if let Some(pr) = prs.get_mut(&id) {
                                         pr.stale = true;
                                         pr.error = Some(message.clone());
-                                        if let Some(count) = consecutive {
+                                        if changed {
+                                            pr.poll_failures = 0;
+                                        } else if let Some(count) = consecutive {
                                             pr.poll_failures = count;
                                         }
                                     }
@@ -990,7 +999,8 @@ fn next_poll(
         (true, None) => failures.saturating_add(1),
     };
     let mut deadline = now + poll_delay(poll_seconds, failures);
-    if failed && let Some(replaced) = replaced.filter(|r| *r > now) {
+    // A replaced retry that came due during the refresh runs immediately.
+    if failed && let Some(replaced) = replaced {
         deadline = deadline.min(replaced);
     }
     (failures, deadline)
@@ -1651,9 +1661,9 @@ esac
             next_poll(now, 30, 0, true, Some(seconds(3600))),
             (1, seconds(30))
         );
-        // A deadline that already passed (refresh during a poll) is not reused.
-        let passed = now - Duration::from_secs(1);
-        assert_eq!(next_poll(now, 30, 3, true, Some(passed)), (3, seconds(120)));
+        // A retry that came due while the refresh ran is not pushed back.
+        let passed = now - Duration::from_secs(10);
+        assert_eq!(next_poll(now, 30, 3, true, Some(passed)), (3, passed));
         // Success resets the count.
         assert_eq!(
             next_poll(now, 30, 3, false, Some(seconds(10))),
@@ -1871,9 +1881,24 @@ esac
         assert_eq!(pr(&step.prs, "PR_1").poll_failures, 0);
         assert_eq!(pr(&step.prs, "PR_2").poll_failures, 1);
 
+        // A new head ends the streak: the stale evidence is no longer shown as current.
+        let step = poll_step(
+            &sender,
+            &mut ui,
+            vec![
+                ("PR_1", Ok(snapshot("PR_1", 1))),
+                ("PR_2", Err(PR_CHANGED_DURING_FETCH.into())),
+            ],
+            "marker",
+        )
+        .await;
+        let changed = pr(&step.prs, "PR_2");
+        assert!(changed.stale && !changed.icon_current());
+        assert_eq!(changed.poll_failures, 0);
+
         // A peer ignored during the poll still shows GitHub was reachable.
         sender.send(Command::Ignore("PR_1".into())).unwrap();
-        for count in 2..=POLL_FAILURE_THRESHOLD {
+        for count in 1..=POLL_FAILURE_THRESHOLD {
             let step = poll_step(&sender, &mut ui, peer_ok_pr_2_fails(), "marker").await;
             assert_eq!(step.error, None);
             assert_eq!(pr(&step.prs, "PR_2").poll_failures, count);
