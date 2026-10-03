@@ -327,7 +327,7 @@ async fn run(
             _ = tokio::time::sleep_until(poll_ready.into()), if !shutting_down && !polling => {
                 polling = true;
                 sink(UiEvent::Updated {
-                    prs: prs.values().cloned().collect(),
+                    prs: displayed_prs(&prs, &pr_actions.state, &config),
                     error: error.clone(),
                     loading: true,
                 });
@@ -443,11 +443,22 @@ async fn run(
                     apply_ready_saved(pr, expected);
                     store.save(pr)?;
                     if polling {
-                        invalidated_poll_ids.insert(id);
+                        invalidated_poll_ids.insert(id.clone());
                         rediscover_after_poll = true;
                     }
                     deadline = Instant::now();
                 }
+                pr_actions.ready_saved(
+                    &id,
+                    &action_worker::Context {
+                        store: &store,
+                        prs: &prs,
+                        viewer: viewer.as_deref(),
+                        config: &config,
+                        sender: &sender,
+                        sink: &sink,
+                    },
+                );
             }
             Command::PrAction(command) => {
                 pr_actions.handle(
@@ -841,7 +852,7 @@ async fn run(
             None,
         );
         sink(UiEvent::Updated {
-            prs: prs.values().cloned().collect(),
+            prs: displayed_prs(&prs, &pr_actions.state, &config),
             error: error.clone(),
             loading: polling,
         });
@@ -851,6 +862,29 @@ async fn run(
     }
     tracing::info!(event = "worker_stopped");
     Ok(())
+}
+
+/// PRs as the UI displays them: drafts with a pending Ready for review request
+/// show optimistically as ready. The worker keeps validating against, and
+/// persisting, only GitHub's confirmed state.
+fn displayed_prs(
+    prs: &BTreeMap<String, PullRequest>,
+    actions: &crate::actions::ActionState,
+    config: &Config,
+) -> Vec<PullRequest> {
+    prs.values()
+        .cloned()
+        .map(|mut pr| {
+            if pr.snapshot.draft && actions.ready_pending(&pr.snapshot.id) {
+                let expected = config
+                    .repositories
+                    .get(&pr.snapshot.repo)
+                    .and_then(|repo| repo.reviewers.as_deref());
+                apply_ready_saved(&mut pr, expected);
+            }
+            pr
+        })
+        .collect()
 }
 
 fn apply_ready_saved(pr: &mut PullRequest, expected: Option<&[Agent]>) {
@@ -976,6 +1010,51 @@ mod tests {
         let confirmed = transition(draft.snapshot.clone(), Some(&draft), None, 130, 0);
         assert_eq!(confirmed.state, State::ReadyForReview);
         assert!(confirmed.ready_pending);
+    }
+
+    #[test]
+    fn pending_ready_action_is_displayed_without_changing_worker_state() {
+        use crate::actions::{ActionState, Failure, ReadyProgress};
+        let draft = transition(
+            Snapshot {
+                id: "PR_1".into(),
+                open: true,
+                draft: true,
+                ..Default::default()
+            },
+            None,
+            None,
+            100,
+            0,
+        );
+        let prs = BTreeMap::from([("PR_1".to_owned(), draft)]);
+        let config = Config::default();
+        let mut actions = ActionState::default();
+        let displayed = |actions: &ActionState| displayed_prs(&prs, actions, &config).remove(0);
+        assert!(displayed(&actions).snapshot.draft);
+
+        for progress in [ReadyProgress::Checking, ReadyProgress::Submitting] {
+            actions.ready.insert("PR_1".into(), progress);
+            let shown = displayed(&actions);
+            assert!(!shown.snapshot.draft);
+            assert_eq!(shown.state, State::ReadyForReview);
+            // Acknowledgements and notifications keep following the confirmed update.
+            assert_eq!(shown.update_id, prs["PR_1"].update_id);
+            assert!(prs["PR_1"].snapshot.draft);
+            assert_eq!(prs["PR_1"].state, State::Unknown);
+        }
+
+        // A failed or cancelled request reverts the display to GitHub's draft.
+        actions.ready.insert(
+            "PR_1".into(),
+            ReadyProgress::Failed(Failure {
+                id: 1,
+                message: "Ready for review failed".into(),
+            }),
+        );
+        let shown = displayed(&actions);
+        assert!(shown.snapshot.draft);
+        assert_eq!(shown.state, State::Unknown);
     }
 
     #[test]

@@ -252,6 +252,14 @@ impl ActionState {
             .cloned()
             .unwrap_or_default()
     }
+    /// A Ready for review request is validating, submitting, or awaiting its
+    /// saved result; the PR is displayed optimistically as ready meanwhile.
+    pub fn ready_pending(&self, pr: &str) -> bool {
+        matches!(
+            self.ready.get(pr),
+            Some(ReadyProgress::Checking | ReadyProgress::Submitting)
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
