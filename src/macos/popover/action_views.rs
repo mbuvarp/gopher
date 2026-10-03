@@ -1,5 +1,5 @@
 use super::*;
-use crate::actions::{Condition, Kind, MergeMethod, MergeProgress, ReadyProgress};
+use crate::actions::{Condition, Kind, MergeMethod, MergeProgress};
 use objc2::runtime::ProtocolObject;
 use std::cell::Cell;
 
@@ -194,18 +194,10 @@ impl PrActions {
             ));
         }
         let preferences = state.preferences(&pr.snapshot.repo);
+        let ready_pending = state.ready_pending(&pr.snapshot.id);
         self.ready.setHidden(!pr.snapshot.draft);
-        self.ready.setEnabled(
-            pr.snapshot.draft
-                && pr.snapshot.open
-                && !pr.stale
-                && !state.ready.get(&pr.snapshot.id).is_some_and(|progress| {
-                    matches!(
-                        progress,
-                        ReadyProgress::Checking | ReadyProgress::Submitting
-                    )
-                }),
-        );
+        self.ready
+            .setEnabled(pr.snapshot.draft && pr.snapshot.open && !pr.stale && !ready_pending);
         self.merge.setTitle(&NSString::from_str(
             if pr.snapshot.check_state == Some(crate::model::CheckState::Running) {
                 "Merge on green checks"
@@ -218,8 +210,9 @@ impl PrActions {
         self.separator.setHidden(
             !pr.snapshot.draft && !preferences.merge.enabled && !preferences.label.enabled,
         );
+        // GitHub still has a draft until the optimistically shown Ready for review saves.
         self.merge
-            .setEnabled(preferences.allows(Kind::Merge, pr) && !busy);
+            .setEnabled(preferences.allows(Kind::Merge, pr) && !busy && !ready_pending);
         self.labels.setEnabled(preferences.allows(Kind::Label, pr));
         bind_item(
             &self.ready,

@@ -332,6 +332,33 @@ esac
             self.handle(command);
         }
     }
+    /// Handles action commands until the coordinator reports a saved ready result.
+    async fn ready_saved(&mut self) -> (String, String) {
+        loop {
+            let command = tokio::time::timeout(Duration::from_secs(8), self.receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match command {
+                Command::PrAction(action) => self.handle(action),
+                Command::ReadySaved { pr, viewer } => break (pr, viewer),
+                _ => {}
+            }
+        }
+    }
+    fn finish_ready(&mut self, pr: &str) {
+        self.coordinator.ready_saved(
+            pr,
+            &Context {
+                store: &self.store,
+                prs: &self.prs,
+                viewer: Some(self.viewer),
+                config: &self.config,
+                sender: &self.sender,
+                sink: &self.sink,
+            },
+        );
+    }
     async fn refresh_pr(&mut self) {
         self.add_pr("PR_1", 1).await;
     }
@@ -365,36 +392,53 @@ async fn ready_for_review_submits_for_draft_without_check_requirements() {
     h.refresh_pr().await;
     assert!(h.prs["PR_1"].snapshot.draft);
     h.request(h.ready_request());
-    let saved = loop {
-        let command = tokio::time::timeout(Duration::from_secs(8), h.receiver.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        match command {
-            Command::PrAction(action) => h.handle(action),
-            Command::ReadySaved { pr, viewer } => break (pr, viewer),
-            _ => {}
-        }
-    };
+    // Displayed as ready from the click, before GitHub has been contacted.
+    assert!(h.coordinator.state.ready_pending("PR_1"));
+    let saved = h.ready_saved().await;
     assert_eq!(saved, ("PR_1".into(), "test".into()));
     assert!(h.directory.path().join("ready.json").exists());
+    // Still displayed as ready until the worker applies ReadySaved, so the
+    // row does not flash back to draft in between.
+    assert!(h.coordinator.state.ready_pending("PR_1"));
+    h.finish_ready("PR_1");
+    assert!(!h.coordinator.state.ready.contains_key("PR_1"));
 }
 
 #[tokio::test]
-async fn ready_for_review_rejects_stale_and_remote_non_draft_prs() {
+async fn ready_for_review_rejects_stale_prs() {
+    let mut h = Harness::new();
+    let pr = h.prs.get_mut("PR_1").unwrap();
+    pr.snapshot.draft = true;
+    pr.stale = true;
+    h.request(h.ready_request());
+    assert!(h.coordinator.ready.is_empty());
+    assert!(!h.coordinator.state.ready_pending("PR_1"));
+    assert!(!h.directory.path().join("ready.json").exists());
+}
+
+#[tokio::test]
+async fn ready_for_review_accepts_a_pr_already_ready_on_github() {
+    let mut h = Harness::new();
+    // Locally a draft, but GitHub's snapshot already reports it as ready.
+    let pr = h.prs.get_mut("PR_1").unwrap();
+    pr.snapshot.draft = true;
+    h.request(h.ready_request());
+    let saved = h.ready_saved().await;
+    assert_eq!(saved, ("PR_1".into(), "test".into()));
+    assert!(h.coordinator.state.ready_pending("PR_1"));
+    assert!(h.coordinator.state.error.is_none());
+    assert!(!h.coordinator.has_submissions());
+    assert!(!h.directory.path().join("ready.json").exists());
+}
+
+#[tokio::test]
+async fn ready_saved_keeps_a_newer_request_pending() {
     let mut h = Harness::new();
     h.prs.get_mut("PR_1").unwrap().snapshot.draft = true;
     h.request(h.ready_request());
-    assert!(!h.directory.path().join("ready.json").exists());
-
-    h.prs.get_mut("PR_1").unwrap().stale = false;
-    h.request(h.ready_request());
-    h.step().await;
-    assert!(matches!(
-        h.coordinator.state.ready.get("PR_1"),
-        Some(ReadyProgress::Failed(_))
-    ));
-    assert!(!h.directory.path().join("ready.json").exists());
+    // A ReadySaved for an earlier request must not end this one's display.
+    h.finish_ready("PR_1");
+    assert!(h.coordinator.state.ready_pending("PR_1"));
 }
 
 #[tokio::test]
@@ -429,8 +473,11 @@ async fn ready_for_review_rejects_head_changes_during_validation() {
     std::fs::write(gh, script).unwrap();
     h.refresh_pr().await;
     h.request(h.ready_request());
+    assert!(h.coordinator.state.ready_pending("PR_1"));
     h.prs.get_mut("PR_1").unwrap().snapshot.head = "new-head".into();
     h.step().await;
+    // The optimistic display reverts and the failure is shown instead.
+    assert!(!h.coordinator.state.ready_pending("PR_1"));
     assert!(matches!(
         h.coordinator.state.ready.get("PR_1"),
         Some(ReadyProgress::Failed(_))

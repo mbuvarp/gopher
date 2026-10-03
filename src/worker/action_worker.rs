@@ -235,6 +235,16 @@ impl Coordinator {
     pub fn publish(&self, context: &Context<'_>) {
         (context.sink)(UiEvent::ActionsChanged(self.state.clone()));
     }
+    /// Ends the optimistic display once the worker has handled ReadySaved,
+    /// whether it applied the result or rejected it for a changed account/PR.
+    pub fn ready_saved(&mut self, pr: &str, context: &Context<'_>) {
+        if !self.ready.contains_key(pr)
+            && matches!(self.state.ready.get(pr), Some(ReadyProgress::Submitting))
+        {
+            self.state.ready.remove(pr);
+            self.publish(context);
+        }
+    }
     fn intent(&mut self, id: &str, kind: Kind, context: &Context<'_>) -> Result<Intent> {
         let pr = context
             .prs
@@ -363,6 +373,7 @@ impl Coordinator {
             }
             ActionCommand::ReadyChecked { pr, token, result } => {
                 if let Some(intent) = self.ready.get(&pr).filter(|i| i.token == token).cloned() {
+                    // None: GitHub already shows the PR as ready, which is the requested result.
                     let checked = result.and_then(|(snapshot, github)| {
                         let current = context.prs.get(&pr);
                         if context.viewer == Some(intent.viewer.as_str())
@@ -375,10 +386,9 @@ impl Coordinator {
                             })
                             && snapshot.id == pr
                             && snapshot.open
-                            && snapshot.draft
                             && snapshot.head == intent.head
                         {
-                            Ok(github)
+                            Ok(snapshot.draft.then_some(github))
                         } else {
                             Err("Ready for review cancelled: the PR or account changed.".into())
                         }
@@ -391,7 +401,19 @@ impl Coordinator {
                                 self.state.ready.insert(pr, ReadyProgress::Failed(failure));
                             }
                         }
-                        Ok(github) => {
+                        Ok(None) => {
+                            tracing::info!(event="pr_already_ready_for_review", pr_id=%pr);
+                            self.ready.remove(&pr);
+                            // Keep displaying the PR as ready until ReadySaved applies it.
+                            self.state
+                                .ready
+                                .insert(pr.clone(), ReadyProgress::Submitting);
+                            let _ = context.sender.send(Command::ReadySaved {
+                                pr,
+                                viewer: intent.viewer,
+                            });
+                        }
+                        Ok(Some(github)) => {
                             self.state
                                 .ready
                                 .insert(pr.clone(), ReadyProgress::Submitting);
@@ -423,9 +445,8 @@ impl Coordinator {
                     match result {
                         Ok(()) => {
                             tracing::info!(event="pr_ready_for_review", pr_id=%pr);
-                            if current {
-                                self.state.ready.remove(&pr);
-                            }
+                            // Its Submitting progress keeps the PR displayed as ready until
+                            // ReadySaved applies the result, so the row never flashes back.
                             let _ = context.sender.send(Command::ReadySaved {
                                 pr,
                                 viewer: intent.viewer,
