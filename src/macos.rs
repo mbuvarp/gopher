@@ -12,12 +12,13 @@ use objc2::{
     sel,
 };
 use objc2_app_kit::{
-    NSImage, NSMenu, NSMenuDidBeginTrackingNotification, NSMenuDidEndTrackingNotification,
-    NSMenuItem, NSWorkspace,
+    NSBitmapImageRep, NSDeviceRGBColorSpace, NSFontWeightRegular, NSGraphicsContext, NSImage,
+    NSImageSymbolConfiguration, NSMenu, NSMenuDidBeginTrackingNotification,
+    NSMenuDidEndTrackingNotification, NSMenuItem, NSWorkspace,
 };
 use objc2_foundation::{
     NSArray, NSBundle, NSError, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol,
-    NSSet, NSSize, NSString, NSURL,
+    NSPoint, NSRect, NSSet, NSSize, NSString, NSURL,
 };
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
 use objc2_user_notifications::*;
@@ -596,10 +597,11 @@ pub fn run(
                     Err(e)=>tracing::error!(event="menu_build_failed",error=%e),
                 }
                 let attention:Vec<_>=prs.iter().filter(|p|p.needs_attention()).collect();
-                let state=menu_bar_state(&prs,error.is_some());
+                let state=menu_bar_state(&prs,service_error.is_some(),ui_error.is_some());
                 let _=tray.set_icon_with_as_template(Some(icon(state)),true);
                 // On macOS, None leaves the existing status-item title unchanged.
-                tray.set_title(Some(if error.is_some(){"!"}else{""}));
+                // The disconnected symbol is explicit enough without a marker.
+                tray.set_title(Some(if error.is_some()&&state!=MenuBarState::Disconnected{"!"}else{""}));
                 let _=tray.set_tooltip(Some(format!("{} · {} PRs · {} updates",crate::identity::NAME,prs.len(),attention.len())));
                 tracing::debug!(event="menu_updated",prs=prs.len(),updates=attention.len(),state=?state);
             }
@@ -917,6 +919,8 @@ fn menu(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MenuBarState {
     Idle,
+    /// GitHub requests are failing. Local UI errors keep the question mark.
+    Disconnected,
     Review(State),
 }
 
@@ -953,8 +957,11 @@ fn pr_status_image(state: State, draft: bool) -> Option<objc2::rc::Retained<NSIm
     })
 }
 
-fn menu_bar_state(prs: &[PullRequest], has_error: bool) -> MenuBarState {
-    if has_error {
+fn menu_bar_state(prs: &[PullRequest], service_error: bool, local_error: bool) -> MenuBarState {
+    if service_error {
+        return MenuBarState::Disconnected;
+    }
+    if local_error {
         return MenuBarState::Review(State::Unknown);
     }
     for state in [State::Failed, State::Comments, State::Approved] {
@@ -1019,11 +1026,86 @@ fn template_rgba(bytes: &[u8]) -> Vec<u8> {
     rgba
 }
 
+fn disconnected_rgba() -> Option<&'static [u8]> {
+    static PIXELS: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    PIXELS
+        .get_or_init(|| symbol_rgba("icloud.slash", "GitHub unavailable"))
+        .as_deref()
+}
+
+/// Rasterize an SF Symbol into the same Retina-sized alpha mask as the bundled
+/// artwork, so template tinting and the Dev badge apply to it as well.
+fn symbol_rgba(name: &str, description: &str) -> Option<Vec<u8>> {
+    const SIZE: usize = 36;
+    let canvas = SIZE as f64;
+    let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str(name),
+        Some(&NSString::from_str(description)),
+    )?
+    .imageWithSymbolConfiguration(
+        &NSImageSymbolConfiguration::configurationWithPointSize_weight(canvas, unsafe {
+            NSFontWeightRegular
+        }),
+    )?;
+    let size = image.size();
+    if size.width <= 0. || size.height <= 0. {
+        return None;
+    }
+    // Fit the symbol's own aspect ratio inside the square canvas.
+    let scale = (canvas / size.width).min(canvas / size.height);
+    let (width, height) = (size.width * scale, size.height * scale);
+    let bitmap = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            std::ptr::null_mut(),
+            SIZE as isize,
+            SIZE as isize,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            (SIZE * 4) as isize,
+            32,
+        )
+    }?;
+    let context = NSGraphicsContext::graphicsContextWithBitmapImageRep(&bitmap)?;
+    NSGraphicsContext::saveGraphicsState_class();
+    NSGraphicsContext::setCurrentContext(Some(&context));
+    image.drawInRect(NSRect::new(
+        NSPoint::new((canvas - width) / 2., (canvas - height) / 2.),
+        NSSize::new(width, height),
+    ));
+    context.flushGraphics();
+    NSGraphicsContext::restoreGraphicsState_class();
+    let data = bitmap.bitmapData();
+    if data.is_null() {
+        return None;
+    }
+    // The bitmap owns its buffer, laid out top row first like tray-icon expects.
+    let pixels = unsafe { std::slice::from_raw_parts(data, SIZE * SIZE * 4) };
+    let mut rgba = vec![0; SIZE * SIZE * 4];
+    for (target, source) in rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(pixels.as_chunks::<4>().0)
+    {
+        target[3] = source[3];
+    }
+    Some(rgba)
+}
+
 fn icon(state: MenuBarState) -> tray_icon::Icon {
     let state = match state {
         MenuBarState::Idle | MenuBarState::Review(State::ReadyForReview | State::Reviewing) => {
             return channel_icon(gopher_rgba().to_vec());
         }
+        MenuBarState::Disconnected => match disconnected_rgba() {
+            Some(rgba) => return channel_icon(rgba.to_vec()),
+            // Keep an error indicator if the symbol is unavailable.
+            None => State::Unknown,
+        },
         MenuBarState::Review(state) => state,
     };
     let mut rgba = vec![0_u8; 36 * 36 * 4];
@@ -1123,17 +1205,20 @@ mod tests {
     #[test]
     fn idle_icon_is_distinct_from_unknown_and_actionable_review_states() {
         let mut pr = worker::transition(Snapshot::default(), None, None, 100, 0);
-        assert_eq!(menu_bar_state(&[], false), MenuBarState::Idle);
+        assert_eq!(menu_bar_state(&[], false, false), MenuBarState::Idle);
         assert_eq!(
-            menu_bar_state(&[], true),
+            menu_bar_state(&[], false, true),
             MenuBarState::Review(State::Unknown)
         );
         assert_eq!(
-            menu_bar_state(&[pr.clone()], false),
+            menu_bar_state(&[pr.clone()], false, false),
             MenuBarState::Review(State::Unknown)
         );
         pr.state = State::ReadyForReview;
-        assert_eq!(menu_bar_state(&[pr.clone()], false), MenuBarState::Idle);
+        assert_eq!(
+            menu_bar_state(&[pr.clone()], false, false),
+            MenuBarState::Idle
+        );
         assert_eq!(
             pr_status_symbols(pr.state, false),
             (&["hourglass"][..], "Ready for review")
@@ -1147,11 +1232,14 @@ mod tests {
             pr.state = state;
             pr.acknowledged = None;
             assert_eq!(
-                menu_bar_state(&[pr.clone()], false),
+                menu_bar_state(&[pr.clone()], false, false),
                 MenuBarState::Review(state)
             );
             pr.acknowledged = Some(pr.update_id.clone());
-            assert_eq!(menu_bar_state(&[pr.clone()], false), MenuBarState::Idle);
+            assert_eq!(
+                menu_bar_state(&[pr.clone()], false, false),
+                MenuBarState::Idle
+            );
         }
         assert_eq!(
             pr_status_symbols(State::Failed, false),
@@ -1160,7 +1248,7 @@ mod tests {
         pr.stale = true;
         pr.acknowledged = None;
         assert_eq!(
-            menu_bar_state(&[pr], false),
+            menu_bar_state(&[pr], false, false),
             MenuBarState::Review(State::Unknown)
         );
     }
@@ -1182,23 +1270,61 @@ mod tests {
                 pr_status_symbols(state, true),
                 (&["pencil.and.scribble", "pencil"][..], "Draft pull request")
             );
-            assert_eq!(menu_bar_state(&[draft.clone()], false), MenuBarState::Idle);
+            assert_eq!(
+                menu_bar_state(&[draft.clone()], false, false),
+                MenuBarState::Idle
+            );
         }
         draft.stale = true;
-        assert_eq!(menu_bar_state(&[draft.clone()], false), MenuBarState::Idle);
+        assert_eq!(
+            menu_bar_state(&[draft.clone()], false, false),
+            MenuBarState::Idle
+        );
 
         let mut ready = draft.clone();
         ready.snapshot.draft = false;
         ready.stale = false;
         ready.state = State::Comments;
         assert_eq!(
-            menu_bar_state(&[draft, ready], false),
+            menu_bar_state(&[draft, ready], false, false),
             MenuBarState::Review(State::Comments)
         );
         assert_eq!(
-            menu_bar_state(&[], true),
+            menu_bar_state(&[], false, true),
             MenuBarState::Review(State::Unknown)
         );
+    }
+
+    #[test]
+    fn service_errors_show_disconnected_icon_over_local_errors_and_reviews() {
+        let mut pr = worker::transition(Snapshot::default(), None, None, 100, 0);
+        pr.state = State::Comments;
+        assert_eq!(
+            menu_bar_state(&[pr.clone()], true, false),
+            MenuBarState::Disconnected
+        );
+        assert_eq!(
+            menu_bar_state(&[pr.clone()], true, true),
+            MenuBarState::Disconnected
+        );
+        assert_eq!(
+            menu_bar_state(&[pr], false, true),
+            MenuBarState::Review(State::Unknown)
+        );
+    }
+
+    #[test]
+    fn disconnected_symbol_renders_to_a_centered_template_icon() {
+        let pixels = disconnected_rgba().expect("icloud.slash is available on macOS 13");
+        assert_eq!(pixels.len(), 36 * 36 * 4);
+        let pixels = pixels.as_chunks::<4>().0;
+        assert!(pixels.iter().all(|p| p[..3] == [0, 0, 0]));
+        assert!(pixels.iter().any(|p| p[3] > 240));
+        assert!(pixels.iter().any(|p| p[3] == 0));
+        // The cloud is wider than tall, so the top and bottom rows stay clear.
+        assert!(pixels[..36].iter().all(|p| p[3] == 0));
+        assert!(pixels[35 * 36..].iter().all(|p| p[3] == 0));
+        let _ = icon(MenuBarState::Disconnected);
     }
 
     #[test]
