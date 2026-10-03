@@ -997,7 +997,8 @@ fn menu_bar_state(prs: &[PullRequest], service_error: bool, local_error: bool) -
         .iter()
         .filter(|pr| !pr.snapshot.draft)
         .filter(unacknowledged)
-        .any(|pr| pr.stale || pr.state == State::Unknown)
+        // A PR whose own refresh failed briefly is marked in the list only.
+        .any(|pr| (pr.stale && !pr.transient_poll_failure()) || pr.state == State::Unknown)
     {
         MenuBarState::Review(State::Unknown)
     } else {
@@ -1263,9 +1264,18 @@ mod tests {
         pr.stale = true;
         pr.acknowledged = None;
         assert_eq!(
-            menu_bar_state(&[pr], false, false),
+            menu_bar_state(&[pr.clone()], false, false),
             MenuBarState::Review(State::Unknown)
         );
+        // Single-PR refresh failures reach the icon only once they repeat.
+        for (failures, expected) in [
+            (1, MenuBarState::Idle),
+            (POLL_FAILURE_THRESHOLD - 1, MenuBarState::Idle),
+            (POLL_FAILURE_THRESHOLD, MenuBarState::Review(State::Unknown)),
+        ] {
+            pr.poll_failures = failures;
+            assert_eq!(menu_bar_state(&[pr.clone()], false, false), expected);
+        }
     }
 
     #[test]

@@ -17,6 +17,9 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 const IGNORED_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const SERVICE_ERROR_NOTIFICATION_INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
 const NOTIFICATION_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+/// Quota waits use their own cooldowns; this only spaces out failed polls.
+const MAX_ERROR_BACKOFF: Duration = Duration::from_secs(120);
+const PR_FAILURE_NOTIFICATION_PREFIX: &str = "gopher-pr-error-";
 
 #[derive(Clone, Debug)]
 pub enum UiEvent {
@@ -164,6 +167,13 @@ pub fn start(directory: PathBuf, config: Config, sink: Sink) -> Result<Worker> {
     })
 }
 
+const PR_CHANGED_DURING_FETCH: &str = "PR changed while fetching checks; retrying next poll";
+
+/// A race with a new push, not a request failure: GitHub was reachable.
+fn changed_during_fetch(message: &str) -> bool {
+    message.starts_with("PR changed")
+}
+
 async fn fetch(
     config: Config,
     references: Vec<PrRef>,
@@ -235,7 +245,7 @@ async fn fetch(
                 .get(id)
                 .is_some_and(|(head, open)| head == &snapshot.head && *open == snapshot.open)
         {
-            *result = Err("PR changed while fetching checks; retrying next poll".into());
+            *result = Err(PR_CHANGED_DURING_FETCH.into());
         }
     }
     Ok(Batch {
@@ -283,6 +293,10 @@ async fn run(
     let mut rediscover_after_poll = false;
     let mut invalidated_poll_ids = BTreeSet::new();
     let mut failures = 0_u32;
+    // Consecutive single-PR failures, including PRs not yet in `prs`.
+    let mut pr_failures: BTreeMap<String, u32> = BTreeMap::new();
+    // An explicit refresh that fails must not lengthen the retry delay.
+    let mut refresh_requested = false;
     let mut in_flight_notifications = BTreeSet::new();
     let mut pending_service_error_notification: Option<String> = None;
     let mut dismiss_after_delivery = BTreeSet::new();
@@ -512,6 +526,7 @@ async fn run(
             Command::Refresh => {
                 deadline = Instant::now();
                 discovered_at = None;
+                refresh_requested = true;
             }
             Command::ShowIgnored => {
                 ignored_requested = true;
@@ -619,6 +634,7 @@ async fn run(
                     invalidated_poll_ids.insert(id.clone());
                 }
                 prs.remove(&id);
+                pr_failures.remove(&id);
                 references.retain(|r| r.id != id);
                 dismiss_after_delivery.extend(
                     notifications
@@ -638,7 +654,13 @@ async fn run(
             Command::NotificationAction { id, open, reveal } => {
                 let target = store.notification_target(&id)?;
                 if reveal {
-                    reveal_target = Some(target.as_ref().map(|(pr, _, _)| pr.clone()));
+                    // Refresh-failure notices have no stored update; they reveal their PR.
+                    let failed_pr = id
+                        .strip_prefix(PR_FAILURE_NOTIFICATION_PREFIX)
+                        .filter(|pr| prs.contains_key(*pr))
+                        .map(str::to_owned);
+                    reveal_target =
+                        Some(target.as_ref().map(|(pr, _, _)| pr.clone()).or(failed_pr));
                 }
                 if let Some((pr, update, url)) = target {
                     if open {
@@ -687,6 +709,7 @@ async fn run(
                     Ok(batch) => {
                         if store.set_viewer(&batch.viewer)? {
                             prs.clear();
+                            pr_failures.clear();
                             in_flight_notifications.clear();
                         }
                         viewer = Some(batch.viewer);
@@ -700,32 +723,74 @@ async fn run(
                             let ids: BTreeSet<_> =
                                 references.iter().map(|r| r.id.clone()).collect();
                             prs.retain(|id, _| ids.contains(id));
+                            pr_failures.retain(|id, _| ids.contains(id));
                             store.retain(&ids)?;
                         }
                         let now = chrono::Utc::now().timestamp();
+                        let current = |id: &String| {
+                            !ignored.contains(id) && !invalidated_poll_ids.contains(id)
+                        };
+                        // A failure is specific to its PR only when another PR's
+                        // requests reached GitHub; otherwise it is a service error.
+                        let isolated = batch.results.iter().any(|(id, result)| {
+                            current(id)
+                                && result
+                                    .as_ref()
+                                    .map_or_else(|m| changed_during_fetch(m), |_| true)
+                        });
                         for (id, result) in batch.results {
                             // The user may have ignored this PR while its request was running.
-                            if ignored.contains(&id) || invalidated_poll_ids.contains(&id) {
+                            if !current(&id) {
                                 continue;
                             }
                             match result {
                                 Err(message) => {
+                                    let reference = references.iter().find(|r| r.id == id);
+                                    let consecutive = if isolated && !changed_during_fetch(&message)
+                                    {
+                                        let count = pr_failures.entry(id.clone()).or_default();
+                                        *count = count.saturating_add(1);
+                                        Some(*count)
+                                    } else {
+                                        None
+                                    };
                                     if let Some(pr) = prs.get_mut(&id) {
                                         pr.stale = true;
                                         pr.error = Some(message.clone());
+                                        if let Some(count) = consecutive {
+                                            pr.poll_failures = count;
+                                        }
                                     }
-                                    let reference = references.iter().find(|r| r.id == id);
                                     tracing::warn!(event="poll_failed", pr_id=%id,
-                                        repo=reference.map(|r|r.repo.as_str()),pr=reference.map(|r|r.number),error=%message);
-                                    if !message.starts_with("PR changed") {
+                                        repo=reference.map(|r|r.repo.as_str()),pr=reference.map(|r|r.number),consecutive,error=%message);
+                                    if consecutive == Some(POLL_FAILURE_THRESHOLD) {
+                                        let title = reference.map_or_else(
+                                            || "Gopher cannot refresh a pull request".into(),
+                                            |r| {
+                                                format!(
+                                                    "Gopher cannot refresh {} #{}",
+                                                    r.repo, r.number
+                                                )
+                                            },
+                                        );
+                                        sink(UiEvent::Notify {
+                                            review: false,
+                                            id: format!("{PR_FAILURE_NOTIFICATION_PREFIX}{id}"),
+                                            title,
+                                            body: message.clone(),
+                                        });
+                                    }
+                                    if !isolated {
                                         new_error = Some(message);
                                     }
                                 }
                                 Ok(snapshot) if !snapshot.open => {
                                     prs.remove(&id);
+                                    pr_failures.remove(&id);
                                     references.retain(|r| r.id != id);
                                 }
                                 Ok(snapshot) => {
+                                    pr_failures.remove(&id);
                                     let previous = prs.get(&id);
                                     let expected = config
                                         .repositories
@@ -806,16 +871,13 @@ async fn run(
                     tracing::info!(event = "service_recovered");
                 }
                 error = new_error;
-                failures = if error.is_some() {
-                    failures.saturating_add(1)
-                } else {
-                    0
+                let explicit = std::mem::take(&mut refresh_requested);
+                failures = match (&error, explicit) {
+                    (None, _) => 0,
+                    (Some(_), true) => failures.max(1),
+                    (Some(_), false) => failures.saturating_add(1),
                 };
-                let delay = config
-                    .poll_seconds
-                    .saturating_mul(2_u64.pow(failures.min(5)))
-                    .min(900);
-                deadline = Instant::now() + Duration::from_secs(delay);
+                deadline = Instant::now() + poll_delay(config.poll_seconds, failures);
                 invalidated_poll_ids.clear();
                 if rediscover_after_poll {
                     rediscover_after_poll = false;
@@ -862,6 +924,14 @@ async fn run(
     }
     tracing::info!(event = "worker_stopped");
     Ok(())
+}
+
+/// Delay before the next poll after `failures` consecutive service errors.
+fn poll_delay(poll_seconds: u64, failures: u32) -> Duration {
+    let seconds = poll_seconds
+        .saturating_mul(2_u64.pow(failures.saturating_sub(1).min(5)))
+        .min(MAX_ERROR_BACKOFF.as_secs().max(poll_seconds));
+    Duration::from_secs(seconds)
 }
 
 /// PRs as the UI displays them: drafts with a pending Ready for review request
@@ -980,6 +1050,7 @@ pub fn transition_with_grace(
         reviewing_since,
         ready_generation,
         ready_pending: ready_pending && !state.actionable(),
+        poll_failures: 0,
     }
 }
 
@@ -1485,6 +1556,210 @@ esac
         let store = Store::open(directory.path()).unwrap();
         assert!(!store.ignored().unwrap().contains(&snapshot.id));
         assert!(store.load_ignored().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_polls_retry_within_two_minutes() {
+        let delays: Vec<_> = (0..8).map(|n| poll_delay(30, n).as_secs()).collect();
+        assert_eq!(delays, [30, 30, 60, 120, 120, 120, 120, 120]);
+        // A slower configured interval is never shortened by an error.
+        assert_eq!(poll_delay(300, 3).as_secs(), 300);
+    }
+
+    /// Injects a poll result, then a notification click whose ShowPopover
+    /// marks that every event for the result has been emitted.
+    async fn poll_step(
+        sender: &UnboundedSender<Command>,
+        ui: &mut UnboundedReceiver<UiEvent>,
+        results: Vec<(&str, std::result::Result<Snapshot, String>)>,
+        marker: &str,
+    ) -> (
+        Option<String>,
+        Vec<PullRequest>,
+        Vec<String>,
+        Option<String>,
+    ) {
+        let references = ["PR_1", "PR_2"]
+            .into_iter()
+            .zip(1..)
+            .map(|(id, number)| PrRef {
+                id: id.into(),
+                repo: "owner/repo".into(),
+                number,
+            })
+            .collect();
+        sender
+            .send(Command::PollComplete(Ok(Batch {
+                viewer: "viewer".into(),
+                references,
+                discovered: false,
+                results: results
+                    .into_iter()
+                    .map(|(id, result)| (id.to_owned(), result))
+                    .collect(),
+            })))
+            .unwrap();
+        sender
+            .send(Command::NotificationAction {
+                id: marker.into(),
+                open: false,
+                reveal: true,
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut last = None;
+            let mut notified = Vec::new();
+            loop {
+                match ui.recv().await.unwrap() {
+                    UiEvent::Updated { prs, error, .. } => last = Some((error, prs)),
+                    UiEvent::Notify {
+                        review: false, id, ..
+                    } if id.starts_with(PR_FAILURE_NOTIFICATION_PREFIX) => notified.push(id),
+                    UiEvent::ShowPopover { pr } => {
+                        let (error, prs) = last.unwrap();
+                        return (error, prs, notified, pr);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn single_pr_failures_stay_local_until_they_repeat() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = |id: &str, number| Snapshot {
+            id: id.into(),
+            repo: "owner/repo".into(),
+            number,
+            head: "head".into(),
+            open: true,
+            ..Default::default()
+        };
+        let mut store = Store::open(directory.path()).unwrap();
+        store.set_viewer("viewer").unwrap();
+        for (id, number) in [("PR_1", 1), ("PR_2", 2)] {
+            store
+                .save(&transition(snapshot(id, number), None, None, 100, 0))
+                .unwrap();
+        }
+        drop(store);
+        let (sender, receiver) = unbounded_channel();
+        let (ui_sender, mut ui) = unbounded_channel();
+        let task = tokio::spawn(run(
+            directory.path().into(),
+            Config {
+                gh_path: Some(directory.path().join("missing-gh")),
+                poll_seconds: 3600,
+                notifications: false,
+                ..Default::default()
+            },
+            receiver,
+            sender.clone(),
+            Arc::new(move |event| {
+                let _ = ui_sender.send(event);
+            }),
+            IGNORED_CHECK_INTERVAL,
+        ));
+        // The startup poll fails globally; later results are injected.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                ui.recv().await.unwrap(),
+                UiEvent::Updated { error: Some(_), .. }
+            ) {}
+        })
+        .await
+        .unwrap();
+        let timeout = || Err::<Snapshot, _>("GitHub request timed out; check connectivity".into());
+        let pr = |prs: &[PullRequest], id: &str| {
+            prs.iter().find(|p| p.snapshot.id == id).cloned().unwrap()
+        };
+        let notice = format!("{PR_FAILURE_NOTIFICATION_PREFIX}PR_2");
+
+        for count in 1..=4 {
+            let marker = if count == POLL_FAILURE_THRESHOLD {
+                notice.as_str()
+            } else {
+                "marker"
+            };
+            let (error, prs, notified, revealed) = poll_step(
+                &sender,
+                &mut ui,
+                vec![("PR_1", Ok(snapshot("PR_1", 1))), ("PR_2", timeout())],
+                marker,
+            )
+            .await;
+            assert_eq!(
+                error, None,
+                "One PR's failure must not become a service error"
+            );
+            assert!(!pr(&prs, "PR_1").stale);
+            let failed = pr(&prs, "PR_2");
+            assert!(
+                failed.stale,
+                "The failed PR stays stale so its actions stay disabled"
+            );
+            assert!(failed.error.is_some());
+            assert_eq!(failed.poll_failures, count);
+            if count == POLL_FAILURE_THRESHOLD {
+                assert_eq!(
+                    notified,
+                    [notice.as_str()],
+                    "Notify once the failure repeats"
+                );
+                assert_eq!(revealed.as_deref(), Some("PR_2"));
+            } else {
+                assert!(notified.is_empty(), "Notify once per streak: {notified:?}");
+            }
+        }
+
+        // When no PR request reaches GitHub, it is a service error, not a PR streak.
+        let (error, prs, notified, _) = poll_step(
+            &sender,
+            &mut ui,
+            vec![("PR_1", timeout()), ("PR_2", timeout())],
+            "marker",
+        )
+        .await;
+        assert!(error.is_some());
+        assert_eq!(pr(&prs, "PR_1").poll_failures, 0);
+        assert_eq!(pr(&prs, "PR_2").poll_failures, 4);
+        assert!(notified.is_empty());
+
+        // Success ends the streak, and a later failure starts a new one.
+        let (error, prs, _, _) = poll_step(
+            &sender,
+            &mut ui,
+            vec![
+                ("PR_1", Ok(snapshot("PR_1", 1))),
+                ("PR_2", Ok(snapshot("PR_2", 2))),
+            ],
+            "marker",
+        )
+        .await;
+        assert_eq!(error, None);
+        assert!(!pr(&prs, "PR_2").stale);
+        assert_eq!(pr(&prs, "PR_2").poll_failures, 0);
+
+        // A PR that changed mid-fetch shows GitHub was reachable.
+        let (error, prs, _, _) = poll_step(
+            &sender,
+            &mut ui,
+            vec![
+                ("PR_1", Err(PR_CHANGED_DURING_FETCH.into())),
+                ("PR_2", timeout()),
+            ],
+            "marker",
+        )
+        .await;
+        assert_eq!(error, None);
+        assert_eq!(pr(&prs, "PR_1").poll_failures, 0);
+        assert_eq!(pr(&prs, "PR_2").poll_failures, 1);
+
+        sender.send(Command::Shutdown).unwrap();
+        task.await.unwrap().unwrap();
     }
 
     #[cfg(unix)]
