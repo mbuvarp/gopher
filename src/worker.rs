@@ -198,6 +198,15 @@ fn reached_github(result: &std::result::Result<Snapshot, String>) -> bool {
         .map_or_else(|message| changed_during_fetch(message), |_| true)
 }
 
+/// Cached PRs to keep on disk. Merged PRs stay listed only in memory, so a quit
+/// during their display window cannot restore them as stale.
+fn persisted(prs: &BTreeMap<String, PullRequest>, merged: &BTreeSet<String>) -> BTreeSet<String> {
+    prs.keys()
+        .filter(|id| !merged.contains(*id))
+        .cloned()
+        .collect()
+}
+
 /// A stale, identity-only entry for a discovered PR whose details failed.
 fn unavailable(reference: &PrRef) -> PullRequest {
     PullRequest::unreviewed(Snapshot {
@@ -533,7 +542,8 @@ async fn run(
                         sink: &sink,
                     },
                 );
-                for id in pr_actions.take_merged() {
+                let newly_merged = pr_actions.take_merged();
+                for id in newly_merged.iter().cloned() {
                     references.retain(|r| r.id != id);
                     merged.insert(id.clone());
                     let sender = sender.clone();
@@ -542,13 +552,23 @@ async fn run(
                         let _ = sender.send(Command::MergedExpired(id));
                     });
                 }
+                if !newly_merged.is_empty() {
+                    store.retain(&persisted(&prs, &merged))?;
+                }
             }
             Command::MergedExpired(id) => {
                 if prs.remove(&id).is_none() {
                     continue;
                 }
                 tracing::info!(event = "merged_pr_removed", pr_id = %id);
-                store.retain(&prs.keys().cloned().collect())?;
+                store.retain(&persisted(&prs, &merged))?;
+                // Remove the row before reconciling forgets its Merged state, so the
+                // UI never redraws the row with its Merge action in between.
+                sink(UiEvent::Updated {
+                    prs: displayed_prs(&prs, &pr_actions.state, &config),
+                    error: error.clone(),
+                    loading: polling,
+                });
                 if pr_failures
                     .remove(&id)
                     .is_some_and(|streak| streak.notified)
@@ -592,6 +612,8 @@ async fn run(
                         )?;
                         tracing::warn!(event = "notification_shutdown_unconfirmed");
                     }
+                    // An acknowledgement during a display window may have saved it again.
+                    store.retain(&persisted(&prs, &merged))?;
                     break;
                 }
                 continue;
@@ -793,8 +815,11 @@ async fn run(
                 match result {
                     Err(message) => {
                         for (id, pr) in &mut prs {
-                            // Merged PRs keep their last state until they are removed.
-                            pr.stale |= !merged.contains(id);
+                            // Merged PRs, and PRs whose merge was submitted, keep
+                            // their last state until they are removed.
+                            pr.stale |= !merged.contains(id)
+                                && pr_actions.state.merges.get(id)
+                                    != Some(&crate::actions::MergeProgress::Merging);
                         }
                         new_error = Some(message);
                     }
@@ -812,16 +837,12 @@ async fn run(
                             .collect();
                         if batch.discovered {
                             discovered_at = Some(Instant::now());
+                            let ids: BTreeSet<_> =
+                                references.iter().map(|r| r.id.clone()).collect();
                             // Merged PRs stay listed until their display window expires.
-                            let ids: BTreeSet<_> = references
-                                .iter()
-                                .map(|r| &r.id)
-                                .chain(merged.iter().filter(|id| prs.contains_key(*id)))
-                                .cloned()
-                                .collect();
-                            prs.retain(|id, _| ids.contains(id));
+                            prs.retain(|id, _| ids.contains(id) || merged.contains(id));
                             pr_failures.retain(|id, streak| {
-                                let keep = ids.contains(id);
+                                let keep = ids.contains(id) || merged.contains(id);
                                 if !keep && streak.notified {
                                     recovered.push(failure_notification(id));
                                 }
@@ -973,7 +994,7 @@ async fn run(
                                 }
                             }
                         }
-                        store.retain(&prs.keys().cloned().collect())?;
+                        store.retain(&persisted(&prs, &merged))?;
                     }
                 }
                 if let Some(message) = &new_error {
@@ -2164,15 +2185,30 @@ esac
             assert!(!shown.stale);
             assert_eq!(shown.state, pr.state);
         }
+        // The cached row is already gone, so quitting now cannot restore it as stale.
+        assert!(
+            Store::open(directory.path())
+                .unwrap()
+                .load()
+                .unwrap()
+                .is_empty()
+        );
         assert!(merged_at.elapsed() < MERGED_DISPLAY);
 
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let UiEvent::Updated { prs, .. } = ui.recv().await.unwrap() {
-                    if prs.iter().all(|p| p.snapshot.id != "PR_1") {
-                        break;
+                match ui.recv().await.unwrap() {
+                    UiEvent::Updated { prs, .. } => {
+                        if prs.iter().all(|p| p.snapshot.id != "PR_1") {
+                            break;
+                        }
+                        assert!(prs.iter().all(|p| !p.stale));
                     }
-                    assert!(prs.iter().all(|p| !p.stale));
+                    // The listed row keeps its Merged control until it is removed.
+                    UiEvent::ActionsChanged(state) => {
+                        assert_eq!(state.merges.get("PR_1"), Some(&MergeProgress::Complete))
+                    }
+                    _ => {}
                 }
             }
         })

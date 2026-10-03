@@ -57,6 +57,8 @@ async fn shutdown_waits_for_a_submitted_merge_even_after_intent_invalidation() {
         h.step().await;
     }
     assert!(h.directory.path().join("merge.json").exists());
+    // The worker still learns the PR merged, so it is never polled back in.
+    assert_eq!(h.coordinator.take_merged(), ["PR_1"]);
 }
 
 #[tokio::test]

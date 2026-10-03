@@ -308,14 +308,14 @@ impl Coordinator {
         self.state
             .ready
             .retain(|id, _| context.prs.get(id).is_none_or(|pr| pr.snapshot.draft));
-        // A completed merge is displayed only while its PR remains listed.
-        let merge_count = self.state.merges.len();
+        if self.state.ready.len() != ready_count {
+            self.publish(context);
+        }
+        // A completed merge is displayed only while its PR remains listed. The
+        // worker publishes the row removal first, so forgetting it needs no update.
         self.state.merges.retain(|id, progress| {
             *progress != MergeProgress::Complete || context.prs.contains_key(id)
         });
-        if self.state.ready.len() != ready_count || self.state.merges.len() != merge_count {
-            self.publish(context);
-        }
         self.sync_labels(context);
         let cancelled = self
             .merges
@@ -546,14 +546,17 @@ impl Coordinator {
             }
             ActionCommand::Merged { pr, token, result } => {
                 self.submissions.remove(&token);
+                // GitHub merged the PR even if an account change discarded its intent.
+                if result.is_ok() {
+                    tracing::info!(event="pr_merged", pr_id=%pr);
+                    self.merged.push(pr.clone());
+                    let _ = context.sender.send(Command::Refresh);
+                }
                 if self.merges.get(&pr).is_some_and(|i| i.token == token) {
                     self.merges.remove(&pr);
                     match result {
                         Ok(()) => {
-                            tracing::info!(event="pr_merged", pr_id=%pr);
-                            self.merged.push(pr.clone());
                             self.state.merges.insert(pr, MergeProgress::Complete);
-                            let _ = context.sender.send(Command::Refresh);
                         }
                         Err(error) => {
                             tracing::warn!(event="merge_failed", pr_id=%pr, error=%error);
