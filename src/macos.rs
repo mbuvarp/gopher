@@ -400,7 +400,7 @@ pub fn run(
             Event::UserEvent(AppEvent::Worker(UiEvent::Stopped)) => {
                 worker_stopped = true;
                 if shutting_down { *flow = ControlFlow::Exit; }
-                else { ui_error=Some("Gopher’s background worker stopped. Restart Gopher.".into()); rebuild=true; }
+                else { ui_error=Some(stopped_worker_error(service_error.take())); rebuild=true; }
             }
             Event::LoopDestroyed => {
                 if let Err(error)=log.diagnostic("INFO",serde_json::json!({"event":"event_loop_stopped","reason":exit_reason,"pid":std::process::id()})) {eprintln!("Gopher could not log event loop shutdown: {error}");}
@@ -613,6 +613,19 @@ pub fn run(
     match startup_error {
         Some(error) => Err(error),
         None => Ok(exit_reason),
+    }
+}
+
+/// A stopped worker's last error may be local, such as an unreadable database,
+/// and GitHub is no longer polled either way, so it must not keep the
+/// disconnected icon.
+fn stopped_worker_error(last_error: Option<String>) -> String {
+    match last_error {
+        Some(error) => format!(
+            "Gopher’s background worker stopped: {}. Restart Gopher.",
+            error.trim_end_matches('.')
+        ),
+        None => "Gopher’s background worker stopped. Restart Gopher.".into(),
     }
 }
 
@@ -1069,6 +1082,12 @@ fn symbol_rgba(name: &str, description: &str) -> Option<Vec<u8>> {
             32,
         )
     }?;
+    let data = bitmap.bitmapData();
+    if data.is_null() {
+        return None;
+    }
+    // The initializer only allocates the buffer; clear it before compositing.
+    unsafe { std::ptr::write_bytes(data, 0, SIZE * SIZE * 4) };
     let context = NSGraphicsContext::graphicsContextWithBitmapImageRep(&bitmap)?;
     NSGraphicsContext::saveGraphicsState_class();
     NSGraphicsContext::setCurrentContext(Some(&context));
@@ -1078,10 +1097,6 @@ fn symbol_rgba(name: &str, description: &str) -> Option<Vec<u8>> {
     ));
     context.flushGraphics();
     NSGraphicsContext::restoreGraphicsState_class();
-    let data = bitmap.bitmapData();
-    if data.is_null() {
-        return None;
-    }
     // The bitmap owns its buffer, laid out top row first like tray-icon expects.
     let pixels = unsafe { std::slice::from_raw_parts(data, SIZE * SIZE * 4) };
     let mut rgba = vec![0; SIZE * SIZE * 4];
@@ -1310,6 +1325,18 @@ mod tests {
         assert_eq!(
             menu_bar_state(&[pr], false, true),
             MenuBarState::Review(State::Unknown)
+        );
+    }
+
+    #[test]
+    fn stopped_worker_errors_are_reported_as_local_errors() {
+        assert_eq!(
+            stopped_worker_error(Some("Cannot open state database.".into())),
+            "Gopher’s background worker stopped: Cannot open state database. Restart Gopher."
+        );
+        assert_eq!(
+            stopped_worker_error(None),
+            "Gopher’s background worker stopped. Restart Gopher."
         );
     }
 
