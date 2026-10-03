@@ -185,6 +185,28 @@ fn changed_during_fetch(message: &str) -> bool {
     message.starts_with("PR changed")
 }
 
+fn reached_github(result: &std::result::Result<Snapshot, String>) -> bool {
+    result
+        .as_ref()
+        .map_or_else(|message| changed_during_fetch(message), |_| true)
+}
+
+/// A stale, identity-only entry for a discovered PR whose details failed.
+fn unavailable(reference: &PrRef) -> PullRequest {
+    PullRequest::unreviewed(Snapshot {
+        id: reference.id.clone(),
+        repo: reference.repo.clone(),
+        number: reference.number,
+        title: "Pull request details unavailable".into(),
+        url: format!(
+            "https://github.com/{}/pull/{}",
+            reference.repo, reference.number
+        ),
+        open: true,
+        ..Default::default()
+    })
+}
+
 async fn fetch(
     config: Config,
     references: Vec<PrRef>,
@@ -766,12 +788,22 @@ async fn run(
                         // A failure is specific to its PR only when another request
                         // reached GitHub, including one whose result is discarded
                         // below; otherwise it is a service error.
-                        let isolated = batch.results.iter().any(|(_, result)| {
-                            result
-                                .as_ref()
-                                .map_or_else(|m| changed_during_fetch(m), |_| true)
-                        });
+                        let isolated = batch
+                            .results
+                            .iter()
+                            .any(|(_, result)| reached_github(result));
                         for (id, result) in batch.results {
+                            // Any request that reached GitHub ends the PR's failure
+                            // streak, even when its result is discarded below. After
+                            // a changed head, old evidence must not drive the icon.
+                            if reached_github(&result) {
+                                if pr_failures.remove(&id).is_some_and(|s| s.notified) {
+                                    recovered.push(failure_notification(&id));
+                                }
+                                if let Some(pr) = prs.get_mut(&id) {
+                                    pr.poll_failures = 0;
+                                }
+                            }
                             // The user may have ignored this PR while its request was running.
                             if ignored.contains(&id) || invalidated_poll_ids.contains(&id) {
                                 continue;
@@ -780,12 +812,11 @@ async fn run(
                                 Err(message) => {
                                     let reference = references.iter().find(|r| r.id == id);
                                     let changed = changed_during_fetch(&message);
-                                    // A new head reached GitHub, ending any failure streak;
-                                    // its old evidence must no longer drive the icon.
-                                    if changed
-                                        && pr_failures.remove(&id).is_some_and(|s| s.notified)
+                                    // Keep a newly discovered PR visible while its details fail.
+                                    if let Some(reference) = reference
+                                        && !prs.contains_key(&id)
                                     {
-                                        recovered.push(failure_notification(&id));
+                                        prs.insert(id.clone(), unavailable(reference));
                                     }
                                     let streak = (isolated && !changed).then(|| {
                                         let streak = pr_failures.entry(id.clone()).or_default();
@@ -799,9 +830,7 @@ async fn run(
                                     if let Some(pr) = prs.get_mut(&id) {
                                         pr.stale = true;
                                         pr.error = Some(message.clone());
-                                        if changed {
-                                            pr.poll_failures = 0;
-                                        } else if let Some(count) = consecutive {
+                                        if let Some(count) = consecutive {
                                             pr.poll_failures = count;
                                         }
                                     }
@@ -831,15 +860,13 @@ async fn run(
                                     }
                                 }
                                 Ok(snapshot) => {
-                                    if pr_failures.remove(&id).is_some_and(|s| s.notified) {
-                                        recovered.push(failure_notification(&id));
-                                    }
                                     if !snapshot.open {
                                         prs.remove(&id);
                                         references.retain(|r| r.id != id);
                                         continue;
                                     }
-                                    let previous = prs.get(&id);
+                                    // An identity-only placeholder is not earlier evidence.
+                                    let previous = prs.get(&id).filter(|pr| pr.fetched_at > 0);
                                     let expected = config
                                         .repositories
                                         .get(&snapshot.repo)
@@ -1687,7 +1714,7 @@ esac
         results: Vec<(&str, std::result::Result<Snapshot, String>)>,
         marker: &str,
     ) -> PollStep {
-        let references = ["PR_1", "PR_2"]
+        let references = ["PR_1", "PR_2", "PR_3"]
             .into_iter()
             .zip(1..)
             .map(|(id, number)| PrRef {
@@ -1910,6 +1937,143 @@ esac
         assert_eq!(step.dismissed, [notice.as_str()]);
         assert!(step.prs.is_empty());
 
+        // A newly discovered PR whose details fail stays visible as unavailable.
+        let step = poll_step(
+            &sender,
+            &mut ui,
+            vec![("PR_1", Ok(snapshot("PR_1", 1))), ("PR_3", timeout())],
+            "marker",
+        )
+        .await;
+        assert_eq!(step.error, None);
+        let placeholder = pr(&step.prs, "PR_3");
+        assert!(placeholder.stale && placeholder.error.is_some());
+        assert_eq!(placeholder.poll_failures, 1);
+        assert_eq!(
+            placeholder.snapshot.url,
+            "https://github.com/owner/repo/pull/3"
+        );
+        let step = poll_step(
+            &sender,
+            &mut ui,
+            vec![("PR_3", Ok(snapshot("PR_3", 3)))],
+            "marker",
+        )
+        .await;
+        let fetched = pr(&step.prs, "PR_3");
+        assert!(!fetched.stale && fetched.fetched_at > 0);
+
+        sender.send(Command::Shutdown).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    async fn poll_started(ui: &mut UnboundedReceiver<UiEvent>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                ui.recv().await.unwrap(),
+                UiEvent::Updated { loading: true, .. }
+            ) {}
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discarded_successful_fetch_ends_a_failure_streak() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        // Real polls stay in flight so a saved label invalidates their results.
+        let gh = directory.path().join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\nif [ \"$1\" = auth ]; then echo test-credential; exit 0; fi\nexec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let snapshot = |id: &str, number| Snapshot {
+            id: id.into(),
+            repo: "owner/repo".into(),
+            number,
+            head: "head".into(),
+            open: true,
+            ..Default::default()
+        };
+        let mut store = Store::open(directory.path()).unwrap();
+        store.set_viewer("viewer").unwrap();
+        for (id, number) in [("PR_1", 1), ("PR_2", 2)] {
+            store
+                .save(&transition(snapshot(id, number), None, None, 100, 0))
+                .unwrap();
+        }
+        drop(store);
+        let (sender, receiver) = unbounded_channel();
+        let (ui_sender, mut ui) = unbounded_channel();
+        let task = tokio::spawn(run(
+            directory.path().into(),
+            Config {
+                gh_path: Some(gh),
+                poll_seconds: 3600,
+                notifications: false,
+                ..Default::default()
+            },
+            receiver,
+            sender.clone(),
+            Arc::new(move |event| {
+                let _ = ui_sender.send(event);
+            }),
+            IGNORED_CHECK_INTERVAL,
+        ));
+        let timeout = || Err::<Snapshot, _>("GitHub request timed out; check connectivity".into());
+        let pr = |prs: &[PullRequest], id: &str| {
+            prs.iter().find(|p| p.snapshot.id == id).cloned().unwrap()
+        };
+        poll_started(&mut ui).await;
+        for count in 1..POLL_FAILURE_THRESHOLD {
+            let step = poll_step(
+                &sender,
+                &mut ui,
+                vec![("PR_1", Ok(snapshot("PR_1", 1))), ("PR_2", timeout())],
+                "marker",
+            )
+            .await;
+            assert_eq!(pr(&step.prs, "PR_2").poll_failures, count);
+        }
+        // A label saved during the next poll discards PR_2's successful result.
+        sender.send(Command::Refresh).unwrap();
+        poll_started(&mut ui).await;
+        sender
+            .send(Command::LabelSaved {
+                pr: "PR_2".into(),
+                viewer: "viewer".into(),
+                label: PrLabel {
+                    name: "saved".into(),
+                    color: "112233".into(),
+                },
+                selected: true,
+            })
+            .unwrap();
+        let step = poll_step(
+            &sender,
+            &mut ui,
+            vec![
+                ("PR_1", Ok(snapshot("PR_1", 1))),
+                ("PR_2", Ok(snapshot("PR_2", 2))),
+            ],
+            "marker",
+        )
+        .await;
+        assert_eq!(pr(&step.prs, "PR_2").poll_failures, 0);
+        // The next failure starts a new streak instead of reaching the threshold.
+        let step = poll_step(
+            &sender,
+            &mut ui,
+            vec![("PR_1", Ok(snapshot("PR_1", 1))), ("PR_2", timeout())],
+            "marker",
+        )
+        .await;
+        assert_eq!(pr(&step.prs, "PR_2").poll_failures, 1);
+        assert!(step.notified.is_empty());
         sender.send(Command::Shutdown).unwrap();
         task.await.unwrap().unwrap();
     }
