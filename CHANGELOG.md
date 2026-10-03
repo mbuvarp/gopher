@@ -6,6 +6,11 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-03
+
+- Show a draft PR as ready as soon as you click Ready for review, instead of waiting for GitHub to confirm. If the request fails or the PR changed in the meantime, it goes back to draft and shows the error. Merge stays disabled until the change is saved. A PR that GitHub already shows as ready now counts as success instead of showing a cancelled error.
+- Show a crossed-out cloud in the menu bar when GitHub requests fail, such as network, authentication, or rate-limit errors, instead of a question mark with an exclamation mark. The question mark still marks other errors and unacknowledged unknown or stale PRs.
+
 ## [0.6.0] - 2026-10-02
 
 - Dismiss a failed PR action or a rejected-action banner by clicking it. Newer failures, in-progress merges, and polling or authentication errors stay visible.
