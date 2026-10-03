@@ -6,6 +6,12 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-04
+
+- Show how far running checks have progressed, such as **Checks running (60%)**. Only the latest checks and statuses that decide the result are counted, so superseded runs don't affect the percentage.
+- Keep a failure to refresh one PR on that PR instead of showing a GitHub error for the whole app. The PR shows as cached with its error while other PRs keep updating, and Gopher notifies you only after three failures in a row. Failed polls now retry within two minutes instead of backing off for up to 15 minutes.
+- Fix PRs merged from Gopher briefly showing as Unknown (cached). They now stay listed as Merged for five seconds and are then removed. PRs merged or closed elsewhere while a poll is running are also handled as closed instead of showing as cached.
+
 ## [0.6.1] - 2026-10-03
 
 - Show a draft PR as ready as soon as you click Ready for review, instead of waiting for GitHub to confirm. If the request fails or the PR changed in the meantime, it goes back to draft and shows the error. Merge stays disabled until the change is saved. A PR that GitHub already shows as ready now counts as success instead of showing a cancelled error.
