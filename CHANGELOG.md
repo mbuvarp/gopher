@@ -6,6 +6,10 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-05
+
+- Fix left-clicking the menu bar icon on macOS 27 opening the standard menu instead of the Gopher popover. Right-click still opens the standard menu.
+
 ## [0.7.0] - 2026-10-04
 
 - Show how far running checks have progressed, such as **Checks running (60%)**. Only the latest checks and statuses that decide the result are counted, so superseded runs don't affect the percentage.
