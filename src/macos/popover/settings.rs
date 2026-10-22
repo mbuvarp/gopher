@@ -20,7 +20,7 @@ pub(super) struct SettingsEditor {
 impl SettingsEditor {
     pub fn new(target: &ActionTarget) -> Self {
         let mtm = MainThreadMarker::new().unwrap();
-        let view = FlippedView::new(rect(0.0, 0.0, WIDTH, 660.0), mtm);
+        let view = FlippedView::new(rect(0.0, 0.0, WIDTH, 696.0), mtm);
         let heading = label("Hotkeys", 16.0, false, mtm);
         heading.setFont(Some(&NSFont::boldSystemFontOfSize(16.0)));
         heading.setFrame(rect(20.0, 10.0, 200.0, 24.0));
@@ -52,28 +52,28 @@ impl SettingsEditor {
             });
         }
         let reset = target.button("Restore defaults", AppEvent::HotkeyEdit(Edit::Reset), mtm);
-        reset.setFrame(rect(20.0, 392.0, 136.0, 28.0));
+        reset.setFrame(rect(20.0, 428.0, 136.0, 28.0));
         view.addSubview(&reset);
         let file = target.button(
             "Open configuration file",
             AppEvent::PopoverAction(Action::ConfigFile),
             mtm,
         );
-        file.setFrame(rect(174.0, 392.0, 190.0, 28.0));
+        file.setFrame(rect(174.0, 428.0, 190.0, 28.0));
         file.setToolTip(Some(&NSString::from_str(
             "Advanced config.toml changes still require a restart.",
         )));
         view.addSubview(&file);
         let message = label("", 11.0, true, mtm);
-        message.setFrame(rect(20.0, 434.0, WIDTH - 40.0, 40.0));
+        message.setFrame(rect(20.0, 470.0, WIDTH - 40.0, 40.0));
         view.addSubview(&message);
         let font_size = if crate::identity::IS_DEV { 13.0 } else { 16.0 };
         let heading = label(&crate::identity::version_label(), font_size, false, mtm);
         heading.setFont(Some(&NSFont::boldSystemFontOfSize(font_size)));
         heading.setFrame(if crate::identity::IS_DEV {
-            rect(20.0, 480.0, WIDTH - 40.0, 40.0)
+            rect(20.0, 516.0, WIDTH - 40.0, 40.0)
         } else {
-            rect(20.0, 490.0, WIDTH - 40.0, 24.0)
+            rect(20.0, 526.0, WIDTH - 40.0, 24.0)
         });
         view.addSubview(&heading);
         let checks = target.button(
@@ -88,11 +88,11 @@ impl SettingsEditor {
         );
         for (index, button) in [&checks, &downloads].into_iter().enumerate() {
             button.setButtonType(NSButtonType::Switch);
-            button.setFrame(rect(20.0, 525.0 + index as f64 * 30.0, WIDTH - 40.0, 26.0));
+            button.setFrame(rect(20.0, 561.0 + index as f64 * 30.0, WIDTH - 40.0, 26.0));
             view.addSubview(button);
         }
         let updates_message = label("", 11.0, true, mtm);
-        updates_message.setFrame(rect(20.0, 592.0, WIDTH - 40.0, 52.0));
+        updates_message.setFrame(rect(20.0, 628.0, WIDTH - 40.0, 52.0));
         view.addSubview(&updates_message);
         Self {
             view,

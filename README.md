@@ -11,6 +11,7 @@ The detail row also shows **Checks running (60%)** in yellow, where the percenta
 The buttons beneath each PR let you:
 
 - **Open PR** in the browser and acknowledge the displayed update after it opens successfully.
+- **Copy URL** to the clipboard and acknowledge the displayed update after it is copied. The button reads **Copied** briefly to confirm.
 - Expand **Details** to inspect reviewer evidence.
 - Open the right-aligned **Actions** dropdown for repository configuration, enabled PR actions, and **Ignore** at the bottom. Ignore hides the PR from the active list, review polling, and notifications until restored.
 
@@ -22,7 +23,7 @@ Ignored PRs are checked at startup and every 15 minutes without fetching reviews
 
 ## Settings and hotkeys
 
-Choose **Actions → Settings** to customize shortcuts. Click a binding and press its replacement, use **Clear** to unset it, or **Restore defaults** to reset all eight. Escape cancels recording. Changes save and apply immediately. Conflicting or unavailable bindings show an error and leave your previous shortcut working. **Open configuration file** opens the advanced `config.toml` settings, which still require restart.
+Choose **Actions → Settings** to customize shortcuts. Click a binding and press its replacement, use **Clear** to unset it, or **Restore defaults** to reset all nine. Escape cancels recording. Changes save and apply immediately. Conflicting or unavailable bindings show an error and leave your previous shortcut working. **Open configuration file** opens the advanced `config.toml` settings, which still require restart.
 
 | Action | Default | Scope |
 | --- | --- | --- |
@@ -31,11 +32,12 @@ Choose **Actions → Settings** to customize shortcuts. Click a binding and pres
 | Previous PR | K | Inbox |
 | Acknowledge | Space | Active inbox |
 | Open PR | O | Inbox |
+| Copy URL | C | Inbox |
 | Toggle Details | D | Inbox |
 | Open Actions | A | Active inbox; opens the menu for arrow-key navigation |
 | Refresh | R | Active inbox |
 
-Keyboard navigation highlights a PR without acknowledging it. J starts at the first PR; K starts at the last. Moving beyond either end clears the highlight. The highlighted PR scrolls into view and stays selected through background updates and trips to other panels. Reopening the popover clears the highlight. Notification clicks highlight their target after acknowledgement and flash its title and icon blue three times to draw attention, then restore their normal color. The ignored list supports navigation, Open PR, and Details too.
+Keyboard navigation highlights a PR without acknowledging it. J starts at the first PR; K starts at the last. Moving beyond either end clears the highlight. The highlighted PR scrolls into view and stays selected through background updates and trips to other panels. Reopening the popover clears the highlight. Notification clicks highlight their target after acknowledgement and flash its title and icon blue three times to draw attention, then restore their normal color. The ignored list supports navigation, Open PR, Copy URL, and Details too. If an earlier version already assigned C to another action, Copy URL starts unset instead.
 
 Command+, is a fixed shortcut that opens Settings from the focused popover. It cannot be reassigned.
 
