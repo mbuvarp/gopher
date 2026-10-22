@@ -6,6 +6,10 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-10-22
+
+- Add a **Copy URL** button to each PR, between **Open PR** and **Details**, including in the ignored list. It copies the PR's GitHub link and acknowledges the update, briefly showing **Copied** to confirm. Press **C** to copy the highlighted PR's link; you can change the key in Settings. If you had already assigned C to another action, that shortcut is kept and Copy URL starts unset.
+
 ## [0.7.1] - 2026-10-05
 
 - Fix left-clicking the menu bar icon on macOS 27 opening the standard menu instead of the Gopher popover. Right-click still opens the standard menu.
