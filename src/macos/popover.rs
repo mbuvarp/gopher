@@ -33,6 +33,8 @@ const WIDTH: f64 = 580.0;
 const HEIGHT: f64 = 620.0;
 const CONTENT_WIDTH: f64 = WIDTH - 32.0;
 const HIGHLIGHT_PADDING: f64 = 8.0;
+const COPY_URL: &str = "Copy URL";
+const COPIED_FEEDBACK: std::time::Duration = std::time::Duration::from_millis(1500);
 
 define_class!(
     #[unsafe(super = NSView)]
@@ -309,6 +311,9 @@ struct Row {
     status: Retained<NSTextField>,
     labels: label_pills::LabelPills,
     open: Retained<NSButton>,
+    copy: Retained<NSButton>,
+    /// UI-only confirmation after a successful copy; it resets on its own deadline.
+    copied_until: std::cell::Cell<Option<std::time::Instant>>,
     disclosure: Retained<NSButton>,
     ignore: Retained<NSButton>,
     actions: PrActions,
@@ -344,10 +349,12 @@ impl Row {
         status.setFrame(rect(49.0, 34.0, CONTENT_WIDTH - 52.0, 18.0));
         let open = target.button("Open PR", placeholder.clone(), mtm);
         open.setFrame(rect(0.0, 57.0, 84.0, 26.0));
+        let copy = target.button(COPY_URL, placeholder.clone(), mtm);
+        copy.setFrame(rect(94.0, 57.0, 84.0, 26.0));
         let disclosure = target.button("Details", placeholder.clone(), mtm);
-        disclosure.setFrame(rect(94.0, 57.0, 92.0, 26.0));
+        disclosure.setFrame(rect(188.0, 57.0, 92.0, 26.0));
         let ignore = target.button("Ignore", placeholder, mtm);
-        ignore.setFrame(rect(196.0, 57.0, 72.0, 26.0));
+        ignore.setFrame(rect(290.0, 57.0, 72.0, 26.0));
         let details = label("", 12.0, true, mtm);
         let actions = PrActions::new(pr, target, mtm);
         let action_message = label("", 11.0, false, mtm);
@@ -359,6 +366,7 @@ impl Row {
             &*title,
             &*status,
             &*open,
+            &*copy,
             &*disclosure,
             &*ignore,
             &*details,
@@ -378,6 +386,8 @@ impl Row {
             status,
             labels: Default::default(),
             open,
+            copy,
+            copied_until: Default::default(),
             disclosure,
             ignore,
             details,
@@ -477,6 +487,7 @@ impl Row {
         );
         for button in [
             &*self.open as &NSView,
+            &*self.copy,
             &*self.disclosure,
             &*self.ignore,
             &*self.actions.button,
@@ -487,6 +498,18 @@ impl Row {
         }
         self.title.setEnabled(!pr.stale && !ignored);
         self.open.setEnabled(!pr.snapshot.url.is_empty());
+        self.copy.setEnabled(!pr.snapshot.url.is_empty());
+        self.copy.setTitle(&NSString::from_str(
+            if self
+                .copied_until
+                .get()
+                .is_some_and(|until| std::time::Instant::now() < until)
+            {
+                "Copied"
+            } else {
+                COPY_URL
+            },
+        ));
         self.ignore.setTitle(&NSString::from_str(if ignored {
             "Restore"
         } else {
@@ -505,6 +528,14 @@ impl Row {
         target.bind(
             &self.open,
             AppEvent::PopoverAction(Action::Open {
+                pr: pr.snapshot.id.clone(),
+                update: pr.update_id.clone(),
+                url: pr.snapshot.url.clone(),
+            }),
+        );
+        target.bind(
+            &self.copy,
+            AppEvent::PopoverAction(Action::CopyUrl {
                 pr: pr.snapshot.id.clone(),
                 update: pr.update_id.clone(),
                 url: pr.snapshot.url.clone(),
@@ -579,6 +610,7 @@ impl Row {
         for button in [
             &self.title,
             &self.open,
+            &self.copy,
             &self.disclosure,
             &self.ignore,
             &self.dismiss,
@@ -832,7 +864,32 @@ impl ReviewPopover {
             row.set_blue(row.normal_blue.get());
         }
     }
+    pub(super) fn copied(&self, id: &str) {
+        if let Some(row) = self.rows.get(id) {
+            row.copied_until
+                .set(Some(std::time::Instant::now() + COPIED_FEEDBACK));
+        }
+    }
+    /// Returns the next deadline for UI-only feedback: the notification flash or a
+    /// Copied confirmation.
     pub(super) fn animate(&mut self) -> Option<std::time::Instant> {
+        let now = std::time::Instant::now();
+        let mut next = self.animate_flash();
+        for row in self.rows.values() {
+            match row.copied_until.get() {
+                Some(until) if now < until => {
+                    next = Some(next.map_or(until, |next| next.min(until)));
+                }
+                Some(_) => {
+                    row.copied_until.set(None);
+                    row.copy.setTitle(&NSString::from_str(COPY_URL));
+                }
+                None => {}
+            }
+        }
+        next
+    }
+    fn animate_flash(&mut self) -> Option<std::time::Instant> {
         let flash = self.flash.as_ref()?;
         if self.popover.isShown()
             && self.detail.is_none()
@@ -904,6 +961,7 @@ impl ReviewPopover {
         let button = match action {
             HotkeyAction::Acknowledge if !self.showing_ignored => Some(&row.title),
             HotkeyAction::OpenPr => Some(&row.open),
+            HotkeyAction::CopyUrl => Some(&row.copy),
             HotkeyAction::Details => Some(&row.disclosure),
             _ => None,
         };

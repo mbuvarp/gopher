@@ -37,6 +37,7 @@ impl Store {
             .map(|text| serde_json::from_str(&text))
             .transpose()?
             .unwrap_or_default();
+        let preferences = preferences.without_conflicting_defaults();
         preferences.validate()?;
         Ok(preferences)
     }

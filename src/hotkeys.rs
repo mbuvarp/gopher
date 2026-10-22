@@ -16,17 +16,19 @@ pub enum HotkeyAction {
     Previous,
     Acknowledge,
     OpenPr,
+    CopyUrl,
     Details,
     Actions,
     Refresh,
 }
 impl HotkeyAction {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::OpenGopher,
         Self::Next,
         Self::Previous,
         Self::Acknowledge,
         Self::OpenPr,
+        Self::CopyUrl,
         Self::Details,
         Self::Actions,
         Self::Refresh,
@@ -38,6 +40,7 @@ impl HotkeyAction {
             Self::Previous => "Previous PR",
             Self::Acknowledge => "Acknowledge",
             Self::OpenPr => "Open PR",
+            Self::CopyUrl => "Copy URL",
             Self::Details => "Toggle Details",
             Self::Actions => "Open Actions",
             Self::Refresh => "Refresh",
@@ -50,6 +53,7 @@ impl HotkeyAction {
             Self::Previous => (40, "K"),
             Self::Acknowledge => (49, "Space"),
             Self::OpenPr => (31, "O"),
+            Self::CopyUrl => (8, "C"),
             Self::Details => (2, "D"),
             Self::Actions => (0, "A"),
             Self::Refresh => (15, "R"),
@@ -97,6 +101,22 @@ impl Preferences {
             .get(&action)
             .cloned()
             .unwrap_or_else(|| action.default_binding())
+    }
+    /// Unset defaults that collide with stored bindings, so a default added in a
+    /// later version cannot invalidate shortcuts the user already customized.
+    pub fn without_conflicting_defaults(mut self) -> Self {
+        let stored: Vec<_> = self.bindings.values().flatten().cloned().collect();
+        for action in HotkeyAction::ALL {
+            if !self.bindings.contains_key(&action)
+                && let Some(default) = action.default_binding()
+                && stored
+                    .iter()
+                    .any(|b| b.matches(default.key, default.modifiers))
+            {
+                self.bindings.insert(action, None);
+            }
+        }
+        self
     }
     pub fn changed(&self, action: HotkeyAction, binding: Option<Binding>) -> Result<Self> {
         let mut next = self.clone();
@@ -303,6 +323,21 @@ mod tests {
             restored.binding(HotkeyAction::Previous),
             prefs.binding(HotkeyAction::Previous)
         );
+    }
+    #[test]
+    fn new_defaults_yield_to_stored_custom_bindings() {
+        // A version without Copy URL could already store C for another action.
+        let stored: Preferences =
+            serde_json::from_str(r#"{"bindings":{"refresh":{"key":8,"modifiers":0,"label":"C"}}}"#)
+                .unwrap();
+        assert!(stored.validate().is_err());
+        let migrated = stored.without_conflicting_defaults();
+        migrated.validate().unwrap();
+        assert_eq!(migrated.action(8, 0), Some(HotkeyAction::Refresh));
+        assert!(migrated.binding(HotkeyAction::CopyUrl).is_none());
+        let defaults = Preferences::default().without_conflicting_defaults();
+        assert_eq!(defaults, Preferences::default());
+        assert_eq!(defaults.action(8, 0), Some(HotkeyAction::CopyUrl));
     }
     #[test]
     fn navigation_has_none_at_both_ends_and_keeps_identity() {

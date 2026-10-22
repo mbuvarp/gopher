@@ -14,7 +14,8 @@ use objc2::{
 use objc2_app_kit::{
     NSBitmapImageRep, NSDeviceRGBColorSpace, NSFontWeightRegular, NSGraphicsContext, NSImage,
     NSImageSymbolConfiguration, NSMenu, NSMenuDidBeginTrackingNotification,
-    NSMenuDidEndTrackingNotification, NSMenuItem, NSWorkspace,
+    NSMenuDidEndTrackingNotification, NSMenuItem, NSPasteboard, NSPasteboardTypeString,
+    NSWorkspace,
 };
 use objc2_foundation::{
     NSArray, NSBundle, NSError, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol,
@@ -164,6 +165,11 @@ impl PrMenuTarget {
 #[derive(Clone, Debug)]
 enum Action {
     Open {
+        url: String,
+        pr: String,
+        update: String,
+    },
+    CopyUrl {
         url: String,
         pr: String,
         update: String,
@@ -445,7 +451,7 @@ pub fn run(
                     if let Some(tray)=&tray {popover.show(tray);}
                     rebuild=true;
                 }
-                UiEvent::Open{url,pr,update}=>{match open_and_acknowledge(&url,&pr,&update,&sender,open_url){
+                UiEvent::Open{url,pr,update}=>{match acknowledge_after(&url,&pr,&update,&sender,open_url){
                     Ok(())=>{}
                     Err(e)=>{ui_error=Some(e.to_string());rebuild=true;}
                 }}
@@ -496,7 +502,8 @@ pub fn run(
                 if let Some(action)=action.as_ref() {
                     let result: Result<()> = (|| {
                         match action {
-                            Action::Open{url,pr,update}=>open_and_acknowledge(url,pr,update,&sender,open_url)?,
+                            Action::Open{url,pr,update}=>acknowledge_after(url,pr,update,&sender,open_url)?,
+                            Action::CopyUrl{url,pr,update}=>{acknowledge_after(url,pr,update,&sender,copy_url)?;popover.copied(pr);rebuild=true;}
                             Action::Ignore(pr)=>{let _=sender.send(Command::Ignore(pr.clone()));}
                             Action::Restore(pr)=>{let _=sender.send(Command::Restore(pr.clone()));}
                             Action::ShowIgnored=>{popover.show_ignored(true);let _=sender.send(Command::ShowIgnored);rebuild=true;}
@@ -674,7 +681,7 @@ fn notify(
     center.addNotificationRequest_withCompletionHandler(&request, Some(&completion));
 }
 
-fn open_url(url: &str) -> Result<()> {
+fn validate_pr_url(url: &str) -> Result<()> {
     let parsed = url::Url::parse(url)?;
     anyhow::ensure!(
         parsed.scheme() == "https"
@@ -683,10 +690,26 @@ fn open_url(url: &str) -> Result<()> {
             && parsed.password().is_none(),
         "Refusing an invalid GitHub PR URL"
     );
+    Ok(())
+}
+
+fn open_url(url: &str) -> Result<()> {
+    validate_pr_url(url)?;
     let url = NSURL::URLWithString(&NSString::from_str(url)).context("Invalid PR URL")?;
     anyhow::ensure!(
         NSWorkspace::sharedWorkspace().openURL(&url),
         "Could not open the PR in your browser"
+    );
+    Ok(())
+}
+
+fn copy_url(url: &str) -> Result<()> {
+    validate_pr_url(url)?;
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    anyhow::ensure!(
+        pasteboard.setString_forType(&NSString::from_str(url), unsafe { NSPasteboardTypeString }),
+        "Could not copy the PR URL"
     );
     Ok(())
 }
@@ -708,21 +731,22 @@ fn dispatch_pr_action(
     Ok(())
 }
 
-fn open_and_acknowledge(
+/// Acknowledges the displayed update only after opening or copying its URL succeeds.
+fn acknowledge_after(
     url: &str,
     pr: &str,
     update: &str,
     sender: &UnboundedSender<Command>,
-    open: impl FnOnce(&str) -> Result<()>,
+    use_url: impl FnOnce(&str) -> Result<()>,
 ) -> Result<()> {
-    open(url)?;
+    use_url(url)?;
     sender
         .send(Command::Acknowledge {
             pr: pr.into(),
             update: update.into(),
             checked: true,
         })
-        .map_err(|_| anyhow::anyhow!("PR opened, but Gopher could not acknowledge the update"))?;
+        .map_err(|_| anyhow::anyhow!("Gopher could not acknowledge the update"))?;
     Ok(())
 }
 
@@ -1526,13 +1550,13 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let url = "https://github.com/owner/repo/pull/1";
         assert!(
-            open_and_acknowledge(url, "PR_1", "update-1", &sender, |_| {
+            acknowledge_after(url, "PR_1", "update-1", &sender, |_| {
                 anyhow::bail!("Browser failed")
             })
             .is_err()
         );
         assert!(receiver.try_recv().is_err());
-        open_and_acknowledge(url, "PR_1", "update-1", &sender, |actual| {
+        acknowledge_after(url, "PR_1", "update-1", &sender, |actual| {
             assert_eq!(actual, url);
             Ok(())
         })
@@ -1540,5 +1564,41 @@ mod tests {
         assert!(
             matches!(receiver.try_recv().unwrap(), Command::Acknowledge {pr,update,checked:true} if pr=="PR_1" && update=="update-1")
         );
+    }
+
+    #[test]
+    fn copying_acknowledges_only_after_the_url_is_copied() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let url = "https://github.com/owner/repo/pull/1";
+        assert!(
+            acknowledge_after(url, "PR_1", "update-1", &sender, |_| {
+                anyhow::bail!("Could not copy the PR URL")
+            })
+            .is_err()
+        );
+        assert!(receiver.try_recv().is_err());
+        acknowledge_after(url, "PR_1", "update-1", &sender, |actual| {
+            assert_eq!(actual, url);
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            matches!(receiver.try_recv().unwrap(), Command::Acknowledge {pr,update,checked:true} if pr=="PR_1" && update=="update-1")
+        );
+    }
+
+    #[test]
+    fn opening_and_copying_accept_only_github_pr_urls() {
+        validate_pr_url("https://github.com/owner/repo/pull/1").unwrap();
+        for url in [
+            "",
+            "http://github.com/owner/repo/pull/1",
+            "https://example.com/owner/repo/pull/1",
+            "https://user:secret@github.com/owner/repo/pull/1",
+            "https://github.com.example.com/owner/repo/pull/1",
+            "javascript:alert(1)",
+        ] {
+            assert!(validate_pr_url(url).is_err(), "{url}");
+        }
     }
 }
