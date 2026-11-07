@@ -80,6 +80,10 @@ define_class!(
                             let state: isize = unsafe { msg_send![sender, state] };
                             *value = state == NSControlStateValueOn;
                         }
+                        Request::MergeDelay(seconds) => {
+                            let value: isize = unsafe { msg_send![sender, integerValue] };
+                            *seconds = value.clamp(0, crate::actions::MAX_MERGE_DELAY_SECONDS.into()) as u8;
+                        }
                         _ => {}
                     }
                     // Hold navigation immediately, before worker state reaches the UI.
@@ -1099,7 +1103,11 @@ impl ReviewPopover {
         let mtm = MainThreadMarker::new().unwrap();
         if let Some(detail) = &mut self.detail {
             if let DetailPanel::Settings(editor) = detail {
-                editor.update(&self.keyboard_state, &self.update_state);
+                editor.update(
+                    &self.keyboard_state,
+                    &self.update_state,
+                    self.action_state.merge_delay,
+                );
             }
             self.refresh.setHidden(true);
             self.actions.setHidden(true);
