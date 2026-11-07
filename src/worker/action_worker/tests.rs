@@ -1842,3 +1842,109 @@ async fn merge_waits_for_github_to_recalculate_mergeability() {
         assert_eq!(h.merge_log().len(), 1);
     }
 }
+
+#[tokio::test]
+async fn merge_delay_setting_persists_and_sets_new_countdowns() {
+    let mut h = Harness::new();
+    assert_eq!(h.coordinator.state.merge_delay, DEFAULT_MERGE_DELAY_SECONDS);
+    h.request(Request::MergeDelay(10));
+    assert_eq!(h.coordinator.state.merge_delay, 10);
+    assert!(h.coordinator.state.error.is_none());
+    h.start_merge();
+    assert_eq!(h.progress("PR_1"), Some(&MergeProgress::Countdown(10)));
+    assert_eq!(MergeProgress::Countdown(10).text(), "Cancel (10s)");
+    h.request(Request::CancelMerge("PR_1".into()));
+
+    // Out-of-range values are rejected and leave the saved setting unchanged.
+    h.request(Request::MergeDelay(MAX_MERGE_DELAY_SECONDS + 1));
+    assert!(h.coordinator.state.error.is_some());
+    assert_eq!(h.coordinator.state.merge_delay, 10);
+
+    // The setting is application-wide and survives restarts and account changes.
+    h.store.set_viewer("someone-else").unwrap();
+    let restarted = Coordinator::new(&h.store).unwrap();
+    assert_eq!(restarted.state.merge_delay, 10);
+}
+
+#[tokio::test]
+async fn invalid_stored_merge_delay_falls_back_to_the_default() {
+    let h = Harness::new();
+    let connection = rusqlite::Connection::open(h.directory.path().join("state.sqlite3")).unwrap();
+    for value in ["11", "-1", "five"] {
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO metadata(key,value) VALUES ('merge_delay_seconds',?1)",
+                [value],
+            )
+            .unwrap();
+        assert_eq!(
+            h.store.merge_delay_seconds().unwrap(),
+            DEFAULT_MERGE_DELAY_SECONDS
+        );
+    }
+    assert!(h.store.save_merge_delay_seconds(11).is_err());
+}
+
+#[tokio::test]
+async fn changing_the_merge_delay_keeps_running_countdowns() {
+    let mut h = Harness::new();
+    h.refresh_pr().await;
+    h.add_pr("PR_2", 2).await;
+    let token = h.merge("PR_1");
+    h.request(Request::MergeDelay(2));
+    assert_eq!(h.progress("PR_1"), Some(&MergeProgress::Countdown(5)));
+    h.handle(ActionCommand::Tick {
+        pr: "PR_1".into(),
+        token,
+        remaining: 4,
+    });
+    assert_eq!(h.progress("PR_1"), Some(&MergeProgress::Countdown(4)));
+    h.merge("PR_2");
+    assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Countdown(2)));
+    // A shorter later countdown still cannot overtake the earlier request.
+    h.finish_countdown("PR_2");
+    assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Queued(1)));
+}
+
+#[tokio::test]
+async fn zero_merge_delay_checks_immediately_and_preserves_request_order() {
+    let mut h = Harness::new();
+    h.refresh_pr().await;
+    h.add_pr("PR_2", 2).await;
+    h.request(Request::MergeDelay(0));
+    h.merge("PR_1");
+    assert_eq!(h.progress("PR_1"), Some(&MergeProgress::Checking));
+    h.merge("PR_2");
+    assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Queued(1)));
+    while h.coordinator.state.merges.values().any(MergeProgress::busy) {
+        h.step().await;
+    }
+    assert_eq!(h.progress("PR_1"), Some(&MergeProgress::Complete));
+    assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Complete));
+    assert_eq!(h.merge_log().len(), 2);
+}
+
+#[tokio::test]
+async fn zero_merge_delay_starts_green_merges_in_request_order() {
+    let mut h = Harness::new();
+    h.refresh_pr().await;
+    h.add_pr("PR_2", 2).await;
+    h.request(Request::MergeDelay(0));
+    // PR_2 is requested first, although PR_1 sorts first by ID.
+    for pr in ["PR_2", "PR_1"] {
+        h.prs.get_mut(pr).unwrap().snapshot.check_state = Some(CheckState::Running);
+        h.request(Request::Merge {
+            on_green: true,
+            pr: pr.into(),
+            head: "head".into(),
+            update: h.prs[pr].update_id.clone(),
+        });
+        assert_eq!(h.progress(pr), Some(&MergeProgress::WaitingForChecks));
+    }
+    for pr in ["PR_1", "PR_2"] {
+        h.prs.get_mut(pr).unwrap().snapshot.check_state = Some(CheckState::Green);
+    }
+    h.reconcile();
+    assert_eq!(h.progress("PR_2"), Some(&MergeProgress::Checking));
+    assert_eq!(h.progress("PR_1"), Some(&MergeProgress::Queued(2)));
+}

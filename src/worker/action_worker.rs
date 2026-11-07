@@ -188,6 +188,7 @@ impl Coordinator {
         Ok(Self {
             state: ActionState {
                 preferences: store.action_preferences()?,
+                merge_delay: store.merge_delay_seconds()?,
                 ..Default::default()
             },
             viewer: store.viewer()?,
@@ -335,7 +336,7 @@ impl Coordinator {
             }
             self.publish(context);
         }
-        let ready = self
+        let mut ready = self
             .merges
             .iter()
             .filter(|(id, _)| {
@@ -347,6 +348,9 @@ impl Coordinator {
             })
             .map(|(id, intent)| (id.clone(), intent.token))
             .collect::<Vec<_>>();
+        // Without a countdown, merges are checked immediately, so start them in
+        // request order rather than PR ID order.
+        ready.sort_unstable_by_key(|(_, token)| *token);
         for (id, token) in ready {
             self.start_countdown(id, token, context);
             self.publish(context);
@@ -491,12 +495,7 @@ impl Coordinator {
                             .merges
                             .insert(pr, MergeProgress::Countdown(remaining));
                     } else {
-                        match self.merge_blocker(&pr, context) {
-                            Some(number) => {
-                                self.queue_merge(pr, number);
-                            }
-                            None => self.check_merge(&pr, context),
-                        }
+                        self.countdown_finished(pr, context);
                     }
                 }
             }
@@ -801,6 +800,16 @@ impl Coordinator {
                     tracing::info!(event="merge_cancelled", pr_id=%pr);
                 }
             }
+            Request::MergeDelay(seconds) => {
+                ensure!(
+                    seconds <= MAX_MERGE_DELAY_SECONDS,
+                    "The merge countdown must be at most {MAX_MERGE_DELAY_SECONDS} seconds"
+                );
+                if seconds != self.state.merge_delay {
+                    context.store.save_merge_delay_seconds(seconds)?;
+                    self.state.merge_delay = seconds;
+                }
+            }
             Request::LoadLabels(pr) => {
                 let intent = self.intent(&pr, Kind::Label, context)?;
                 self.refresh_catalogues(context, Some(&intent.pr.snapshot.repo));
@@ -890,23 +899,39 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Uses the merge delay current when the countdown starts; changing the
+    /// setting later does not shorten or extend a running countdown.
     fn start_countdown(&mut self, pr: String, token: u64, context: &Context<'_>) {
+        let seconds = self.state.merge_delay;
+        tracing::info!(event="merge_countdown_started", pr_id=%pr, seconds);
+        if seconds == 0 {
+            self.countdown_finished(pr, context);
+            return;
+        }
         self.state
             .merges
-            .insert(pr.clone(), MergeProgress::Countdown(5));
-        tracing::info!(event="merge_countdown_started", pr_id=%pr);
+            .insert(pr.clone(), MergeProgress::Countdown(seconds));
         let sender = context.sender.clone();
         tokio::spawn(async move {
             let start = tokio::time::Instant::now();
-            for elapsed in 1..=5 {
-                tokio::time::sleep_until(start + Duration::from_secs(elapsed)).await;
+            for elapsed in 1..=seconds {
+                tokio::time::sleep_until(start + Duration::from_secs(elapsed.into())).await;
                 let _ = sender.send(Command::PrAction(ActionCommand::Tick {
                     pr: pr.clone(),
                     token,
-                    remaining: (5 - elapsed) as u8,
+                    remaining: seconds - elapsed,
                 }));
             }
         });
+    }
+    /// Waits behind an earlier same-base merge, or starts final validation.
+    fn countdown_finished(&mut self, pr: String, context: &Context<'_>) {
+        match self.merge_blocker(&pr, context) {
+            Some(number) => {
+                self.queue_merge(pr, number);
+            }
+            None => self.check_merge(&pr, context),
+        }
     }
     /// The PR number this merge must wait for: a same-base merge being checked
     /// or submitted, or an earlier request whose countdown or queue is pending.

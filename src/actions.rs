@@ -3,6 +3,10 @@ use crate::model::{CheckState, PullRequest, State};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Seconds Merge counts down before submitting; zero submits without a wait.
+pub const DEFAULT_MERGE_DELAY_SECONDS: u8 = 5;
+pub const MAX_MERGE_DELAY_SECONDS: u8 = 10;
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
@@ -150,6 +154,8 @@ pub enum Request {
         on_green: bool,
     },
     CancelMerge(String),
+    /// Applies to countdowns started afterwards; running countdowns keep theirs.
+    MergeDelay(u8),
     LoadLabels(String),
     Label {
         pr: String,
@@ -234,13 +240,26 @@ impl MergeProgress {
         )
     }
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ActionState {
     pub preferences: BTreeMap<String, Preferences>,
     pub merges: BTreeMap<String, MergeProgress>,
     pub ready: BTreeMap<String, ReadyProgress>,
     pub labels: BTreeMap<String, Labels>,
     pub error: Option<Failure>,
+    pub merge_delay: u8,
+}
+impl Default for ActionState {
+    fn default() -> Self {
+        Self {
+            preferences: BTreeMap::new(),
+            merges: BTreeMap::new(),
+            ready: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            error: None,
+            merge_delay: DEFAULT_MERGE_DELAY_SECONDS,
+        }
+    }
 }
 pub fn repo_key(repo: &str) -> String {
     repo.to_ascii_lowercase()

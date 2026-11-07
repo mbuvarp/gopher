@@ -1,4 +1,5 @@
 use super::*;
+use crate::actions::MAX_MERGE_DELAY_SECONDS;
 use crate::hotkeys::HotkeyAction;
 use crate::macos::keyboard::{Edit, State as KeyboardState};
 
@@ -13,6 +14,8 @@ pub(super) struct SettingsEditor {
     reset: Retained<NSButton>,
     file: Retained<NSButton>,
     message: Retained<NSTextField>,
+    merge_delay: Retained<NSSlider>,
+    merge_delay_value: Retained<NSTextField>,
     checks: Retained<NSButton>,
     downloads: Retained<NSButton>,
     updates_message: Retained<NSTextField>,
@@ -20,7 +23,7 @@ pub(super) struct SettingsEditor {
 impl SettingsEditor {
     pub fn new(target: &ActionTarget) -> Self {
         let mtm = MainThreadMarker::new().unwrap();
-        let view = FlippedView::new(rect(0.0, 0.0, WIDTH, 696.0), mtm);
+        let view = FlippedView::new(rect(0.0, 0.0, WIDTH, 796.0), mtm);
         let heading = label("Hotkeys", 16.0, false, mtm);
         heading.setFont(Some(&NSFont::boldSystemFontOfSize(16.0)));
         heading.setFrame(rect(20.0, 10.0, 200.0, 24.0));
@@ -67,13 +70,44 @@ impl SettingsEditor {
         let message = label("", 11.0, true, mtm);
         message.setFrame(rect(20.0, 470.0, WIDTH - 40.0, 40.0));
         view.addSubview(&message);
+        let heading = label("Merge countdown", 16.0, false, mtm);
+        heading.setFont(Some(&NSFont::boldSystemFontOfSize(16.0)));
+        heading.setFrame(rect(20.0, 526.0, 200.0, 24.0));
+        view.addSubview(&heading);
+        let hint = label(
+            "Time to cancel before Gopher submits a merge. Off submits immediately.",
+            11.0,
+            true,
+            mtm,
+        );
+        hint.setFrame(rect(20.0, 554.0, WIDTH - 40.0, 18.0));
+        view.addSubview(&hint);
+        let merge_delay =
+            NSSlider::initWithFrame(NSSlider::alloc(mtm), rect(20.0, 578.0, 420.0, 28.0));
+        merge_delay.setMinValue(0.0);
+        merge_delay.setMaxValue(MAX_MERGE_DELAY_SECONDS.into());
+        merge_delay.setNumberOfTickMarks(isize::from(MAX_MERGE_DELAY_SECONDS) + 1);
+        merge_delay.setTickMarkPosition(NSTickMarkPosition::Below);
+        merge_delay.setAllowsTickMarkValuesOnly(true);
+        // Save once the knob is released, so worker updates cannot move it mid-drag.
+        merge_delay.setContinuous(false);
+        // The popover retains this target longer than all its controls.
+        unsafe {
+            merge_delay.setTarget(Some(target));
+            merge_delay.setAction(Some(sel!(activate:)));
+        }
+        merge_delay.setTag(target.register(AppEvent::PrAction(Request::MergeDelay(0))));
+        view.addSubview(&merge_delay);
+        let merge_delay_value = label("", 13.0, false, mtm);
+        merge_delay_value.setFrame(rect(456.0, 580.0, WIDTH - 476.0, 24.0));
+        view.addSubview(&merge_delay_value);
         let font_size = if crate::identity::IS_DEV { 13.0 } else { 16.0 };
         let heading = label(&crate::identity::version_label(), font_size, false, mtm);
         heading.setFont(Some(&NSFont::boldSystemFontOfSize(font_size)));
         heading.setFrame(if crate::identity::IS_DEV {
-            rect(20.0, 516.0, WIDTH - 40.0, 40.0)
+            rect(20.0, 616.0, WIDTH - 40.0, 40.0)
         } else {
-            rect(20.0, 526.0, WIDTH - 40.0, 24.0)
+            rect(20.0, 626.0, WIDTH - 40.0, 24.0)
         });
         view.addSubview(&heading);
         let checks = target.button(
@@ -88,11 +122,11 @@ impl SettingsEditor {
         );
         for (index, button) in [&checks, &downloads].into_iter().enumerate() {
             button.setButtonType(NSButtonType::Switch);
-            button.setFrame(rect(20.0, 561.0 + index as f64 * 30.0, WIDTH - 40.0, 26.0));
+            button.setFrame(rect(20.0, 661.0 + index as f64 * 30.0, WIDTH - 40.0, 26.0));
             view.addSubview(button);
         }
         let updates_message = label("", 11.0, true, mtm);
-        updates_message.setFrame(rect(20.0, 628.0, WIDTH - 40.0, 52.0));
+        updates_message.setFrame(rect(20.0, 728.0, WIDTH - 40.0, 52.0));
         view.addSubview(&updates_message);
         Self {
             view,
@@ -100,12 +134,30 @@ impl SettingsEditor {
             reset,
             file,
             message,
+            merge_delay,
+            merge_delay_value,
             checks,
             downloads,
             updates_message,
         }
     }
-    pub fn update(&self, state: &KeyboardState, updates: &super::super::updates::State) {
+    pub fn update(
+        &self,
+        state: &KeyboardState,
+        updates: &super::super::updates::State,
+        merge_delay: u8,
+    ) {
+        if self.merge_delay.integerValue() != isize::from(merge_delay) {
+            self.merge_delay.setIntegerValue(merge_delay.into());
+        }
+        set_text(
+            &self.merge_delay_value,
+            &match merge_delay {
+                0 => "Off".to_owned(),
+                1 => "1 second".to_owned(),
+                seconds => format!("{seconds} seconds"),
+            },
+        );
         self.checks.setEnabled(updates.enabled);
         self.downloads.setEnabled(updates.enabled && updates.checks);
         self.checks.setState(if updates.checks { 1 } else { 0 });
@@ -159,5 +211,10 @@ impl SettingsEditor {
         for button in [&self.reset, &self.file, &self.checks, &self.downloads] {
             target.ivars().actions.borrow_mut().remove(&button.tag());
         }
+        target
+            .ivars()
+            .actions
+            .borrow_mut()
+            .remove(&self.merge_delay.tag());
     }
 }

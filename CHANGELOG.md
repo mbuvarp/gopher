@@ -6,6 +6,8 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+- Add a **Merge countdown** slider to Settings. Choose how many seconds (0–10) Merge waits before submitting, so you can still cancel. The default stays at 5 seconds; **Off** merges right away. The setting is kept across restarts and account changes.
+
 ## [0.7.2] - 2026-10-22
 
 - Add a **Copy URL** button to each PR, between **Open PR** and **Details**, including in the ignored list. It copies the PR's GitHub link and acknowledges the update, briefly showing **Copied** to confirm. Press **C** to copy the highlighted PR's link; you can change the key in Settings. If you had already assigned C to another action, that shortcut is kept and Copy URL starts unset.

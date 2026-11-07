@@ -136,6 +136,42 @@ impl Store {
         Ok(())
     }
 
+    /// The application-wide merge countdown, independent of account changes.
+    /// A missing or out-of-range value falls back to the default.
+    pub fn merge_delay_seconds(&self) -> Result<u8> {
+        let value: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key='merge_delay_seconds'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(value) = value else {
+            return Ok(crate::actions::DEFAULT_MERGE_DELAY_SECONDS);
+        };
+        match value.parse::<u8>() {
+            Ok(seconds) if seconds <= crate::actions::MAX_MERGE_DELAY_SECONDS => Ok(seconds),
+            _ => {
+                tracing::warn!(event = "merge_delay_invalid", value = %value);
+                Ok(crate::actions::DEFAULT_MERGE_DELAY_SECONDS)
+            }
+        }
+    }
+    pub fn save_merge_delay_seconds(&self, seconds: u8) -> Result<()> {
+        anyhow::ensure!(
+            seconds <= crate::actions::MAX_MERGE_DELAY_SECONDS,
+            "The merge countdown must be at most {} seconds",
+            crate::actions::MAX_MERGE_DELAY_SECONDS
+        );
+        self.connection.execute(
+            "INSERT OR REPLACE INTO metadata(key,value) VALUES ('merge_delay_seconds',?1)",
+            [seconds.to_string()],
+        )?;
+        tracing::info!(event = "merge_delay_saved", seconds);
+        Ok(())
+    }
+
     pub fn label_catalogues(
         &self,
         viewer: &str,
