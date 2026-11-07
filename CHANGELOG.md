@@ -6,6 +6,8 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-11-07
+
 - Add a **Merge countdown** slider to Settings. Choose how many seconds (0–10) Merge waits before submitting, so you can still cancel. The default stays at 5 seconds; **Off** merges right away. The setting is kept across restarts and account changes.
 
 ## [0.7.2] - 2026-10-22
