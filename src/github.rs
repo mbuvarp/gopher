@@ -481,13 +481,16 @@ impl Github {
             Value::Null,
             Value::Null,
             Value::Null,
+            Value::Null,
         ];
-        let mut done = [false; 5];
+        let mut done = [false; 6];
         let mut snapshot = Snapshot::default();
+        let mut base = String::new();
+        let mut contexts = Vec::new();
         let mut initial = true;
         // Independent connection cursors avoid truncating a busy PR or skipping nested pages.
         loop {
-            let data = self.graphql(PR_QUERY, json!({"id":reference.id,"r":cursors[0],"c":cursors[1],"t":cursors[2],"e":cursors[3],"reviews":!done[0],"comments":!done[1],"threads":!done[2],"reactions":!done[3],"l":cursors[4],"labels":!done[4]})).await?;
+            let data = self.graphql(PR_QUERY, json!({"id":reference.id,"r":cursors[0],"c":cursors[1],"t":cursors[2],"e":cursors[3],"reviews":!done[0],"comments":!done[1],"threads":!done[2],"reactions":!done[3],"l":cursors[4],"labels":!done[4],"k":cursors[5],"rollup":!done[5]})).await?;
             let pr = &data["node"];
             let head = required(pr, "headRefOid")?;
             if initial {
@@ -514,6 +517,7 @@ impl Github {
                 if !snapshot.open {
                     return Ok(snapshot);
                 }
+                base = pr["baseRefOid"].as_str().unwrap_or("").into();
                 initial = false;
             }
             ensure!(
@@ -594,12 +598,33 @@ impl Github {
                     done[index] = true;
                 }
             }
+            // The check summary follows GitHub's PR status rollup, which leaves
+            // out runs GitHub does not show on the PR, such as manual dispatches.
+            if !done[5] {
+                let rollup = &pr["statusCheckRollup"];
+                if rollup.is_null() {
+                    // GitHub omits the rollup while the head has no checks or statuses.
+                    done[5] = true;
+                } else {
+                    ensure!(
+                        rollup["commit"]["oid"] == head,
+                        "PR changed during pagination; retrying next poll"
+                    );
+                    let connection = &rollup["contexts"];
+                    contexts.extend(nodes(connection)?.iter().cloned());
+                    if let Some(cursor) = next_cursor(connection)? {
+                        cursors[5] = Value::String(cursor);
+                    } else {
+                        done[5] = true;
+                    }
+                }
+            }
             if done.iter().all(|done| *done) {
                 break;
             }
         }
         let check_state = snapshot.check_state.unwrap_or_default();
-        let mut all_checks = Vec::new();
+        // Agent check runs carry review evidence; CI is summarized from the rollup.
         let mut page = 1;
         loop {
             let endpoint = format!(
@@ -627,25 +652,14 @@ impl Github {
                     summary: string(&check["output"], "summary"),
                 });
             }
-            all_checks.extend(checks.iter().cloned());
             if checks.len() < 100 {
                 break;
             }
             page += 1;
         }
-        let workflows = if check_status::needs_workflow_identity(&all_checks) {
-            match check_status::workflow_runs(self, &reference.repo, &snapshot.head).await {
-                Ok(workflows) => workflows,
-                Err(_) => {
-                    tracing::warn!(event = "workflow_identity_unavailable", repo = %reference.repo,
-                        pr = reference.number, "Keeping check suites independent");
-                    BTreeMap::new()
-                }
-            }
-        } else {
-            BTreeMap::new()
-        };
-        let runs = check_status::check_runs(&all_checks, &workflows);
+        let (rollup_checks, rollup_statuses, workflows) = check_status::rollup(&contexts);
+        let summary = check_status::check_runs(&rollup_checks, &workflows)
+            .merge(check_status::commit_statuses(&rollup_statuses));
         // CodeRabbit also uses legacy commit statuses, which are separate from check runs.
         let mut statuses = Vec::new();
         let mut page = 1;
@@ -665,9 +679,14 @@ impl Github {
             page += 1;
         }
         snapshot.checks.extend(legacy_checks(&statuses));
-        let summary = runs.merge(check_status::commit_statuses(&statuses));
         snapshot.check_state = Some(check_state.max(summary.state));
         snapshot.check_progress = Some(summary.progress);
+        let reviewed = crate::reviewers::reviewed_commits(&snapshot);
+        if !reviewed.is_empty() {
+            snapshot.reviewed_commits = self
+                .reviewed_commits(&reference.repo, &base, &snapshot.head, reviewed)
+                .await;
+        }
         tracing::debug!(event="snapshot_collected", repo=%reference.repo, pr=reference.number, elapsed_ms=start.elapsed().as_millis() as u64, threads=snapshot.threads.len());
         Ok(snapshot)
     }
@@ -869,6 +888,8 @@ fn request_kind(args: &[&str], payload: Option<&Value>) -> &'static str {
         "check_runs"
     } else if args.iter().any(|a| a.contains("/statuses?")) {
         "commit_statuses"
+    } else if args.iter().any(|a| a.contains("/compare/")) {
+        "compare_commits"
     } else {
         "rest"
     }
@@ -901,10 +922,21 @@ fn next_cursor(connection: &Value) -> Result<Option<String>> {
 }
 
 const PR_QUERY: &str = r#"
-query($id:ID!,$r:String,$c:String,$t:String,$e:String,$reviews:Boolean!,$comments:Boolean!,$threads:Boolean!,$reactions:Boolean!,$l:String,$labels:Boolean!) {
+query($id:ID!,$r:String,$c:String,$t:String,$e:String,$reviews:Boolean!,$comments:Boolean!,$threads:Boolean!,$reactions:Boolean!,$l:String,$labels:Boolean!,$k:String,$rollup:Boolean!) {
  node(id:$id) { ... on PullRequest {
-  title url state isDraft headRefOid mergeable headRefName baseRefName isCrossRepository
+  title url state isDraft headRefOid baseRefOid mergeable headRefName baseRefName isCrossRepository
   headRepositoryOwner { login }
+  statusCheckRollup {
+   commit { oid }
+   contexts(first:100,after:$k) @include(if:$rollup) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+     __typename
+     ... on CheckRun { databaseId name status conclusion checkSuite { databaseId branch { name } app { databaseId slug } workflowRun { databaseId event workflow { databaseId } } } }
+     ... on StatusContext { context state }
+    }
+   }
+  }
   labels(first:100,after:$l) @include(if:$labels) {
    pageInfo { hasNextPage endCursor }
    nodes { name color }
@@ -1042,3 +1074,5 @@ mod cache;
 mod credentials;
 
 mod report;
+
+mod rewrites;

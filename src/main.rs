@@ -48,7 +48,7 @@ fn main() -> Result<()> {
                     let expected=config.repositories.get(&repo).and_then(|r|r.reviewers.as_deref());
                     let agents=reviewers::evaluate(&snapshot,None,expected);
                     let state=reviewers::aggregate(&snapshot,&agents);
-                    println!("{}",serde_json::to_string_pretty(&serde_json::json!({"repo":repo,"number":number,"head":snapshot.head,"open":snapshot.open,"state":state,"agents":agents,"unresolved_threads":snapshot.threads.iter().filter(|t|!t.resolved).count(),"note":"Live evidence only; no cached run history or settling interval."}))?);
+                    println!("{}",serde_json::to_string_pretty(&serde_json::json!({"repo":repo,"number":number,"head":snapshot.head,"open":snapshot.open,"state":state,"checks":snapshot.check_state.map(|c|c.label_with(snapshot.check_progress)),"agents":agents,"unresolved_threads":snapshot.threads.iter().filter(|t|!t.resolved).count(),"note":"Live evidence only; no cached run history or settling interval."}))?);
                 }
             }
             Ok(())

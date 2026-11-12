@@ -181,6 +181,27 @@ pub struct PrLabel {
     pub color: String,
 }
 
+/// How the head relates to an older commit that a reviewer reviewed, compared
+/// on GitHub using only the PR's added and removed lines.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadChange {
+    /// The PR makes the same changes at both commits, as after a clean rebase.
+    Equivalent,
+    /// Commits with different changes were added on top of the reviewed commit.
+    NewCommits,
+    /// The branch was rewritten and the PR's changes differ.
+    Rewritten,
+    /// GitHub could not compare the commits, so the review is not current.
+    Unavailable,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewedCommit {
+    /// Full or abbreviated SHA as the reviewer reported it.
+    pub commit: String,
+    pub change: HeadChange,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Snapshot {
     pub id: String,
@@ -211,6 +232,10 @@ pub struct Snapshot {
     pub check_progress: Option<CheckProgress>,
     #[serde(default)]
     pub labels: Vec<PrLabel>,
+    /// Comparisons of the head with older commits that reviewers reviewed,
+    /// fetched only when a reviewer's result names another commit.
+    #[serde(default)]
+    pub reviewed_commits: Vec<ReviewedCommit>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
