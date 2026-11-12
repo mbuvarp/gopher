@@ -1156,6 +1156,35 @@ esac
         };
         assert_eq!(compares.lines().count(), expected_calls, "{expected:?}");
     }
+    // A retargeted base changes the PR's changes, so the result is not reused.
+    let fixture = include_str!("fixtures/gh-snapshot.sh").replacen(
+        "\"comments\":{\"nodes\":[]",
+        &format!(
+            "\"baseRefOid\":\"'\"$(cat \"$(dirname \"$0\")/base\")\"'\",\"comments\":{{\"nodes\":[{comment}]"
+        ),
+        1,
+    );
+    let (dir, gh) = mock(&format!(
+        r#"
+case "$*" in
+  *compare/*) printf '%s\n' "$*" >> "$(dirname "$0")/compares" ;;
+esac
+case "$*" in
+  *"...{reviewed}?"*) printf '%s\n' '{before}'; exit 0 ;;
+  *"...head?"*) printf '%s\n' '{rebased}'; exit 0 ;;
+  *compare/*) exit 1 ;;
+esac
+{fixture}
+"#
+    ));
+    for base in ["old-base", "old-base", "new-base"] {
+        std::fs::write(dir.path().join("base"), base).unwrap();
+        let snapshot = gh.snapshot(&pr_ref()).await.unwrap();
+        assert_eq!(snapshot.reviewed_commits[0].change, HeadChange::Equivalent);
+    }
+    let compares = std::fs::read_to_string(dir.path().join("compares")).unwrap();
+    assert_eq!(compares.lines().count(), 4);
+    assert_eq!(compares.matches("compare/new-base...").count(), 2);
     // Without a stale Codex review, no comparison is requested.
     let (dir, gh) = mock(&format!(
         "case \"$*\" in *compare/*) touch \"$(dirname \"$0\")/compared\"; exit 1 ;; esac\n{}",

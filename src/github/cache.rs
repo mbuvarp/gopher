@@ -14,11 +14,14 @@ pub(super) struct ApiState {
     limits: Limits,
     blocked: BTreeMap<String, Instant>,
     secondary_failures: u32,
-    /// Comparisons of reviewed commits with later heads, by repository,
-    /// reviewed commit and head. Commits are immutable, so only failed
+    /// Comparisons of reviewed commits with later heads, by repository, base
+    /// commit, reviewed commit and head. Commits are immutable, so only failed
     /// comparisons are retried.
-    head_changes: BTreeMap<(String, String, String), (HeadChange, Instant)>,
+    head_changes: BTreeMap<HeadChangeKey, (HeadChange, Instant)>,
 }
+/// Repository, base commit, reviewed commit, and head. The PR's changes at
+/// each commit depend on the base, which moves or changes when retargeted.
+pub(super) type HeadChangeKey = (String, String, String, String);
 /// Bounds remembered comparisons; each one costs up to three REST requests.
 const HEAD_CHANGES: usize = 512;
 /// A failed comparison is retried after this long instead of on every poll.
@@ -124,7 +127,7 @@ impl ApiState {
             self.head_changes.clear();
         }
     }
-    pub fn head_change(&mut self, key: &(String, String, String)) -> Option<HeadChange> {
+    pub fn head_change(&mut self, key: &HeadChangeKey) -> Option<HeadChange> {
         let (change, at) = *self.head_changes.get(key)?;
         if change == HeadChange::Unavailable && at.elapsed() >= HEAD_CHANGE_RETRY {
             self.head_changes.remove(key);
@@ -132,7 +135,7 @@ impl ApiState {
         }
         Some(change)
     }
-    pub fn remember_head_change(&mut self, key: (String, String, String), change: HeadChange) {
+    pub fn remember_head_change(&mut self, key: HeadChangeKey, change: HeadChange) {
         if self.head_changes.len() >= HEAD_CHANGES && !self.head_changes.contains_key(&key) {
             let oldest = self
                 .head_changes

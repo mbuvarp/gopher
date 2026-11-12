@@ -24,7 +24,13 @@ impl Github {
     }
 
     async fn head_change(&self, repo: &str, base: &str, reviewed: &str, head: &str) -> HeadChange {
-        let key = (repo.to_owned(), reviewed.to_owned(), head.to_owned());
+        // A retargeted or updated base changes the PR's changes at both commits.
+        let key = (
+            repo.to_owned(),
+            base.to_owned(),
+            reviewed.to_owned(),
+            head.to_owned(),
+        );
         let Ok(session) = self.session().await else {
             return HeadChange::Unavailable;
         };
