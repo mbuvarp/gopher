@@ -31,6 +31,9 @@ const MERGEABILITY_POLL: Duration = Duration::from_millis(20);
 
 mod catalogues;
 
+const CHANGED_REPORT: &str =
+    "Not reported: the PR changed when refetched. Report again if it is still wrong.";
+
 pub enum ActionCommand {
     Request(Request),
     ReadyChecked {
@@ -73,6 +76,20 @@ pub enum ActionCommand {
         token: u64,
         result: Result<(), String>,
     },
+    ReportChecked {
+        pr: String,
+        token: u64,
+        result: Result<(Box<Snapshot>, Evidence), String>,
+    },
+}
+type Evidence = BTreeMap<String, serde_json::Value>;
+
+/// A Report as incorrect request awaiting its confirming refetch.
+#[derive(Clone)]
+struct ReportIntent {
+    token: u64,
+    viewer: String,
+    displayed: Displayed,
 }
 
 pub(super) struct Context<'a> {
@@ -182,6 +199,9 @@ pub(super) struct Coordinator {
     submitted_labels: BTreeMap<u64, LabelJob>,
     /// PRs GitHub confirmed merged, awaiting the worker's merged display window.
     merged: Vec<String>,
+    reports: BTreeMap<String, ReportIntent>,
+    /// Data directory for report bundles; reports are rejected without one.
+    data: Option<std::path::PathBuf>,
 }
 impl Coordinator {
     pub fn new(store: &Store) -> Result<Self> {
@@ -206,10 +226,17 @@ impl Coordinator {
             submitted_ready: BTreeMap::new(),
             submitted_labels: BTreeMap::new(),
             merged: Vec::new(),
+            reports: BTreeMap::new(),
+            data: None,
         })
+    }
+    pub fn set_data_directory(&mut self, directory: std::path::PathBuf) {
+        self.data = Some(directory);
     }
     pub fn begin_shutdown(&mut self) {
         self.shutting_down = true;
+        // Reports are read-only diagnostics; an unfinished one is simply dropped.
+        self.reports.clear();
         self.merges
             .retain(|_, intent| self.submissions.contains(&intent.token));
         self.ready
@@ -279,7 +306,8 @@ impl Coordinator {
         if self.viewer.as_deref() != context.viewer {
             let changed = !self.state.merges.is_empty()
                 || !self.state.ready.is_empty()
-                || !self.state.labels.is_empty();
+                || !self.state.labels.is_empty()
+                || !self.state.reports.is_empty();
             self.viewer = context.viewer.map(str::to_owned);
             self.merges.clear();
             self.ready.clear();
@@ -298,6 +326,8 @@ impl Coordinator {
                 })
                 .unwrap_or_default();
             self.label_jobs.clear();
+            self.reports.clear();
+            self.state.reports.clear();
             self.state.merges.clear();
             self.state.ready.clear();
             self.state.labels.clear();
@@ -310,6 +340,14 @@ impl Coordinator {
             .ready
             .retain(|id, _| context.prs.get(id).is_none_or(|pr| pr.snapshot.draft));
         if self.state.ready.len() != ready_count {
+            self.publish(context);
+        }
+        let report_count = self.state.reports.len();
+        self.reports.retain(|id, _| context.prs.contains_key(id));
+        self.state
+            .reports
+            .retain(|id, _| context.prs.contains_key(id));
+        if self.state.reports.len() != report_count {
             self.publish(context);
         }
         // A completed merge is displayed only while its PR remains listed. The
@@ -386,6 +424,13 @@ impl Coordinator {
                     {
                         labels.error = Some(error.to_string());
                     }
+                }
+            }
+            ActionCommand::ReportChecked { pr, token, result } => {
+                if let Some(intent) = self.reports.get(&pr).filter(|i| i.token == token).cloned() {
+                    self.reports.remove(&pr);
+                    let progress = self.finish_report(&pr, intent, result, context);
+                    self.state.reports.insert(pr, progress);
                 }
             }
             ActionCommand::ReadyChecked { pr, token, result } => {
@@ -675,6 +720,16 @@ impl Coordinator {
                 let dismissed = shown && self.state.merges.remove(&pr).is_some();
                 (Some(pr), dismissed)
             }
+            DisplayedError::Report { pr, id } => {
+                let shown = self
+                    .state
+                    .reports
+                    .get(&pr)
+                    .and_then(ReportProgress::outcome)
+                    .is_some_and(|outcome| outcome.id == id);
+                let dismissed = shown && self.state.reports.remove(&pr).is_some();
+                (Some(pr), dismissed)
+            }
             DisplayedError::Request(id) => {
                 let shown = self
                     .state
@@ -855,6 +910,7 @@ impl Coordinator {
                 }
             }
             Request::DismissError(error) => self.dismiss(error),
+            Request::Report { pr, displayed } => self.start_report(pr, *displayed, context)?,
             Request::SaveLabels { pr, name } => {
                 let names: Vec<String> = {
                     let labels = self
@@ -901,6 +957,162 @@ impl Coordinator {
 
     /// Uses the merge delay current when the countdown starts; changing the
     /// setting later does not shorten or extend a running countdown.
+    fn start_report(
+        &mut self,
+        pr: String,
+        displayed: Displayed,
+        context: &Context<'_>,
+    ) -> Result<()> {
+        ensure!(
+            !self.reports.contains_key(&pr),
+            "A report for this PR is already being checked"
+        );
+        ensure!(self.data.is_some(), "Reports are unavailable");
+        let current = context
+            .prs
+            .get(&pr)
+            .context("This PR is no longer in the active list")?;
+        if Displayed::of(current) != displayed {
+            // Polling already replaced what the user saw; let them look again.
+            let outcome = self.failure(CHANGED_REPORT);
+            tracing::info!(event="report_not_written", repo=%current.snapshot.repo, pr=current.snapshot.number, reason="display_outdated");
+            self.state
+                .reports
+                .insert(pr, ReportProgress::Changed(outcome));
+            return Ok(());
+        }
+        let viewer: String = context
+            .viewer
+            .context("Waiting for GitHub authentication")?
+            .into();
+        let token = self.token();
+        let reference = PrRef {
+            id: pr.clone(),
+            repo: current.snapshot.repo.clone(),
+            number: current.snapshot.number,
+        };
+        self.reports.insert(
+            pr.clone(),
+            ReportIntent {
+                token,
+                viewer: viewer.clone(),
+                displayed,
+            },
+        );
+        self.state
+            .reports
+            .insert(pr.clone(), ReportProgress::Checking);
+        let sender = context.sender.clone();
+        let config = context.config.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let github = Github::new(&config)?;
+                ensure!(github.viewer().await? == viewer, "GitHub account changed");
+                let snapshot = github.snapshot(&reference).await?;
+                let evidence = if snapshot.open {
+                    github.report_evidence(&reference, &snapshot.head).await
+                } else {
+                    Evidence::new()
+                };
+                ensure!(github.viewer().await? == viewer, "GitHub account changed");
+                Ok((Box::new(snapshot), evidence))
+            }
+            .await
+            .map_err(|e: anyhow::Error| e.to_string());
+            let _ = sender.send(Command::PrAction(ActionCommand::ReportChecked {
+                pr,
+                token,
+                result,
+            }));
+        });
+        Ok(())
+    }
+    /// Writes the report only when the refetch reproduces the displayed state;
+    /// otherwise the display was stale, so a normal refresh shows the new state.
+    fn finish_report(
+        &mut self,
+        pr: &str,
+        intent: ReportIntent,
+        result: Result<(Box<Snapshot>, Evidence), String>,
+        context: &Context<'_>,
+    ) -> ReportProgress {
+        let (snapshot, evidence) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(event="report_failed", pr_id=%pr, error=%error);
+                return ReportProgress::Failed(self.failure(format!(
+                    "Report not saved: could not refetch the PR ({error})"
+                )));
+            }
+        };
+        if context.viewer != Some(intent.viewer.as_str()) {
+            return ReportProgress::Failed(
+                self.failure("Report not saved: the GitHub account changed."),
+            );
+        }
+        let Some(current) = context.prs.get(pr) else {
+            return ReportProgress::Failed(
+                self.failure("Report not saved: the PR is no longer in the active list."),
+            );
+        };
+        let changed = |reason: &str, this: &mut Self| {
+            tracing::info!(event="report_not_written", repo=%current.snapshot.repo, pr=current.snapshot.number, reason);
+            let _ = context.sender.send(Command::Refresh);
+            ReportProgress::Changed(this.failure(CHANGED_REPORT))
+        };
+        if Displayed::of(current) != intent.displayed {
+            return changed("polled_during_refetch", self);
+        }
+        if !snapshot.open || snapshot.id != pr {
+            return changed("closed", self);
+        }
+        let expected = context
+            .config
+            .repositories
+            .get(&snapshot.repo)
+            .and_then(|repo| repo.reviewers.as_deref());
+        let now = chrono::Utc::now();
+        // Mirror polling: an identity-only placeholder is not earlier evidence.
+        let refetched = transition_with_grace(
+            *snapshot,
+            Some(current).filter(|pr| pr.fetched_at > 0),
+            expected,
+            now.timestamp(),
+            context.config.settle_seconds,
+            context.config.review_start_grace_seconds,
+        );
+        if Displayed::of(&refetched) != intent.displayed {
+            return changed("refetch_differs", self);
+        }
+        let Some(data) = &self.data else {
+            return ReportProgress::Failed(self.failure("Reports are unavailable"));
+        };
+        let written = crate::report::write(
+            data,
+            &crate::report::Report {
+                displayed: &intent.displayed,
+                stored: current,
+                refetched: &refetched,
+                evidence: &evidence,
+                config: context.config,
+                viewer: context.viewer,
+                now,
+            },
+        );
+        match written {
+            Ok(path) => {
+                tracing::info!(event="report_saved", repo=%current.snapshot.repo, pr=current.snapshot.number, path=%path.display());
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                ReportProgress::Saved(
+                    self.failure(format!("Reported as incorrect · saved to reports/{name}")),
+                )
+            }
+            Err(error) => {
+                tracing::error!(event="report_write_failed", repo=%current.snapshot.repo, pr=current.snapshot.number, error=%error);
+                ReportProgress::Failed(self.failure(format!("Report not saved: {error}")))
+            }
+        }
+    }
     fn start_countdown(&mut self, pr: String, token: u64, context: &Context<'_>) {
         let seconds = self.state.merge_delay;
         tracing::info!(event="merge_countdown_started", pr_id=%pr, seconds);

@@ -1,5 +1,5 @@
 use super::*;
-use crate::actions::{Condition, Kind, MergeMethod, MergeProgress};
+use crate::actions::{Condition, Displayed, Kind, MergeMethod, MergeProgress, ReportProgress};
 use objc2::runtime::ProtocolObject;
 use std::cell::Cell;
 
@@ -66,6 +66,8 @@ fn forget(tags: impl IntoIterator<Item = isize>, target: &ActionTarget) {
     }
 }
 
+const REPORT: &str = "Report as incorrect";
+
 pub(super) struct PrActions {
     pub button: Retained<NSPopUpButton>,
     pub cancel: Retained<NSButton>,
@@ -74,8 +76,15 @@ pub(super) struct PrActions {
     merge: Retained<NSMenuItem>,
     labels: Retained<NSMenuItem>,
     separator: Retained<NSMenuItem>,
+    report: Retained<NSMenuItem>,
     ignore: Retained<NSMenuItem>,
     tracker: Retained<MenuTracker>,
+}
+fn report_request(pr: &PullRequest) -> AppEvent {
+    AppEvent::PrAction(Request::Report {
+        pr: pr.snapshot.id.clone(),
+        displayed: Box::new(Displayed::of(pr)),
+    })
 }
 impl PrActions {
     pub fn new(pr: &PullRequest, target: &ActionTarget, mtm: MainThreadMarker) -> Self {
@@ -124,6 +133,7 @@ impl PrActions {
             })),
             target,
         );
+        let report = menu_item(REPORT, Some(report_request(pr)), target);
         let ignore = menu_item(
             "Ignore",
             Some(AppEvent::PopoverAction(Action::Ignore(
@@ -138,6 +148,7 @@ impl PrActions {
         menu.addItem(&merge);
         menu.addItem(&labels);
         menu.addItem(&separator);
+        menu.addItem(&report);
         menu.addItem(&ignore);
         button.setMenu(Some(&menu));
         let cancel = target.button(
@@ -155,6 +166,7 @@ impl PrActions {
             merge,
             labels,
             separator,
+            report,
             ignore,
             tracker,
         }
@@ -214,6 +226,17 @@ impl PrActions {
         self.merge
             .setEnabled(preferences.allows(Kind::Merge, pr) && !busy && !ready_pending);
         self.labels.setEnabled(preferences.allows(Kind::Label, pr));
+        // Reports compare against the PR as GitHub has it, so the optimistic
+        // Ready for review display and in-flight merges cannot be reported.
+        let checking = state.reports.get(&pr.snapshot.id) == Some(&ReportProgress::Checking);
+        self.report.setTitle(&NSString::from_str(if checking {
+            "Checking report…"
+        } else {
+            REPORT
+        }));
+        self.report
+            .setEnabled(!checking && !ready_pending && !busy && !pr.snapshot.url.is_empty());
+        bind_item(&self.report, report_request(pr), target);
         bind_item(
             &self.ready,
             AppEvent::PrAction(Request::ReadyForReview {
@@ -257,6 +280,7 @@ impl PrActions {
                 self.ready.tag(),
                 self.merge.tag(),
                 self.labels.tag(),
+                self.report.tag(),
                 self.ignore.tag(),
                 self.cancel.tag(),
             ],
