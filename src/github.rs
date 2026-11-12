@@ -1040,3 +1040,5 @@ enum ResponsePolicy {
 mod cache;
 
 mod credentials;
+
+mod report;

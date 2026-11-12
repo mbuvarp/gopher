@@ -565,22 +565,42 @@ impl Row {
             let pr = pr.snapshot.id.clone();
             match action_state.ready.get(&pr) {
                 Some(crate::actions::ReadyProgress::Failed(failure)) => Some((
-                    DisplayedError::Ready { pr, id: failure.id },
-                    &failure.message,
+                    Some(DisplayedError::Ready { pr, id: failure.id }),
+                    failure.message.as_str(),
+                    true,
                 )),
                 _ => match action_state.merges.get(&pr) {
                     Some(crate::actions::MergeProgress::Failed(failure)) => Some((
-                        DisplayedError::Merge { pr, id: failure.id },
-                        &failure.message,
+                        Some(DisplayedError::Merge { pr, id: failure.id }),
+                        failure.message.as_str(),
+                        true,
                     )),
-                    _ => None,
+                    _ => action_state.reports.get(&pr).map(|report| {
+                        (
+                            report
+                                .outcome()
+                                .map(|outcome| DisplayedError::Report { pr, id: outcome.id }),
+                            report.text(),
+                            matches!(report, crate::actions::ReportProgress::Failed(_)),
+                        )
+                    }),
                 },
             }
         };
         self.action_message.setHidden(action_error.is_none());
-        self.dismiss.setHidden(action_error.is_none());
+        self.dismiss.setHidden(
+            action_error
+                .as_ref()
+                .is_none_or(|(error, ..)| error.is_none()),
+        );
         let mut extra = label_height;
-        if let Some((error, message)) = action_error {
+        if let Some((error, message, failed)) = action_error {
+            let color = if failed {
+                NSColor::systemRedColor()
+            } else {
+                NSColor::secondaryLabelColor()
+            };
+            self.action_message.setTextColor(Some(&color));
             set_text(&self.action_message, message);
             let height = self
                 .action_message
@@ -589,10 +609,12 @@ impl Row {
             let frame = rect(4.0, 88.0 + label_height, CONTENT_WIDTH - 12.0, height);
             self.action_message.setFrame(frame);
             self.dismiss.setFrame(frame);
-            target.bind(
-                &self.dismiss,
-                AppEvent::PrAction(Request::DismissError(error)),
-            );
+            if let Some(error) = error {
+                target.bind(
+                    &self.dismiss,
+                    AppEvent::PrAction(Request::DismissError(error)),
+                );
+            }
             extra += height + 8.0;
         }
         if expanded {
