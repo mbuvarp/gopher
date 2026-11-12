@@ -6,6 +6,12 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-11-12
+
+- Add **Report as incorrect** to each PR's Actions menu, just above Ignore. Use it when Gopher shows the wrong review state or check summary for a PR. Gopher fetches the PR again, and if it still shows the same result, it saves a diagnostic report under `~/.config/gopher/reports/`. If the PR has changed since, Gopher refreshes it instead and asks you to report again if it's still wrong. Reports contain no credentials, and only the newest 50 are kept.
+- Fix PRs staying at Unknown after a rebase that leaves the PR's changes the same, such as a force-push right after opening. A Codex review of the earlier commit now still counts. If the changes differ, the PR shows why and suggests commenting `@codex review`.
+- Fix the check summary counting runs that GitHub leaves out of the PR's checks, such as manually started (`workflow_dispatch`) workflows. These could keep a PR at **Checks running** after GitHub showed it green. The summary now matches the checks shown on the PR.
+
 ## [0.7.3] - 2026-11-07
 
 - Add a **Merge countdown** slider to Settings. Choose how many seconds (0–10) Merge waits before submitting, so you can still cancel. The default stays at 5 seconds; **Off** merges right away. The setting is kept across restarts and account changes.
