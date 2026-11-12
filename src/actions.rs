@@ -1,5 +1,5 @@
 //! Repository action preferences and worker-owned UI state.
-use crate::model::{CheckState, PullRequest, State};
+use crate::model::{AgentResult, CheckProgress, CheckState, PullRequest, State};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -167,6 +167,65 @@ pub enum Request {
         name: Option<String>,
     },
     DismissError(DisplayedError),
+    /// Refetch the PR and, only if the refetch reproduces what was displayed,
+    /// write a diagnostic report for later investigation.
+    Report {
+        pr: String,
+        displayed: Box<Displayed>,
+    },
+}
+/// What the popover showed for a PR when the user reported it as incorrect.
+/// A report is written only when a fresh fetch produces the same values, so a
+/// merely stale display is refreshed instead of reported.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Displayed {
+    pub head: String,
+    pub update_id: String,
+    pub candidate_id: String,
+    pub state: State,
+    pub check_state: Option<CheckState>,
+    pub check_progress: Option<CheckProgress>,
+    pub stale: bool,
+    pub agents: Vec<AgentResult>,
+}
+impl Displayed {
+    pub fn of(pr: &PullRequest) -> Self {
+        Self {
+            head: pr.snapshot.head.clone(),
+            update_id: pr.update_id.clone(),
+            candidate_id: pr.candidate_id.clone(),
+            state: pr.state,
+            check_state: pr.snapshot.check_state,
+            check_progress: pr.snapshot.check_progress,
+            stale: pr.stale,
+            agents: pr.agents.clone(),
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReportProgress {
+    Checking,
+    Saved(Failure),
+    /// The refetch differed from the display, so nothing was written.
+    Changed(Failure),
+    Failed(Failure),
+}
+impl ReportProgress {
+    /// The dismissible message occurrence, if the report has finished.
+    pub fn outcome(&self) -> Option<&Failure> {
+        match self {
+            Self::Checking => None,
+            Self::Saved(outcome) | Self::Changed(outcome) | Self::Failed(outcome) => Some(outcome),
+        }
+    }
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Checking => "Refetching to confirm the report…",
+            Self::Saved(outcome) | Self::Changed(outcome) | Self::Failed(outcome) => {
+                &outcome.message
+            }
+        }
+    }
 }
 /// An action error with a worker-unique ID, so identical repeated messages
 /// remain distinct occurrences.
@@ -181,6 +240,7 @@ pub struct Failure {
 pub enum DisplayedError {
     Ready { pr: String, id: u64 },
     Merge { pr: String, id: u64 },
+    Report { pr: String, id: u64 },
     Request(u64),
 }
 
@@ -246,6 +306,7 @@ pub struct ActionState {
     pub merges: BTreeMap<String, MergeProgress>,
     pub ready: BTreeMap<String, ReadyProgress>,
     pub labels: BTreeMap<String, Labels>,
+    pub reports: BTreeMap<String, ReportProgress>,
     pub error: Option<Failure>,
     pub merge_delay: u8,
 }
@@ -256,6 +317,7 @@ impl Default for ActionState {
             merges: BTreeMap::new(),
             ready: BTreeMap::new(),
             labels: BTreeMap::new(),
+            reports: BTreeMap::new(),
             error: None,
             merge_delay: DEFAULT_MERGE_DELAY_SECONDS,
         }

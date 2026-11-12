@@ -317,6 +317,7 @@ async fn run(
 ) -> Result<()> {
     let mut store = Store::open(&directory)?;
     let mut pr_actions = action_worker::Coordinator::new(&store)?;
+    pr_actions.set_data_directory(directory.clone());
     let mut ignored = store.ignored()?;
     let mut prs: BTreeMap<_, _> = store
         .load()?

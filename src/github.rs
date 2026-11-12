@@ -1073,4 +1073,6 @@ mod cache;
 
 mod credentials;
 
+mod report;
+
 mod rewrites;

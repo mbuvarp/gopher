@@ -180,6 +180,102 @@ async fn shutdown_reports_submitted_label_after_account_invalidation() {
     assert!(labels.pending.contains("one"));
 }
 
+#[tokio::test]
+async fn report_is_written_only_when_the_refetch_reproduces_the_display() {
+    let mut h = Harness::new();
+    let snapshot = Github::new(&h.config)
+        .unwrap()
+        .snapshot(&PrRef {
+            id: "PR_1".into(),
+            repo: "owner/repo".into(),
+            number: 1,
+        })
+        .await
+        .unwrap();
+    let now = chrono::Utc::now().timestamp();
+    h.prs
+        .insert("PR_1".into(), transition(snapshot, None, None, now, 0));
+    h.report("PR_1");
+    assert_eq!(
+        h.coordinator.state.reports.get("PR_1"),
+        Some(&ReportProgress::Checking)
+    );
+    // A second click while checking is rejected rather than duplicated.
+    h.report("PR_1");
+    assert!(h.coordinator.state.error.is_some());
+    assert!(!h.report_finished("PR_1").await);
+    let Some(ReportProgress::Saved(outcome)) = h.coordinator.state.reports.get("PR_1").cloned()
+    else {
+        panic!("{:?}", h.coordinator.state.reports);
+    };
+    let reports = h.reports();
+    assert_eq!(reports.len(), 1);
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(reports[0].join("report.json")).unwrap()).unwrap();
+    assert_eq!(summary["pr"]["id"], "PR_1");
+    assert_eq!(summary["displayed"]["head"], "head");
+    assert_eq!(summary["viewer"], "test");
+    // Unsupported endpoints are recorded as errors instead of failing the report.
+    assert!(reports[0].join("github/check_runs.json").exists());
+    assert!(reports[0].join("github/timeline.json").exists());
+    assert!(
+        !std::fs::read_to_string(reports[0].join("report.json"))
+            .unwrap()
+            .contains("test-credential")
+    );
+    h.request(Request::DismissError(DisplayedError::Report {
+        pr: "PR_1".into(),
+        id: outcome.id + 1,
+    }));
+    assert!(h.coordinator.state.reports.contains_key("PR_1"));
+    h.request(Request::DismissError(DisplayedError::Report {
+        pr: "PR_1".into(),
+        id: outcome.id,
+    }));
+    assert!(h.coordinator.state.reports.is_empty());
+}
+
+#[tokio::test]
+async fn report_refreshes_instead_of_writing_when_the_refetch_differs() {
+    let mut h = Harness::new();
+    // The display predates the head GitHub now reports.
+    h.prs.get_mut("PR_1").unwrap().snapshot.head = "old".into();
+    h.report("PR_1");
+    assert!(h.report_finished("PR_1").await);
+    assert!(matches!(
+        h.coordinator.state.reports.get("PR_1"),
+        Some(ReportProgress::Changed(_))
+    ));
+    assert!(h.reports().is_empty());
+}
+
+#[tokio::test]
+async fn report_of_an_outdated_display_or_failed_refetch_writes_nothing() {
+    let mut h = Harness::new();
+    let mut displayed = Displayed::of(&h.prs["PR_1"]);
+    displayed.stale = !displayed.stale;
+    h.request(Request::Report {
+        pr: "PR_1".into(),
+        displayed: Box::new(displayed),
+    });
+    assert!(matches!(
+        h.coordinator.state.reports.get("PR_1"),
+        Some(ReportProgress::Changed(_))
+    ));
+    h.patch_gh("*statuses*) echo '[]'; exit 0", "*statuses*) exit 1");
+    h.report("PR_1");
+    assert!(!h.report_finished("PR_1").await);
+    assert!(matches!(
+        h.coordinator.state.reports.get("PR_1"),
+        Some(ReportProgress::Failed(_))
+    ));
+    assert!(h.reports().is_empty());
+    // Reports for PRs that leave the list are forgotten.
+    h.prs.clear();
+    h.reconcile();
+    assert!(h.coordinator.state.reports.is_empty());
+}
+
 impl Harness {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
@@ -236,7 +332,8 @@ esac
             100,
             0,
         );
-        let coordinator = Coordinator::new(&store).unwrap();
+        let mut coordinator = Coordinator::new(&store).unwrap();
+        coordinator.set_data_directory(directory.path().to_owned());
         let (sender, receiver) = unbounded_channel();
         Self {
             directory,
@@ -360,6 +457,38 @@ esac
                 sink: &self.sink,
             },
         );
+    }
+    /// Handles commands until the PR's report finishes; returns whether the
+    /// coordinator asked the worker to refresh.
+    async fn report_finished(&mut self, pr: &str) -> bool {
+        let mut refreshed = false;
+        while self.coordinator.state.reports.get(pr) == Some(&ReportProgress::Checking) {
+            let command = tokio::time::timeout(Duration::from_secs(8), self.receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match command {
+                Command::PrAction(action) => self.handle(action),
+                Command::Refresh => refreshed = true,
+                _ => {}
+            }
+        }
+        while let Ok(command) = self.receiver.try_recv() {
+            refreshed |= matches!(command, Command::Refresh);
+        }
+        refreshed
+    }
+    fn reports(&self) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(crate::report::directory(self.directory.path()))
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default()
+    }
+    fn report(&mut self, pr: &str) {
+        let displayed = Box::new(Displayed::of(&self.prs[pr]));
+        self.request(Request::Report {
+            pr: pr.into(),
+            displayed,
+        });
     }
     async fn refresh_pr(&mut self) {
         self.add_pr("PR_1", 1).await;
