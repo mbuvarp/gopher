@@ -5,6 +5,12 @@ mod cubic;
 use crate::model::*;
 use std::collections::BTreeSet;
 
+/// Older commits whose reviews may still apply to the head, for the GitHub
+/// client to compare with it. Detection itself never fetches.
+pub fn reviewed_commits(snapshot: &Snapshot) -> Vec<String> {
+    codex::reviewed_commits(snapshot)
+}
+
 pub fn evaluate(
     snapshot: &Snapshot,
     previous: Option<&PullRequest>,

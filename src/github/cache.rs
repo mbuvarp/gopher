@@ -14,7 +14,15 @@ pub(super) struct ApiState {
     limits: Limits,
     blocked: BTreeMap<String, Instant>,
     secondary_failures: u32,
+    /// Comparisons of reviewed commits with later heads, by repository,
+    /// reviewed commit and head. Commits are immutable, so only failed
+    /// comparisons are retried.
+    head_changes: BTreeMap<(String, String, String), (HeadChange, Instant)>,
 }
+/// Bounds remembered comparisons; each one costs up to three REST requests.
+const HEAD_CHANGES: usize = 512;
+/// A failed comparison is retried after this long instead of on every poll.
+const HEAD_CHANGE_RETRY: Duration = Duration::from_secs(5 * 60);
 fn retry_after(headers: &BTreeMap<String, String>) -> Option<u64> {
     let value = headers.get("retry-after")?;
     value.parse().ok().or_else(|| {
@@ -112,7 +120,30 @@ impl ApiState {
             self.account = Some(account.into());
             self.generation += 1;
             self.clear();
+            // Another account may not be able to read the compared commits.
+            self.head_changes.clear();
         }
+    }
+    pub fn head_change(&mut self, key: &(String, String, String)) -> Option<HeadChange> {
+        let (change, at) = *self.head_changes.get(key)?;
+        if change == HeadChange::Unavailable && at.elapsed() >= HEAD_CHANGE_RETRY {
+            self.head_changes.remove(key);
+            return None;
+        }
+        Some(change)
+    }
+    pub fn remember_head_change(&mut self, key: (String, String, String), change: HeadChange) {
+        if self.head_changes.len() >= HEAD_CHANGES && !self.head_changes.contains_key(&key) {
+            let oldest = self
+                .head_changes
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.head_changes.remove(&oldest);
+            }
+        }
+        self.head_changes.insert(key, (change, Instant::now()));
     }
     pub fn key(&self, endpoint: &str, account: Option<&str>) -> Option<CacheKey> {
         let account = account.filter(|a| self.account.as_deref() == Some(*a))?;

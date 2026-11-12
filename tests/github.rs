@@ -264,9 +264,9 @@ async fn snapshot_paginates_reviews_independently_and_checks_head() {
 async fn conflicts_override_ci_and_use_latest_paginated_mergeability() {
     use gopher::model::CheckState;
     for (status, conclusion, ci) in [
-        ("completed", "success", CheckState::Green),
-        ("in_progress", "", CheckState::Running),
-        ("completed", "failure", CheckState::Failed),
+        ("COMPLETED", "SUCCESS", CheckState::Green),
+        ("IN_PROGRESS", "", CheckState::Running),
+        ("COMPLETED", "FAILURE", CheckState::Failed),
     ] {
         for (first, last, expected) in [
             ("MERGEABLE", "CONFLICTING", CheckState::Conflicts),
@@ -274,8 +274,9 @@ async fn conflicts_override_ci_and_use_latest_paginated_mergeability() {
             ("CONFLICTING", "MERGEABLE", ci),
             ("CONFLICTING", "UNKNOWN", ci),
         ] {
+            let run = rollup_run(1, "CI", status, conclusion, None);
             // The fixture emits the later page first in its shell case arms.
-            let fixture = include_str!("fixtures/gh-snapshot.sh")
+            let fixture = with_rollup(&[run], None)
                 .replacen(
                     "\"headRefOid\":\"head\"",
                     &format!("\"headRefOid\":\"head\",\"mergeable\":\"{last}\""),
@@ -285,24 +286,8 @@ async fn conflicts_override_ci_and_use_latest_paginated_mergeability() {
                     "\"isDraft\":false",
                     &format!("\"isDraft\":false,\"mergeable\":\"{first}\""),
                 );
-            let checks = serde_json::json!({"check_runs":[{
-                "id":1,"app":{"slug":"github-actions"},"name":"CI",
-                "status":status,"conclusion":conclusion
-            }]});
-            let (_dir, gh) = mock(&format!(
-                r#"
-case "$*" in *check-runs*) echo '{checks}'; exit 0 ;; esac
-{fixture}
-"#
-            ));
-            let snapshot = gh
-                .snapshot(&gopher::github::PrRef {
-                    id: "PR_1".into(),
-                    repo: "owner/repo".into(),
-                    number: 1,
-                })
-                .await
-                .unwrap();
+            let (_dir, gh) = mock(&fixture);
+            let snapshot = gh.snapshot(&pr_ref()).await.unwrap();
             assert_eq!(snapshot.check_state, Some(expected), "{first} -> {last}");
             assert!(snapshot.checks.is_empty());
         }
@@ -338,113 +323,170 @@ fn running_checks_show_the_floored_finished_share() {
     assert_eq!(snapshot.check_progress, None);
 }
 
+fn pr_ref() -> gopher::github::PrRef {
+    gopher::github::PrRef {
+        id: "PR_1".into(),
+        repo: "owner/repo".into(),
+        number: 1,
+    }
+}
+
+/// A check run as GitHub's PR status rollup lists it. `workflow` is the
+/// workflow ID and run ID of a GitHub Actions run triggered by `pull_request`.
+fn rollup_run(
+    id: u64,
+    name: &str,
+    status: &str,
+    conclusion: &str,
+    workflow: Option<(u64, u64)>,
+) -> serde_json::Value {
+    let suite = workflow.map_or(id, |(_, run)| run);
+    serde_json::json!({
+        "__typename":"CheckRun","databaseId":id,"name":name,"status":status,
+        "conclusion":if conclusion.is_empty() { serde_json::Value::Null } else { conclusion.into() },
+        "checkSuite":{"databaseId":suite,"branch":{"name":"feature/branch"},
+            "app":{"databaseId":15368,"slug":"github-actions"},
+            "workflowRun":workflow.map(|(workflow, run)| serde_json::json!({
+                "databaseId":run,"event":"pull_request","workflow":{"databaseId":workflow}
+            }))}
+    })
+}
+
+/// The snapshot fixture with GitHub's PR status rollup on the first PR page,
+/// and optionally a second rollup page served with the second PR page.
+fn with_rollup(first: &[serde_json::Value], next: Option<&[serde_json::Value]>) -> String {
+    use serde_json::json;
+    let page = |contexts: &[serde_json::Value], more: bool| {
+        json!({"commit":{"oid":"head"},"contexts":{
+            "pageInfo":{"hasNextPage":more,"endCursor":more.then_some("rollup-next")},
+            "nodes":contexts
+        }})
+    };
+    let mut fixture = include_str!("fixtures/gh-snapshot.sh").replacen(
+        "\"url\":\"https://github.com/owner/repo/pull/1\",",
+        &format!(
+            "\"url\":\"https://github.com/owner/repo/pull/1\",\"statusCheckRollup\":{},",
+            page(first, next.is_some())
+        ),
+        1,
+    );
+    if let Some(next) = next {
+        fixture = fixture
+            .replacen(
+                "{\"data\":{\"node\":{\"state\":\"OPEN\",",
+                &format!(
+                    "{{\"data\":{{\"node\":{{\"state\":\"OPEN\",\"statusCheckRollup\":{},",
+                    page(next, false)
+                ),
+                1,
+            )
+            // The second page must continue from the rollup cursor.
+            .replacen(
+                "input=$(cat)\n",
+                "input=$(cat)\ncase \"$input\" in *'\"r\":\"next\"'*) case \"$input\" in *'\"k\":\"rollup-next\"'*) ;; *) exit 1 ;; esac ;; esac\n",
+                1,
+            );
+    }
+    fixture
+}
+
 #[tokio::test]
-async fn snapshot_summarizes_all_check_pages_and_latest_legacy_contexts() {
+async fn snapshot_summarizes_all_rollup_pages_including_legacy_contexts() {
     use gopher::model::CheckState;
     use serde_json::json;
     for (status, conclusion, legacy_state, expected) in [
-        ("completed", "skipped", "success", CheckState::Green),
-        ("queued", "", "success", CheckState::Running),
-        ("completed", "failure", "pending", CheckState::Failed),
-        ("completed", "neutral", "pending", CheckState::Running),
-        ("in_progress", "", "failure", CheckState::Failed),
+        ("COMPLETED", "SKIPPED", "SUCCESS", CheckState::Green),
+        ("QUEUED", "", "SUCCESS", CheckState::Running),
+        ("COMPLETED", "FAILURE", "PENDING", CheckState::Failed),
+        ("COMPLETED", "NEUTRAL", "EXPECTED", CheckState::Running),
+        ("IN_PROGRESS", "", "FAILURE", CheckState::Failed),
     ] {
-        let first_checks: Vec<_> = (0..100)
-            .map(|id| {
-                json!({
-                    "id":id,"app":{"slug":"github-actions"},"name":format!("job-{id}"),
-                    "status":"completed","conclusion":"skipped"
-                })
-            })
+        let first: Vec<_> = (0..100)
+            .map(|id| rollup_run(id, &format!("job-{id}"), "COMPLETED", "SKIPPED", None))
             .collect();
-        let last_checks = json!({"check_runs":[{
-            "id":100,"app":{"slug":"github-actions"},"name":"last-job",
-            "status":status,"conclusion":conclusion
-        }]});
-        // Deliberately put a newer result on the second page to ensure context
-        // deduplication spans the complete response, not just the first page.
-        let first_statuses: Vec<_> = (0..100)
-            .map(|id| {
-                json!({
-                    "id":id,"context":"CI","state":"failure","creator":{"login":"ci-bot"}
-                })
-            })
-            .collect();
-        let last_statuses =
-            json!([{"id":100,"context":"ci","state":legacy_state,"creator":{"login":"ci-bot"}}]);
+        let next = [
+            rollup_run(100, "last-job", status, conclusion, None),
+            json!({"__typename":"StatusContext","context":"ci","state":legacy_state}),
+        ];
         let script = format!(
-            r#"
-printf '%s\n' "$*" >> "$(dirname "$0")/calls"
-case "$*" in
-  *check-runs*'page=2'*) echo '{last_checks}'; exit 0 ;;
-  *check-runs*) echo '{first_checks}'; exit 0 ;;
-  *statuses*'page=2'*) echo '{last_statuses}'; exit 0 ;;
-  *statuses*) echo '{first_statuses}'; exit 0 ;;
-esac
-{snapshot_script}
-"#,
-            first_checks = json!({"check_runs":first_checks}),
-            first_statuses = json!(first_statuses),
-            snapshot_script = include_str!("fixtures/gh-snapshot.sh")
+            "printf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/calls\"\n{}",
+            with_rollup(&first, Some(&next))
         );
         let (dir, gh) = mock(&script);
-        let snapshot = gh
-            .snapshot(&gopher::github::PrRef {
-                id: "PR_1".into(),
-                repo: "owner/repo".into(),
-                number: 1,
-            })
-            .await
-            .unwrap();
+        let snapshot = gh.snapshot(&pr_ref()).await.unwrap();
         assert_eq!(snapshot.check_state, Some(expected));
-        // 101 check runs plus the latest result of the single legacy context.
+        // 101 check runs plus the single legacy context.
         assert_eq!(
             snapshot.check_progress,
             Some(gopher::model::CheckProgress {
                 completed: 100
-                    + u32::from(status == "completed")
-                    + u32::from(legacy_state != "pending"),
+                    + u32::from(status == "COMPLETED")
+                    + u32::from(!matches!(legacy_state, "PENDING" | "EXPECTED")),
                 total: 102,
             })
         );
         // CI results are summarized separately from agent review evidence.
         assert!(snapshot.checks.is_empty());
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
-        assert_eq!(calls.lines().count(), 7); // Two PR pages, four check/status pages, final head.
+        // Two PR pages, agent check runs, CodeRabbit statuses, final head.
+        assert_eq!(calls.lines().count(), 5);
     }
+}
+
+#[tokio::test]
+async fn snapshot_ignores_runs_github_leaves_out_of_the_pr_rollup() {
+    use gopher::model::{CheckProgress, CheckState};
+    use serde_json::json;
+    // Ur-Solutions/ngs#108: manually dispatched iOS and Android workflows ran on
+    // the head for minutes after the PR's own check passed. GitHub's rollup and
+    // PR checks show only the pull_request run.
+    let rest = json!({"check_runs":[
+        {"id":1,"app":{"slug":"github-actions"},"name":"Build and test iOS app","status":"in_progress","conclusion":null,"check_suite":{"id":11}},
+        {"id":2,"app":{"slug":"github-actions"},"name":"Build and test Android app","status":"in_progress","conclusion":null,"check_suite":{"id":12}},
+        {"id":3,"app":{"slug":"github-actions"},"name":"Lint, typecheck and test","status":"completed","conclusion":"success","check_suite":{"id":13}}
+    ]});
+    let statuses =
+        json!([{"id":1,"context":"deploy","state":"failure","creator":{"login":"ci-bot"}}]);
+    let lint = rollup_run(
+        3,
+        "Lint, typecheck and test",
+        "COMPLETED",
+        "SUCCESS",
+        Some((1, 13)),
+    );
+    let (_dir, gh) = mock(&format!(
+        "case \"$*\" in *check-runs*) echo '{rest}'; exit 0 ;; *statuses*) echo '{statuses}'; exit 0 ;; esac\n{}",
+        with_rollup(&[lint], None)
+    ));
+    let snapshot = gh.snapshot(&pr_ref()).await.unwrap();
+    assert_eq!(snapshot.check_state, Some(CheckState::Green));
+    assert_eq!(
+        snapshot.check_progress,
+        Some(CheckProgress {
+            completed: 1,
+            total: 1
+        })
+    );
+    // Without any checks or statuses, GitHub returns no rollup at all.
+    let (_dir, gh) = mock(include_str!("fixtures/gh-snapshot.sh"));
+    let snapshot = gh.snapshot(&pr_ref()).await.unwrap();
+    assert_eq!(snapshot.check_state, Some(CheckState::Green));
+    assert_eq!(snapshot.check_progress, Some(CheckProgress::default()));
 }
 
 #[tokio::test]
 async fn snapshot_resolves_superseded_checks_across_pages() {
     use gopher::model::CheckState;
-    use serde_json::json;
     for reverse in [false, true] {
-        let old = json!({"id":1,"app":{"id":1,"slug":"github-actions"},"name":"required","status":"completed","conclusion":"failure","check_suite":{"id":10}});
-        let new = json!({"id":200,"app":{"id":1,"slug":"github-actions"},"name":"required","status":"in_progress","conclusion":null,"check_suite":{"id":20}});
+        let old = rollup_run(1, "required", "COMPLETED", "FAILURE", Some((1, 10)));
+        let new = rollup_run(200, "required", "IN_PROGRESS", "", Some((1, 20)));
         let (first, last) = if reverse { (new, old) } else { (old, new) };
-        let mut first_checks: Vec<_> = (2..101).map(|id| json!({"id":id,"app":{"id":1,"slug":"github-actions"},"name":format!("job-{id}"),"status":"completed","conclusion":"success"})).collect();
-        first_checks.push(first);
-        let (_dir, gh) = mock(&format!(
-            r#"
-case "$*" in
-  *actions/runs*) echo '{{"workflow_runs":[{{"id":10,"workflow_id":1,"check_suite_id":10,"head_sha":"head","head_branch":"feature","event":"pull_request"}},{{"id":20,"workflow_id":1,"check_suite_id":20,"head_sha":"head","head_branch":"feature","event":"pull_request"}}]}}'; exit 0 ;;
-  *check-runs*'page=2'*) echo '{last_checks}'; exit 0 ;;
-  *check-runs*) echo '{first_checks}'; exit 0 ;;
-esac
-{fixture}
-"#,
-            first_checks = json!({"check_runs":first_checks}),
-            last_checks = json!({"check_runs":[last]}),
-            fixture = include_str!("fixtures/gh-snapshot.sh"),
-        ));
-        let snapshot = gh
-            .snapshot(&gopher::github::PrRef {
-                id: "PR_1".into(),
-                repo: "owner/repo".into(),
-                number: 1,
-            })
-            .await
-            .unwrap();
+        let mut first_page: Vec<_> = (2..101)
+            .map(|id| rollup_run(id, &format!("job-{id}"), "COMPLETED", "SUCCESS", None))
+            .collect();
+        first_page.push(first);
+        let (_dir, gh) = mock(&with_rollup(&first_page, Some(&[last])));
+        let snapshot = gh.snapshot(&pr_ref()).await.unwrap();
         assert_eq!(snapshot.check_state, Some(CheckState::Running));
         // The superseded failure counts neither as finished nor towards the total.
         assert_eq!(
@@ -459,58 +501,41 @@ esac
 }
 
 #[tokio::test]
-async fn snapshot_preserves_independent_suites_and_unavailable_workflow_identity() {
+async fn snapshot_keeps_suites_independent_without_matching_workflow_identity() {
     use gopher::model::CheckState;
-    use serde_json::json;
-    for (workflow, head, unavailable, expected) in [
-        (1, "head", false, CheckState::Green),
-        (2, "head", false, CheckState::Failed),
-        (1, "other-head", false, CheckState::Failed),
-        (1, "head", true, CheckState::Failed),
+    for (workflow, branch, identified, expected) in [
+        (1, "feature/branch", true, CheckState::Green),
+        (2, "feature/branch", true, CheckState::Failed),
+        (1, "other", true, CheckState::Failed),
+        (1, "feature/branch", false, CheckState::Failed),
     ] {
-        let checks = json!({"check_runs":[
-            {"id":1,"app":{"id":1,"slug":"github-actions"},"name":"test","check_suite":{"id":10},"status":"completed","conclusion":"failure"},
-            {"id":2,"app":{"id":1,"slug":"github-actions"},"name":"test","check_suite":{"id":20},"status":"completed","conclusion":"success"}
-        ]});
-        let mut first_runs: Vec<_> = (100..199)
-            .map(|id| {
-                json!({
-                    "id":id,"workflow_id":id,"check_suite_id":id,"head_sha":"head",
-                    "head_branch":"feature","event":"pull_request"
-                })
-            })
-            .collect();
-        first_runs.push(json!({"id":20,"workflow_id":workflow,"check_suite_id":20,
-            "head_sha":"head","head_branch":"feature","event":"pull_request"}));
-        let last_runs = json!({"workflow_runs":[{"id":10,"workflow_id":1,"check_suite_id":10,
-            "head_sha":head,"head_branch":"feature","event":"pull_request"}]});
-        let (_dir, gh) = mock(&format!(
-            r#"
-case "$*" in
-  *actions/runs*) if {unavailable}; then echo 'HTTP 403' >&2; exit 1; fi ;;
-esac
-case "$*" in
-  *actions/runs*'head_sha=head'*'page=2'*) echo '{last_runs}'; exit 0 ;;
-  *actions/runs*'head_sha=head'*) echo '{first_runs}'; exit 0 ;;
-  *check-runs*) echo '{checks}'; exit 0 ;;
-esac
-{fixture}
-"#,
-            first_runs = json!({"workflow_runs":first_runs}),
-            fixture = include_str!("fixtures/gh-snapshot.sh"),
-        ));
-        let snapshot = gh
-            .snapshot(&gopher::github::PrRef {
-                id: "PR_1".into(),
-                repo: "owner/repo".into(),
-                number: 1,
-            })
-            .await
-            .unwrap();
+        let old = rollup_run(1, "test", "COMPLETED", "FAILURE", Some((1, 10)));
+        let mut new = rollup_run(2, "test", "COMPLETED", "SUCCESS", Some((workflow, 20)));
+        new["checkSuite"]["branch"]["name"] = branch.into();
+        if !identified {
+            new["checkSuite"]["workflowRun"] = serde_json::Value::Null;
+        }
+        let (_dir, gh) = mock(&with_rollup(&[old, new], None));
+        let snapshot = gh.snapshot(&pr_ref()).await.unwrap();
         assert_eq!(snapshot.check_state, Some(expected));
     }
 }
 
+#[tokio::test]
+async fn rejects_a_rollup_for_another_commit() {
+    let fixture = with_rollup(&[rollup_run(1, "CI", "COMPLETED", "SUCCESS", None)], None).replace(
+        "\"commit\":{\"oid\":\"head\"}",
+        "\"commit\":{\"oid\":\"new-head\"}",
+    );
+    let (_dir, gh) = mock(&fixture);
+    assert!(
+        gh.snapshot(&pr_ref())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("changed during pagination")
+    );
+}
 #[tokio::test]
 async fn rejects_head_changes_during_pagination() {
     let script = include_str!("fixtures/gh-snapshot.sh").replace(
@@ -1065,4 +1090,83 @@ async fn same_repository_branches_do_not_include_owner() {
         .unwrap();
     assert_eq!(snapshot.head_branch.as_deref(), Some("feature/branch"));
     assert!(snapshot.source_owner.is_none());
+}
+
+#[tokio::test]
+async fn snapshot_compares_a_stale_codex_review_with_the_head_once() {
+    use gopher::model::{HeadChange, ReviewedCommit};
+    use serde_json::json;
+    let reviewed = "5f3c2a1b9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a";
+    let comment = json!({
+        "id":"summary-1","author":{"login":"chatgpt-codex-connector[bot]"},"updatedAt":"2026-11-12T13:05:51Z",
+        "body":include_str!("fixtures/codex-rebased.md")
+    })
+    // The fixture prints pages with sh's echo, which expands backslash escapes.
+    .to_string()
+    .replace('\\', "\\\\");
+    let file = |patch: &str| json!({"files":[{"filename":"src/lib.rs","status":"modified","sha":"blob","patch":patch}]});
+    // Rebasing moved the hunk and changed its context, not the change itself.
+    let before = file("@@ -1,3 +1,3 @@\n old context\n-let a = 1;\n+let a = 2;");
+    let rebased = file("@@ -9,3 +9,3 @@\n new context\n-let a = 1;\n+let a = 2;");
+    let rewritten = file("@@ -9,3 +9,3 @@\n new context\n-let a = 1;\n+let a = 3;");
+    for (head_diff, between, expected) in [
+        (Some(&rebased), "diverged", HeadChange::Equivalent),
+        (Some(&rewritten), "diverged", HeadChange::Rewritten),
+        (Some(&rewritten), "ahead", HeadChange::NewCommits),
+        (None, "diverged", HeadChange::Unavailable),
+    ] {
+        let head_arm = match head_diff {
+            Some(diff) => format!("printf '%s\\n' '{diff}'; exit 0"),
+            None => "echo 'gh: Not Found (HTTP 404)' >&2; exit 1".into(),
+        };
+        let fixture = include_str!("fixtures/gh-snapshot.sh").replacen(
+            "\"comments\":{\"nodes\":[]",
+            &format!("\"baseRefOid\":\"base\",\"comments\":{{\"nodes\":[{comment}]"),
+            1,
+        );
+        let (dir, gh) = mock(&format!(
+            r#"
+case "$*" in
+  *compare/*) printf '%s\n' "$*" >> "$(dirname "$0")/compares" ;;
+esac
+case "$*" in
+  *"compare/base...{reviewed}?"*) printf '%s\n' '{before}'; exit 0 ;;
+  *"compare/base...head?"*) {head_arm} ;;
+  *"compare/{reviewed}...head?"*) echo '{{"status":"{between}","files":[]}}'; exit 0 ;;
+  *compare/*) exit 1 ;;
+esac
+{fixture}
+"#
+        ));
+        for _ in 0..2 {
+            let snapshot = gh.snapshot(&pr_ref()).await.unwrap();
+            assert_eq!(
+                snapshot.reviewed_commits,
+                vec![ReviewedCommit {
+                    commit: reviewed.into(),
+                    change: expected
+                }]
+            );
+        }
+        // Repeated polls reuse the result; failures wait before retrying.
+        let compares = std::fs::read_to_string(dir.path().join("compares")).unwrap();
+        let expected_calls = match expected {
+            HeadChange::Equivalent | HeadChange::Unavailable => 2,
+            HeadChange::Rewritten | HeadChange::NewCommits => 3,
+        };
+        assert_eq!(compares.lines().count(), expected_calls, "{expected:?}");
+    }
+    // Without a stale Codex review, no comparison is requested.
+    let (dir, gh) = mock(&format!(
+        "case \"$*\" in *compare/*) touch \"$(dirname \"$0\")/compared\"; exit 1 ;; esac\n{}",
+        include_str!("fixtures/gh-snapshot.sh")
+    ));
+    assert!(
+        gh.snapshot(&pr_ref())
+            .await
+            .unwrap()
+            .reviewed_commits
+            .is_empty()
+    );
+    assert!(!dir.path().join("compared").exists());
 }

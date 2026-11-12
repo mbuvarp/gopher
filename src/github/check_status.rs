@@ -1,4 +1,4 @@
-//! Summarize CI checks, resolving Actions workflow identity only for ambiguous names.
+//! Summarize the CI checks GitHub shows on a PR, from its status rollup.
 use super::*;
 
 #[derive(Clone, Debug)]
@@ -53,65 +53,62 @@ struct RankedCheck<'a> {
     check: &'a Value,
 }
 
-pub(super) fn needs_workflow_identity(checks: &[Value]) -> bool {
-    let mut suites = BTreeMap::new();
-    for check in checks {
-        if check["app"]["slug"] != "github-actions" {
-            continue;
-        }
-        if let (Some(name), Some(suite)) =
-            (check["name"].as_str(), check["check_suite"]["id"].as_u64())
-            && *suites.entry(name).or_insert(suite) != suite
-        {
-            return true;
-        }
-    }
-    false
-}
-
-pub(super) async fn workflow_runs(
-    github: &Github,
-    repo: &str,
-    head: &str,
-) -> Result<BTreeMap<u64, WorkflowRun>> {
+/// Split GitHub's PR status rollup into REST-shaped check runs, legacy statuses,
+/// and the workflow identity of each Actions check suite. The rollup is what
+/// GitHub shows on the PR: it already leaves out runs that are not part of the
+/// PR's checks, such as manually dispatched workflows.
+pub(super) fn rollup(contexts: &[Value]) -> (Vec<Value>, Vec<Value>, BTreeMap<u64, WorkflowRun>) {
+    let lower = |value: &Value| value.as_str().map(str::to_lowercase);
+    let mut checks = Vec::new();
+    let mut statuses = Vec::new();
     let mut workflows = BTreeMap::new();
-    let mut page = 1;
-    loop {
-        let endpoint =
-            format!("repos/{repo}/actions/runs?head_sha={head}&per_page=100&page={page}");
-        let data = github
-            .execute(&["api", "--hostname", "github.com", &endpoint], None)
-            .await?;
-        let runs = data["workflow_runs"]
-            .as_array()
-            .context("Missing workflow runs")?;
-        for run in runs {
-            if run["head_sha"] != head {
-                continue;
+    for context in contexts {
+        match context["__typename"].as_str() {
+            Some("CheckRun") => {
+                let suite = &context["checkSuite"];
+                let run = &suite["workflowRun"];
+                if let (Some(suite_id), Some(workflow), Some(id), Some(event)) = (
+                    suite["databaseId"].as_u64(),
+                    run["workflow"]["databaseId"].as_u64(),
+                    run["databaseId"].as_u64(),
+                    run["event"].as_str(),
+                ) {
+                    workflows.insert(
+                        suite_id,
+                        WorkflowRun {
+                            workflow,
+                            run: id,
+                            event: event.into(),
+                            branch: suite["branch"]["name"].as_str().unwrap_or("").into(),
+                        },
+                    );
+                }
+                checks.push(json!({
+                    "id": context["databaseId"],
+                    "app": {"id": suite["app"]["databaseId"], "slug": suite["app"]["slug"]},
+                    "name": context["name"],
+                    "status": lower(&context["status"]),
+                    "conclusion": lower(&context["conclusion"]),
+                    "check_suite": {"id": suite["databaseId"]},
+                }));
             }
-            if let (Some(suite), Some(workflow), Some(id), Some(event), Some(branch)) = (
-                run["check_suite_id"].as_u64(),
-                run["workflow_id"].as_u64(),
-                run["id"].as_u64(),
-                run["event"].as_str(),
-                run["head_branch"].as_str(),
-            ) {
-                workflows.insert(
-                    suite,
-                    WorkflowRun {
-                        workflow,
-                        run: id,
-                        event: event.into(),
-                        branch: branch.into(),
-                    },
-                );
+            Some("StatusContext") => {
+                // A required context that has not reported yet is still pending.
+                let state = match lower(&context["state"]).as_deref() {
+                    Some("expected") => Some("pending".to_owned()),
+                    state => state.map(str::to_owned),
+                };
+                statuses.push(json!({
+                    "id": statuses.len(),
+                    "context": context["context"],
+                    "state": state,
+                }));
             }
+            // The rollup context union only has check runs and statuses.
+            _ => {}
         }
-        if runs.len() < 100 {
-            return Ok(workflows);
-        }
-        page += 1;
     }
+    (checks, statuses, workflows)
 }
 
 pub(super) fn check_runs(checks: &[Value], workflows: &BTreeMap<u64, WorkflowRun>) -> Summary {
@@ -306,7 +303,6 @@ mod tests {
             run: 20,
             ..old.clone()
         };
-        assert!(needs_workflow_identity(&checks));
         assert_eq!(
             check_runs(&checks, &BTreeMap::new()).state,
             CheckState::Failed
@@ -328,7 +324,6 @@ mod tests {
         for check in &mut external {
             check["app"]["slug"] = json!("other-ci");
         }
-        assert!(!needs_workflow_identity(&external));
         assert_eq!(check_runs(&external, &workflows).state, CheckState::Failed);
     }
 
@@ -485,5 +480,84 @@ mod tests {
         let failed: Summary = [CheckState::Failed].into_iter().collect();
         assert_eq!(merged.merge(failed).state, CheckState::Failed);
         assert_eq!(merged.merge(failed).progress.completed, 5);
+    }
+
+    fn rollup_run(
+        id: u64,
+        suite: u64,
+        run: u64,
+        event: &str,
+        status: &str,
+        conclusion: Value,
+    ) -> Value {
+        json!({
+            "__typename":"CheckRun","databaseId":id,"name":"test","status":status,"conclusion":conclusion,
+            "checkSuite":{"databaseId":suite,"branch":{"name":"feature"},"app":{"databaseId":15368,"slug":"github-actions"},
+                "workflowRun":{"databaseId":run,"event":event,"workflow":{"databaseId":1}}}
+        })
+    }
+
+    #[test]
+    fn rollup_contexts_keep_replacement_rules_and_legacy_states() {
+        // An older automatic run's failure is replaced by its newer rerun.
+        let contexts = vec![
+            rollup_run(1, 10, 10, "pull_request", "COMPLETED", json!("FAILURE")),
+            rollup_run(2, 20, 20, "pull_request", "IN_PROGRESS", Value::Null),
+            json!({"__typename":"StatusContext","context":"deploy","state":"SUCCESS"}),
+            json!({"__typename":"StatusContext","context":"required","state":"EXPECTED"}),
+        ];
+        let (checks, statuses, workflows) = rollup(&contexts);
+        assert_eq!(workflows.len(), 2);
+        let runs = check_runs(&checks, &workflows);
+        assert_eq!(runs.state, CheckState::Running);
+        assert_eq!(
+            runs.progress,
+            CheckProgress {
+                completed: 0,
+                total: 1
+            }
+        );
+        let legacy = commit_statuses(&statuses);
+        assert_eq!(legacy.state, CheckState::Running);
+        assert_eq!(
+            legacy.progress,
+            CheckProgress {
+                completed: 1,
+                total: 2
+            }
+        );
+        // Separately triggered executions stay independent of each other.
+        let manual = vec![
+            rollup_run(1, 10, 10, "workflow_run", "COMPLETED", json!("FAILURE")),
+            rollup_run(2, 20, 20, "workflow_run", "COMPLETED", json!("SUCCESS")),
+        ];
+        let (checks, _, workflows) = rollup(&manual);
+        assert_eq!(check_runs(&checks, &workflows).state, CheckState::Failed);
+    }
+
+    #[test]
+    fn rollup_summary_matches_the_checks_github_shows_on_the_pr() {
+        // Ur-Solutions/ngs#108: the head also had iOS and Android runs started by
+        // workflow_dispatch, still running long after the PR check passed.
+        // GitHub's rollup lists only the pull_request run, so the PR is green.
+        let contexts = vec![json!({
+            "__typename":"CheckRun","databaseId":131197842241u64,"name":"Lint, typecheck and test",
+            "status":"COMPLETED","conclusion":"SUCCESS",
+            "checkSuite":{"databaseId":117042807844u64,"branch":{"name":"feature/ngs-114"},
+                "app":{"databaseId":15368,"slug":"github-actions"},
+                "workflowRun":{"databaseId":43222660560u64,"event":"pull_request","workflow":{"databaseId":405945880}}}
+        })];
+        let (checks, statuses, workflows) = rollup(&contexts);
+        let summary = check_runs(&checks, &workflows).merge(commit_statuses(&statuses));
+        assert_eq!(summary.state, CheckState::Green);
+        assert_eq!(
+            summary.progress,
+            CheckProgress {
+                completed: 1,
+                total: 1
+            }
+        );
+        let (checks, statuses, workflows) = rollup(&[]);
+        assert!(checks.is_empty() && statuses.is_empty() && workflows.is_empty());
     }
 }

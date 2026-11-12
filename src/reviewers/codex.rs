@@ -1,4 +1,6 @@
 use super::*;
+use regex::Regex;
+use std::sync::LazyLock;
 
 /// Codex comments instead of reviewing when its usage limit is reached. The
 /// notice stays on the PR, so it only counts while it is strictly newer than all
@@ -26,6 +28,102 @@ fn usage_limit<'a>(s: &'a Snapshot, reactions: &[&Reaction]) -> Option<&'a Comme
     (!newer_comment && !newer_review && !newer_reaction).then_some(notice)
 }
 
+fn latest_summary(s: &Snapshot) -> Option<&Comment> {
+    s.comments
+        .iter()
+        .filter(|c| {
+            Agent::from_login(&c.author) == Some(Agent::Codex)
+                && c.body
+                    .contains("<!-- codex-pull-request-review-summary -->")
+        })
+        .max_by_key(|c| &c.updated_at)
+}
+
+fn summary_rows(summary: &Comment) -> Vec<&str> {
+    summary
+        .body
+        .lines()
+        .filter(|line| line.starts_with('|') && line.contains('`'))
+        .collect()
+}
+
+fn row_commit(row: &str) -> &str {
+    row.split('|').nth(3).unwrap_or("")
+}
+
+/// The abbreviated commit in a summary row, such as `155c736`.
+fn short_commit(row: &str) -> Option<&str> {
+    row_commit(row)
+        .split(|c: char| !c.is_ascii_hexdigit())
+        .find(|part| (7..=40).contains(&part.len()))
+}
+
+/// Older commits named by the latest summary, preferring the full SHA from
+/// Codex's embedded review state so GitHub can compare them unambiguously.
+pub(super) fn reviewed_commits(s: &Snapshot) -> Vec<String> {
+    static FULL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#""commit_sha"\s*:\s*"([0-9a-fA-F]{40})""#).unwrap());
+    let Some(summary) = latest_summary(s) else {
+        return vec![];
+    };
+    let full: Vec<_> = FULL
+        .captures_iter(&summary.body)
+        .map(|c| c[1].to_lowercase())
+        .collect();
+    let mut commits = Vec::new();
+    for row in summary_rows(summary) {
+        let Some(short) = short_commit(row) else {
+            continue;
+        };
+        if matches_commit(row_commit(row), &s.head) {
+            continue;
+        }
+        let short = short.to_lowercase();
+        let commit = full
+            .iter()
+            .find(|sha| sha.starts_with(&short))
+            .cloned()
+            .unwrap_or(short);
+        if !commits.contains(&commit) {
+            commits.push(commit);
+        }
+    }
+    commits
+}
+
+/// GitHub's comparison of the head with the reviewed commit in a summary row.
+fn head_change(s: &Snapshot, row: &str) -> Option<HeadChange> {
+    let short = short_commit(row)?;
+    s.reviewed_commits
+        .iter()
+        .find(|reviewed| {
+            reviewed
+                .commit
+                .to_lowercase()
+                .starts_with(&short.to_lowercase())
+        })
+        .map(|reviewed| reviewed.change)
+}
+
+/// Why an older review does not apply to the head, and what to do about it.
+fn stale_review_reason(s: &Snapshot, row: &str) -> String {
+    let reviewed = short_commit(row).unwrap_or("an older commit");
+    match head_change(s, row) {
+        Some(HeadChange::Rewritten) => format!(
+            "Codex reviewed {reviewed} before the branch was rewritten — comment @codex review to review the current head"
+        ),
+        Some(HeadChange::NewCommits) => format!(
+            "Codex reviewed {reviewed}; newer commits are not reviewed — comment @codex review if Codex does not start"
+        ),
+        Some(HeadChange::Unavailable) => format!(
+            "Codex reviewed {reviewed}; its changes could not be compared with the current head — comment @codex review to review it"
+        ),
+        Some(HeadChange::Equivalent) | None => {
+            "Codex summary has no review for the current commit".into()
+        }
+    }
+}
+
 pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResult {
     let agent = Agent::Codex;
     let reactions: Vec<_> = s
@@ -49,26 +147,29 @@ pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResul
             "Codex eyes reaction is present",
         );
     }
-    let summary = s
-        .comments
-        .iter()
-        .filter(|c| {
-            Agent::from_login(&c.author) == Some(agent)
-                && c.body
-                    .contains("<!-- codex-pull-request-review-summary -->")
-        })
-        .max_by_key(|c| &c.updated_at);
-    if let Some(summary) = summary {
-        let rows: Vec<_> = summary
-            .body
-            .lines()
-            .filter(|line| line.starts_with('|') && line.contains('`'))
-            .collect();
+    if let Some(summary) = latest_summary(s) {
+        let rows = summary_rows(summary);
+        // A review of an older commit still applies when GitHub shows that the
+        // head makes exactly the same changes, such as after a clean rebase.
+        let equivalent = |row: &str| head_change(s, row) == Some(HeadChange::Equivalent);
         let current_rows: Vec<_> = rows
             .iter()
             .copied()
-            .filter(|row| matches_commit(row.split('|').nth(3).unwrap_or(""), &s.head))
+            .filter(|row| matches_commit(row_commit(row), &s.head) || equivalent(row))
             .collect();
+        let rebased: Vec<_> = current_rows
+            .iter()
+            .filter(|row| !matches_commit(row_commit(row), &s.head))
+            .filter_map(|row| short_commit(row))
+            .collect();
+        let note = match rebased.first() {
+            Some(reviewed) => format!(
+                " (Codex reviewed {reviewed}; head {} has the same changes)",
+                s.head.get(..7).unwrap_or(&s.head)
+            ),
+            None => String::new(),
+        };
+        let reason = |text: &str| format!("{text}{note}");
         if current_rows.is_empty() {
             // A current-commit review shows Codex already started, so the
             // stale summary is missing evidence rather than awaiting a review.
@@ -80,12 +181,11 @@ pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResul
                     "Codex summary is missing current-commit evidence",
                 );
             }
-            return result(
-                agent,
-                Verdict::Pending,
-                &summary.id,
-                "Codex summary has no review for the current commit yet",
-            );
+            let reason = rows
+                .first()
+                .map(|row| stale_review_reason(s, row))
+                .unwrap_or_else(|| "Codex summary has no review for the current commit".into());
+            return result(agent, Verdict::Pending, &summary.id, &reason);
         }
         if current_rows.iter().any(|row| {
             row.split('|').nth(2).is_some_and(|cell| {
@@ -96,7 +196,7 @@ pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResul
                 agent,
                 Verdict::Running,
                 format!("{}:{}", summary.id, summary.updated_at),
-                "Codex summary contains a running review",
+                &reason("Codex summary contains a running review"),
             );
         }
         let statuses: Vec<_> = current_rows
@@ -119,7 +219,7 @@ pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResul
                 agent,
                 Verdict::Failed,
                 format!("{}:{}", summary.id, crate::model::hash(failed.join("\n"))),
-                "Codex summary reports a failed review for the current commit",
+                &reason("Codex summary reports a failed review for the current commit"),
             );
         }
         if current_rows.len() != rows.len() {
@@ -127,7 +227,7 @@ pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResul
                 agent,
                 Verdict::Unknown,
                 &summary.id,
-                "Codex summary includes review activity for an older commit",
+                &reason("Codex summary includes review activity for an older commit"),
             );
         }
         let statuses: Vec<_> = statuses
@@ -143,7 +243,7 @@ pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResul
                 agent,
                 Verdict::Unknown,
                 &summary.id,
-                "Codex review did not complete successfully",
+                &reason("Codex review did not complete successfully"),
             );
         }
         let complete = statuses.iter().all(|status| {
@@ -184,14 +284,14 @@ pub(super) fn detect(s: &Snapshot, previous: Option<&PullRequest>) -> AgentResul
                 agent,
                 v,
                 format!("{}:{}", summary.id, summary.updated_at),
-                "Current-commit Codex summary; all listed runs finished",
+                &reason("Current-commit Codex summary; all listed runs finished"),
             );
         }
         return result(
             agent,
             Verdict::Unknown,
             &summary.id,
-            "Unrecognized Codex summary status",
+            &reason("Unrecognized Codex summary status"),
         );
     }
     // Without a summary, a newly observed reaction is safe only after observing activity on this SHA.

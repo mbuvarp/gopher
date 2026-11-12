@@ -1708,3 +1708,103 @@ fn draft_awaiting_review_is_unknown_until_marked_ready() {
     let ready = transition(s, Some(&draft), None, 160, 0);
     assert_eq!(ready.state, State::ReadyForReview);
 }
+
+const REVIEWED: &str = "5f3c2a1b9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a";
+
+/// Codex reviewed REVIEWED when the PR opened and approved it with a thumb; the
+/// branch was then force-pushed to HEAD, and Codex does not review on its own.
+fn rebased(change: Option<HeadChange>) -> Snapshot {
+    let mut s = snapshot();
+    s.comments
+        .push(summary(include_str!("fixtures/codex-rebased.md")));
+    s.reactions.push(thumb());
+    s.reviewed_commits = change
+        .map(|change| ReviewedCommit {
+            commit: REVIEWED.into(),
+            change,
+        })
+        .into_iter()
+        .collect();
+    s
+}
+
+#[test]
+fn codex_review_requests_a_comparison_of_its_reviewed_commit_only_when_stale() {
+    assert_eq!(reviewers::reviewed_commits(&rebased(None)), vec![REVIEWED]);
+    let mut current = rebased(None);
+    current.head = REVIEWED.into();
+    assert!(reviewers::reviewed_commits(&current).is_empty());
+    // Without the full SHA from the review state, the summary's short SHA is used.
+    let mut short = snapshot();
+    short.comments.push(codex_summary("5f3c2a1"));
+    assert_eq!(reviewers::reviewed_commits(&short), vec!["5f3c2a1"]);
+    assert!(reviewers::reviewed_commits(&snapshot()).is_empty());
+}
+
+#[test]
+fn codex_review_carries_across_an_equivalent_rebase() {
+    let s = rebased(Some(HeadChange::Equivalent));
+    let pr = transition(s.clone(), None, None, 100, 0);
+    assert_eq!(pr.state, State::Approved);
+    assert_eq!(codex(&pr).verdict, Verdict::Clean);
+    assert!(
+        codex(&pr)
+            .reason
+            .contains("Codex reviewed 5f3c2a1; head abcdef0 has the same changes"),
+        "{}",
+        codex(&pr).reason
+    );
+    // The comparison is the current evidence: an older thumb still cannot approve.
+    let mut early = s;
+    early.reactions[0].created_at = "2026-09-07T16:00:00Z".into();
+    assert_eq!(state(&early), State::Unknown);
+}
+
+#[test]
+fn codex_review_of_a_rewritten_or_uncompared_branch_stays_unapproved() {
+    for (change, reason) in [
+        (
+            Some(HeadChange::Rewritten),
+            "Codex reviewed 5f3c2a1 before the branch was rewritten — comment @codex review to review the current head",
+        ),
+        (
+            Some(HeadChange::NewCommits),
+            "Codex reviewed 5f3c2a1; newer commits are not reviewed",
+        ),
+        (
+            Some(HeadChange::Unavailable),
+            "Codex reviewed 5f3c2a1; its changes could not be compared with the current head",
+        ),
+        (None, "Codex summary has no review for the current commit"),
+    ] {
+        let s = rebased(change);
+        // A cold start cannot tell how long Codex has been idle on this head.
+        let pr = transition(s.clone(), None, None, 100, 0);
+        assert_eq!(pr.state, State::Unknown, "{change:?}");
+        assert!(codex(&pr).reason.contains(reason), "{}", codex(&pr).reason);
+        assert!(!codex(&pr).reason.contains("yet"));
+        // After an observed push, Codex may still start within the grace period.
+        let mut before = s.clone();
+        before.head = REVIEWED.into();
+        before.reviewed_commits.clear();
+        let approved = transition(before, None, None, 100, 0);
+        assert_eq!(approved.state, State::Approved);
+        let pushed = transition(s, Some(&approved), None, 130, 0);
+        assert_eq!(pushed.state, State::ReadyForReview, "{change:?}");
+        assert_eq!(codex(&pushed).verdict, Verdict::Pending);
+    }
+}
+
+#[test]
+fn equivalence_only_applies_to_the_compared_commit() {
+    // A second summary row for another older commit keeps the result unknown.
+    let mut s = rebased(Some(HeadChange::Equivalent));
+    s.comments[0]
+        .body
+        .push_str("\n| 🛡️ **Security Review** | ✅ **Completed** | `9999999` | Manual |");
+    assert_eq!(state(&s), State::Unknown);
+    // A comparison for another commit is not evidence for this review.
+    let mut other = rebased(Some(HeadChange::Equivalent));
+    other.reviewed_commits[0].commit = "9999999".into();
+    assert_eq!(state(&other), State::Unknown);
+}
