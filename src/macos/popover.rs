@@ -76,7 +76,7 @@ define_class!(
                     // Checkbox state is the user's latest click, even before the
                     // worker has persisted an earlier click on the same control.
                     match &mut request {
-                        Request::Configure { change: Setting::Enabled(_, value), .. } | Request::Label { selected: value, .. } => {
+                        Request::Configure { change: Setting::Enabled(_, value) | Setting::QuickLabel(_, value), .. } | Request::Label { selected: value, .. } => {
                             let state: isize = unsafe { msg_send![sender, state] };
                             *value = state == NSControlStateValueOn;
                         }
