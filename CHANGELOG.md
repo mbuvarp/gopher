@@ -6,6 +6,10 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-11-13
+
+- Saving labels now acknowledges the PR's update, the same as opening the PR. This applies to the Labels view and to quick labels in the Actions menu, and also clears that update's notifications. For the Labels view, Gopher acknowledges the update you saw when you opened it; anything that arrived while it was open stays unacknowledged.
+
 ## [0.7.5] - 2026-11-13
 
 - Add quick labels. In a PR's **Labels** view, check **Quick** on a label to show it directly in the **Actions** menu of every PR in that repository, above **Labels**. A checkmark shows whether the label is applied, and clicking it adds or removes the label immediately. Quick labels are saved per repository and follow the Labels action's Enabled and Condition settings.
