@@ -525,7 +525,8 @@ impl LabelRow {
 }
 pub(super) struct LabelPicker {
     pub(super) id: String,
-    /// The PR's currently displayed update, acknowledged when labels save.
+    /// The update shown when the picker opened. The picker hides review
+    /// state, so newer updates from polls stay unseen and unacknowledged.
     pub(super) update: String,
     repo: String,
     title: String,
@@ -571,12 +572,10 @@ impl LabelPicker {
     fn update(&mut self, prs: &[PullRequest], state: &ActionState, target: &ActionTarget) {
         let mtm = MainThreadMarker::new().unwrap();
         let labels = state.labels.get(&self.id).cloned().unwrap_or_default();
-        let pr = prs.iter().find(|pr| pr.snapshot.id == self.id);
-        if let Some(pr) = pr {
-            self.update.clone_from(&pr.update_id);
-        }
-        let allowed =
-            pr.is_some_and(|pr| state.preferences(&pr.snapshot.repo).allows(Kind::Label, pr));
+        let allowed = prs
+            .iter()
+            .find(|pr| pr.snapshot.id == self.id)
+            .is_some_and(|pr| state.preferences(&pr.snapshot.repo).allows(Kind::Label, pr));
         self.refresh
             .setEnabled(allowed && !labels.loading && labels.pending.is_empty());
         let text = if let Some(error) = labels.error.as_ref().or(labels.catalogue_error.as_ref()) {
@@ -696,14 +695,6 @@ impl LabelPicker {
             } else {
                 NSControlStateValueOff
             });
-            target.bind(
-                &row.unsaved,
-                AppEvent::PrAction(Request::SaveLabels {
-                    pr: self.id.clone(),
-                    name: Some(item.name.clone()),
-                    update: self.update.clone(),
-                }),
-            );
             row.unsaved.setHidden(!labels.unsaved.contains(&item.name));
             row.unsaved
                 .setEnabled(allowed && !labels.pending.contains(&item.name));
