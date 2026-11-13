@@ -410,7 +410,9 @@ impl Coordinator {
         }
         let label_request = matches!(&command, ActionCommand::Request(Request::Label { .. }));
         let save_pr = match &command {
-            ActionCommand::Request(Request::SaveLabels { pr, .. }) => Some(pr.clone()),
+            ActionCommand::Request(
+                Request::SaveLabels { pr, .. } | Request::QuickLabel { pr, .. },
+            ) => Some(pr.clone()),
             _ => None,
         };
         match command {
@@ -908,6 +910,25 @@ impl Coordinator {
                 if labels.unsaved.is_empty() {
                     labels.error = None;
                 }
+            }
+            Request::QuickLabel { pr, name, selected } => {
+                // The same staged toggle and save the picker uses, so pending
+                // mutations and failures appear consistently in both places.
+                self.request(
+                    Request::Label {
+                        pr: pr.clone(),
+                        name: name.clone(),
+                        selected,
+                    },
+                    context,
+                )?;
+                self.request(
+                    Request::SaveLabels {
+                        pr,
+                        name: Some(name),
+                    },
+                    context,
+                )?;
             }
             Request::DismissError(error) => self.dismiss(error),
             Request::Report { pr, displayed } => self.start_report(pr, *displayed, context)?,

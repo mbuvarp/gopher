@@ -86,6 +86,8 @@ pub struct Preferences {
     pub merge: Rule,
     pub label: Rule,
     pub merge_method: MergeMethod,
+    /// Label names offered as checkable items directly in each PR's Actions menu.
+    pub quick_labels: BTreeSet<String>,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -96,6 +98,7 @@ impl Default for Preferences {
             },
             label: Rule::default(),
             merge_method: MergeMethod::Merge,
+            quick_labels: BTreeSet::new(),
         }
     }
 }
@@ -116,16 +119,22 @@ impl Preferences {
                 || (!pr.snapshot.draft && pr.snapshot.check_state != Some(CheckState::Conflicts)))
     }
     pub fn apply(&mut self, change: &Setting) {
-        match *change {
+        match change {
             Setting::Enabled(kind, value) => match kind {
-                Kind::Merge => self.merge.enabled = value,
-                Kind::Label => self.label.enabled = value,
+                Kind::Merge => self.merge.enabled = *value,
+                Kind::Label => self.label.enabled = *value,
             },
             Setting::Condition(kind, value) => match kind {
-                Kind::Merge => self.merge.condition = value,
-                Kind::Label => self.label.condition = value,
+                Kind::Merge => self.merge.condition = *value,
+                Kind::Label => self.label.condition = *value,
             },
-            Setting::MergeMethod(value) => self.merge_method = value,
+            Setting::MergeMethod(value) => self.merge_method = *value,
+            Setting::QuickLabel(name, true) => {
+                self.quick_labels.insert(name.clone());
+            }
+            Setting::QuickLabel(name, false) => {
+                self.quick_labels.remove(name);
+            }
         }
     }
 }
@@ -135,6 +144,7 @@ pub enum Setting {
     Enabled(Kind, bool),
     Condition(Kind, Condition),
     MergeMethod(MergeMethod),
+    QuickLabel(String, bool),
 }
 #[derive(Clone, Debug)]
 pub enum Request {
@@ -165,6 +175,12 @@ pub enum Request {
     SaveLabels {
         pr: String,
         name: Option<String>,
+    },
+    /// Toggles and immediately saves one label from the PR's Actions menu.
+    QuickLabel {
+        pr: String,
+        name: String,
+        selected: bool,
     },
     DismissError(DisplayedError),
     /// Refetch the PR and, only if the refetch reproduces what was displayed,
@@ -347,4 +363,31 @@ impl ActionState {
 pub struct LabelCatalogue {
     pub labels: Vec<crate::model::PrLabel>,
     pub fetched_at: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preferences_saved_before_quick_labels_still_load() {
+        let preferences: Preferences = serde_json::from_str(
+            r#"{"merge":{"enabled":true,"condition":"approved"},"label":{"enabled":true,"condition":"always"},"merge_method":"squash"}"#,
+        )
+        .unwrap();
+        assert!(preferences.quick_labels.is_empty());
+        assert!(preferences.label.enabled);
+    }
+
+    #[test]
+    fn quick_label_settings_toggle_names() {
+        let mut preferences = Preferences::default();
+        preferences.apply(&Setting::QuickLabel("bug".into(), true));
+        preferences.apply(&Setting::QuickLabel("ready".into(), true));
+        preferences.apply(&Setting::QuickLabel("bug".into(), false));
+        assert_eq!(
+            preferences.quick_labels.into_iter().collect::<Vec<_>>(),
+            ["ready"]
+        );
+    }
 }

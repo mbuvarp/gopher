@@ -1040,6 +1040,90 @@ async fn disabling_labels_keeps_failed_changes_for_retry_without_sending_mutatio
 }
 
 #[tokio::test]
+async fn quick_label_saves_immediately_and_quick_settings_persist() {
+    let mut h = Harness::new();
+    h.request(Request::Configure {
+        repo: "Owner/Repo".into(),
+        change: Setting::QuickLabel("one".into(), true),
+    });
+    assert!(
+        h.store.action_preferences().unwrap()["owner/repo"]
+            .quick_labels
+            .contains("one")
+    );
+    h.coordinator.state.labels.insert(
+        "PR_1".into(),
+        Labels {
+            items: ["one", "two"]
+                .into_iter()
+                .map(|name| Label {
+                    name: name.into(),
+                    color: "ff0000".into(),
+                    selected: false,
+                })
+                .collect(),
+            ..Default::default()
+        },
+    );
+    h.request(Request::QuickLabel {
+        pr: "PR_1".into(),
+        name: "one".into(),
+        selected: true,
+    });
+    let labels = &h.coordinator.state.labels["PR_1"];
+    assert!(labels.items[0].selected);
+    assert!(labels.unsaved.is_empty());
+    assert!(labels.pending.contains("one"));
+    while !h.coordinator.state.labels["PR_1"].pending.is_empty() {
+        h.step().await;
+    }
+    let calls = std::fs::read_to_string(h.directory.path().join("labels.log")).unwrap();
+    assert_eq!(calls.lines().count(), 1);
+    assert!(calls.contains("--method POST"));
+    // A quick label setting never changes which label mutations are allowed.
+    h.request(Request::Configure {
+        repo: "owner/repo".into(),
+        change: Setting::QuickLabel("one".into(), false),
+    });
+    assert!(
+        h.store.action_preferences().unwrap()["owner/repo"]
+            .quick_labels
+            .is_empty()
+    );
+    assert!(h.coordinator.state.preferences("owner/repo").label.enabled);
+}
+
+#[tokio::test]
+async fn quick_label_is_rejected_when_the_label_action_is_unavailable() {
+    let mut h = Harness::new();
+    h.coordinator.state.labels.insert(
+        "PR_1".into(),
+        Labels {
+            items: vec![Label {
+                name: "one".into(),
+                color: "ff0000".into(),
+                selected: false,
+            }],
+            ..Default::default()
+        },
+    );
+    h.request(Request::Configure {
+        repo: "owner/repo".into(),
+        change: Setting::Enabled(Kind::Label, false),
+    });
+    h.request(Request::QuickLabel {
+        pr: "PR_1".into(),
+        name: "one".into(),
+        selected: true,
+    });
+    let labels = &h.coordinator.state.labels["PR_1"];
+    assert!(!labels.items[0].selected);
+    assert!(labels.pending.is_empty() && labels.unsaved.is_empty());
+    assert!(h.coordinator.state.error.is_some());
+    assert!(!h.directory.path().join("labels.log").exists());
+}
+
+#[tokio::test]
 async fn changes_during_final_authentication_cannot_submit_a_merge() {
     for change in [
         "disable",

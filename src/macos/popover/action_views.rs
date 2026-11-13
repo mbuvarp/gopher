@@ -1,7 +1,7 @@
 use super::*;
 use crate::actions::{Condition, Displayed, Kind, MergeMethod, MergeProgress, ReportProgress};
 use objc2::runtime::ProtocolObject;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 struct TrackingState {
     tracking: Cell<bool>,
@@ -75,6 +75,9 @@ pub(super) struct PrActions {
     ready: Retained<NSMenuItem>,
     merge: Retained<NSMenuItem>,
     labels: Retained<NSMenuItem>,
+    /// Repository quick labels, shown in catalogue order directly above Labels.
+    quick: RefCell<Vec<(String, Retained<NSMenuItem>)>>,
+    menu: Retained<NSMenu>,
     separator: Retained<NSMenuItem>,
     report: Retained<NSMenuItem>,
     ignore: Retained<NSMenuItem>,
@@ -84,6 +87,14 @@ fn report_request(pr: &PullRequest) -> AppEvent {
     AppEvent::PrAction(Request::Report {
         pr: pr.snapshot.id.clone(),
         displayed: Box::new(Displayed::of(pr)),
+    })
+}
+/// Requests the opposite of the checkmark the user saw on the menu item.
+fn quick_label_request(pr: &PullRequest, label: &crate::actions::Label) -> AppEvent {
+    AppEvent::PrAction(Request::QuickLabel {
+        pr: pr.snapshot.id.clone(),
+        name: label.name.clone(),
+        selected: !label.selected,
     })
 }
 impl PrActions {
@@ -126,7 +137,7 @@ impl PrActions {
             target,
         );
         let labels = menu_item(
-            "Label",
+            "Labels",
             Some(AppEvent::PopoverAction(Action::Labels {
                 pr: pr.snapshot.id.clone(),
                 update: pr.update_id.clone(),
@@ -165,10 +176,62 @@ impl PrActions {
             ready,
             merge,
             labels,
+            quick: RefCell::new(Vec::new()),
+            menu,
             separator,
             report,
             ignore,
             tracker,
+        }
+    }
+    /// Rebuilds the quick label items only when their names change, then
+    /// refreshes each item's checkmark and the toggle its click requests.
+    fn update_quick_labels(
+        &self,
+        pr: &PullRequest,
+        state: &ActionState,
+        allowed: bool,
+        target: &ActionTarget,
+    ) {
+        let preferences = state.preferences(&pr.snapshot.repo);
+        let labels = state.labels.get(&pr.snapshot.id);
+        let wanted: Vec<&crate::actions::Label> = labels
+            .filter(|_| preferences.label.enabled)
+            .map(|labels| {
+                labels
+                    .items
+                    .iter()
+                    .filter(|item| preferences.quick_labels.contains(&item.name))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut quick = self.quick.borrow_mut();
+        if !quick
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .eq(wanted.iter().map(|item| item.name.as_str()))
+        {
+            for (_, item) in quick.drain(..) {
+                self.menu.removeItem(&item);
+                forget([item.tag()], target);
+            }
+            let index = self.menu.indexOfItem(&self.labels);
+            for (offset, label) in wanted.iter().enumerate() {
+                let item = menu_item(&label.name, Some(quick_label_request(pr, label)), target);
+                self.menu.insertItem_atIndex(&item, index + offset as isize);
+                quick.push((label.name.clone(), item));
+            }
+        }
+        for ((_, item), label) in quick.iter().zip(&wanted) {
+            item.setState(if label.selected {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
+            item.setEnabled(
+                allowed && labels.is_some_and(|labels| !labels.pending.contains(&label.name)),
+            );
+            bind_item(item, quick_label_request(pr, label), target);
         }
     }
     pub fn update(
@@ -225,7 +288,9 @@ impl PrActions {
         // GitHub still has a draft until the optimistically shown Ready for review saves.
         self.merge
             .setEnabled(preferences.allows(Kind::Merge, pr) && !busy && !ready_pending);
-        self.labels.setEnabled(preferences.allows(Kind::Label, pr));
+        let labels_allowed = preferences.allows(Kind::Label, pr);
+        self.labels.setEnabled(labels_allowed);
+        self.update_quick_labels(pr, state, labels_allowed, target);
         // Reports compare against the PR as GitHub has it, so the optimistic
         // Ready for review display and in-flight merges cannot be reported.
         let checking = state.reports.get(&pr.snapshot.id) == Some(&ReportProgress::Checking);
@@ -283,7 +348,9 @@ impl PrActions {
                 self.report.tag(),
                 self.ignore.tag(),
                 self.cancel.tag(),
-            ],
+            ]
+            .into_iter()
+            .chain(self.quick.borrow().iter().map(|(_, item)| item.tag())),
             target,
         );
     }
@@ -350,7 +417,7 @@ impl ConfigEditor {
                 if kind == Kind::Merge {
                     "Merge"
                 } else {
-                    "Label"
+                    "Labels"
                 },
                 13.0,
                 false,
@@ -373,7 +440,7 @@ impl ConfigEditor {
                 if kind == Kind::Merge {
                     "Merge"
                 } else {
-                    "Label"
+                    "Labels"
                 }
             ))));
             tags.push(enabled.tag());
@@ -448,13 +515,21 @@ struct LabelRow {
     checkbox: Retained<NSButton>,
     dot: Retained<NSImageView>,
     unsaved: Retained<NSButton>,
+    quick: Retained<NSButton>,
+}
+impl LabelRow {
+    fn tags(&self) -> [isize; 3] {
+        [self.checkbox.tag(), self.unsaved.tag(), self.quick.tag()]
+    }
 }
 pub(super) struct LabelPicker {
     pub(super) id: String,
+    repo: String,
     title: String,
     view: Retained<FlippedView>,
     message: Retained<NSTextField>,
     refresh: Retained<NSButton>,
+    quick_heading: Retained<NSTextField>,
     rows: HashMap<String, LabelRow>,
 }
 impl LabelPicker {
@@ -470,8 +545,13 @@ impl LabelPicker {
         );
         refresh.setFrame(rect(WIDTH - 144.0, 8.0, 124.0, 28.0));
         view.addSubview(&refresh);
+        let quick = label("Quick", 12.0, true, mtm);
+        quick.setAlignment(NSTextAlignment::Center);
+        quick.setHidden(true);
+        view.addSubview(&quick);
         Self {
             id: pr.snapshot.id.clone(),
+            repo: pr.snapshot.repo.clone(),
             title: format!(
                 "Labels #{} · {}",
                 pr.snapshot.number,
@@ -480,6 +560,7 @@ impl LabelPicker {
             view,
             message,
             refresh,
+            quick_heading: quick,
             rows: HashMap::new(),
         }
     }
@@ -524,11 +605,17 @@ impl LabelPicker {
                 row.checkbox.removeFromSuperview();
                 row.dot.removeFromSuperview();
                 row.unsaved.removeFromSuperview();
-                forget([row.checkbox.tag(), row.unsaved.tag()], target);
+                row.quick.removeFromSuperview();
+                forget(row.tags(), target);
                 false
             }
         });
-        let mut y = (height + 28.0).max(52.0);
+        let quick_labels = state.preferences(&self.repo).quick_labels;
+        // Leave room below Refresh labels for the Quick column heading.
+        let mut y = (height + 28.0).max(60.0);
+        self.quick_heading
+            .setFrame(rect(WIDTH - 83.0, y - 20.0, 60.0, 18.0));
+        self.quick_heading.setHidden(labels.items.is_empty());
         for item in &labels.items {
             let row = self.rows.entry(item.name.clone()).or_insert_with(|| {
                 let checkbox = target.button(
@@ -563,19 +650,45 @@ impl LabelPicker {
                     image.setTemplate(true);
                     dot.setImage(Some(&image));
                 }
+                // Repository-wide: a quick label appears directly in the Actions
+                // menu of every PR in this repository.
+                let quick = target.button(
+                    "",
+                    AppEvent::PrAction(Request::Configure {
+                        repo: self.repo.clone(),
+                        change: Setting::QuickLabel(item.name.clone(), false),
+                    }),
+                    mtm,
+                );
+                quick.setButtonType(NSButtonType::Switch);
+                quick.setAccessibilityLabel(Some(&NSString::from_str(&format!(
+                    "Quick label {}",
+                    item.name
+                ))));
+                quick.setToolTip(Some(&NSString::from_str(
+                    "Show this label directly in the PR Actions menu",
+                )));
                 self.view.addSubview(&checkbox);
                 self.view.addSubview(&dot);
                 self.view.addSubview(&unsaved);
+                self.view.addSubview(&quick);
                 LabelRow {
                     checkbox,
                     dot,
                     unsaved,
+                    quick,
                 }
             });
-            row.checkbox.setFrame(rect(44.0, y, WIDTH - 144.0, 28.0));
+            row.checkbox.setFrame(rect(44.0, y, WIDTH - 228.0, 28.0));
             row.dot.setFrame(rect(23.0, y + 8.0, 12.0, 12.0));
             row.dot.setContentTintColor(Some(&label_color(&item.color)));
-            row.unsaved.setFrame(rect(WIDTH - 100.0, y, 80.0, 28.0));
+            row.unsaved.setFrame(rect(WIDTH - 176.0, y, 80.0, 28.0));
+            row.quick.setFrame(rect(WIDTH - 61.0, y, 26.0, 28.0));
+            row.quick.setState(if quick_labels.contains(&item.name) {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
             row.unsaved.setHidden(!labels.unsaved.contains(&item.name));
             row.unsaved
                 .setEnabled(allowed && !labels.pending.contains(&item.name));
@@ -674,13 +787,7 @@ impl DetailPanel {
             Self::Settings(editor) => editor.remove(target),
             Self::Labels(picker) => {
                 forget([picker.refresh.tag()], target);
-                forget(
-                    picker
-                        .rows
-                        .values()
-                        .flat_map(|row| [row.checkbox.tag(), row.unsaved.tag()]),
-                    target,
-                );
+                forget(picker.rows.values().flat_map(LabelRow::tags), target);
             }
         }
     }
