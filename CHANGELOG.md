@@ -6,6 +6,11 @@ both GitHub release notes and Gopher's update dialog.
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-11-13
+
+- Add quick labels. In a PR's **Labels** view, check **Quick** on a label to show it directly in the **Actions** menu of every PR in that repository, above **Labels**. A checkmark shows whether the label is applied, and clicking it adds or removes the label immediately. Quick labels are saved per repository and follow the Labels action's Enabled and Condition settings.
+- Rename the **Label** action to **Labels** in the Actions menu and the Configure table.
+
 ## [0.7.4] - 2026-11-12
 
 - Add **Report as incorrect** to each PR's Actions menu, just above Ignore. Use it when Gopher shows the wrong review state or check summary for a PR. Gopher fetches the PR again, and if it still shows the same result, it saves a diagnostic report under `~/.config/gopher/reports/`. If the PR has changed since, Gopher refreshes it instead and asks you to report again if it's still wrong. Reports contain no credentials, and only the newest 50 are kept.
