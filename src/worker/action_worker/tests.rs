@@ -88,6 +88,7 @@ async fn shutdown_finishes_submitted_label_but_cancels_the_queue() {
     h.request(Request::SaveLabels {
         pr: "PR_1".into(),
         name: None,
+        update: "displayed".into(),
     });
     while !h.coordinator.has_submissions() {
         h.step().await;
@@ -127,6 +128,7 @@ async fn shutdown_reports_submitted_label_after_account_invalidation() {
     h.request(Request::SaveLabels {
         pr: "PR_1".into(),
         name: None,
+        update: "displayed".into(),
     });
     while !h.coordinator.has_submissions() {
         h.step().await;
@@ -894,6 +896,7 @@ async fn label_toggles_are_queued_and_results_only_change_the_requested_label() 
     h.request(Request::SaveLabels {
         pr: "PR_1".into(),
         name: None,
+        update: "displayed".into(),
     });
     assert_eq!(h.coordinator.state.labels["PR_1"].pending.len(), 2);
     while !h.coordinator.state.labels["PR_1"].pending.is_empty() {
@@ -934,6 +937,7 @@ async fn toggling_a_label_back_clears_the_draft_without_a_mutation() {
     h.request(Request::SaveLabels {
         pr: "PR_1".into(),
         name: None,
+        update: "displayed".into(),
     });
     assert!(h.coordinator.state.labels["PR_1"].pending.is_empty());
     assert!(!h.directory.path().join("labels.log").exists());
@@ -966,6 +970,7 @@ async fn saving_one_draft_leaves_other_drafts_unsaved() {
     h.request(Request::SaveLabels {
         pr: "PR_1".into(),
         name: Some("one".into()),
+        update: "displayed".into(),
     });
     assert!(h.coordinator.state.labels["PR_1"].pending.contains("one"));
     assert!(h.coordinator.state.labels["PR_1"].unsaved.contains("two"));
@@ -999,6 +1004,7 @@ async fn draft_survives_refresh_and_clears_when_remote_selection_matches() {
     h.request(Request::SaveLabels {
         pr: "PR_1".into(),
         name: None,
+        update: "displayed".into(),
     });
     assert!(!h.directory.path().join("labels.log").exists());
 }
@@ -1025,6 +1031,7 @@ async fn disabling_labels_keeps_failed_changes_for_retry_without_sending_mutatio
     h.request(Request::SaveLabels {
         pr: "PR_1".into(),
         name: None,
+        update: "displayed".into(),
     });
     h.request(Request::Configure {
         repo: "owner/repo".into(),
@@ -1069,6 +1076,7 @@ async fn quick_label_saves_immediately_and_quick_settings_persist() {
         pr: "PR_1".into(),
         name: "one".into(),
         selected: true,
+        update: "displayed".into(),
     });
     let labels = &h.coordinator.state.labels["PR_1"];
     assert!(labels.items[0].selected);
@@ -1080,6 +1088,14 @@ async fn quick_label_saves_immediately_and_quick_settings_persist() {
     let calls = std::fs::read_to_string(h.directory.path().join("labels.log")).unwrap();
     assert_eq!(calls.lines().count(), 1);
     assert!(calls.contains("--method POST"));
+    // The saved result carries the update the user saw, for acknowledgement.
+    let mut saved = None;
+    while let Ok(command) = h.receiver.try_recv() {
+        if let Command::LabelSaved { update, .. } = command {
+            saved = Some(update);
+        }
+    }
+    assert_eq!(saved.as_deref(), Some("displayed"));
     // A quick label setting never changes which label mutations are allowed.
     h.request(Request::Configure {
         repo: "owner/repo".into(),
@@ -1115,6 +1131,7 @@ async fn quick_label_is_rejected_when_the_label_action_is_unavailable() {
         pr: "PR_1".into(),
         name: "one".into(),
         selected: true,
+        update: "displayed".into(),
     });
     let labels = &h.coordinator.state.labels["PR_1"];
     assert!(!labels.items[0].selected);
@@ -1267,6 +1284,7 @@ echo"#,
         h.request(Request::SaveLabels {
             pr: "PR_1".into(),
             name: None,
+            update: "displayed".into(),
         });
         tokio::time::timeout(Duration::from_secs(8), async {
             while !h.directory.path().join("auth-started").exists() {

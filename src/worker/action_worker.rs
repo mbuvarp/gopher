@@ -169,6 +169,8 @@ struct LabelJob {
     name: String,
     selected: bool,
     color: String,
+    /// The update displayed when the save was requested.
+    update: String,
 }
 #[derive(Clone)]
 struct ReadyIntent {
@@ -911,7 +913,12 @@ impl Coordinator {
                     labels.error = None;
                 }
             }
-            Request::QuickLabel { pr, name, selected } => {
+            Request::QuickLabel {
+                pr,
+                name,
+                selected,
+                update,
+            } => {
                 // The same staged toggle and save the picker uses, so pending
                 // mutations and failures appear consistently in both places.
                 self.request(
@@ -926,13 +933,14 @@ impl Coordinator {
                     Request::SaveLabels {
                         pr,
                         name: Some(name),
+                        update,
                     },
                     context,
                 )?;
             }
             Request::DismissError(error) => self.dismiss(error),
             Request::Report { pr, displayed } => self.start_report(pr, *displayed, context)?,
-            Request::SaveLabels { pr, name } => {
+            Request::SaveLabels { pr, name, update } => {
                 let names: Vec<String> = {
                     let labels = self
                         .state
@@ -966,6 +974,7 @@ impl Coordinator {
                         name,
                         selected,
                         color,
+                        update: update.clone(),
                     });
                     if jobs.len() == 1 {
                         self.start_label(&pr, context);
@@ -1354,6 +1363,7 @@ impl Coordinator {
                         color: job.color.clone(),
                     },
                     selected: job.selected,
+                    update: job.update.clone(),
                 });
             }
         }

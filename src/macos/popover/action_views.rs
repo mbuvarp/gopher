@@ -95,6 +95,7 @@ fn quick_label_request(pr: &PullRequest, label: &crate::actions::Label) -> AppEv
         pr: pr.snapshot.id.clone(),
         name: label.name.clone(),
         selected: !label.selected,
+        update: pr.update_id.clone(),
     })
 }
 impl PrActions {
@@ -524,6 +525,9 @@ impl LabelRow {
 }
 pub(super) struct LabelPicker {
     pub(super) id: String,
+    /// The update shown when the picker opened. The picker hides review
+    /// state, so newer updates from polls stay unseen and unacknowledged.
+    pub(super) update: String,
     repo: String,
     title: String,
     view: Retained<FlippedView>,
@@ -551,6 +555,7 @@ impl LabelPicker {
         view.addSubview(&quick);
         Self {
             id: pr.snapshot.id.clone(),
+            update: pr.update_id.clone(),
             repo: pr.snapshot.repo.clone(),
             title: format!(
                 "Labels #{} · {}",
@@ -637,6 +642,7 @@ impl LabelPicker {
                     AppEvent::PrAction(Request::SaveLabels {
                         pr: self.id.clone(),
                         name: Some(item.name.clone()),
+                        update: self.update.clone(),
                     }),
                     mtm,
                 );

@@ -949,8 +949,8 @@ impl ReviewPopover {
             return;
         }
         if let Some(DetailPanel::Labels(picker)) = &self.detail {
-            let id = picker.id.clone();
-            self.save_label_drafts(&id);
+            let (id, update) = (picker.id.clone(), picker.update.clone());
+            self.save_label_drafts(&id, &update);
         }
         self.show_detail(DetailPanel::settings(&self.target));
     }
@@ -1067,12 +1067,13 @@ impl ReviewPopover {
                 .as_ref()
                 .is_some_and(|detail| detail.labels_saving(&self.action_state))
     }
-    fn save_label_drafts(&mut self, id: &str) {
+    fn save_label_drafts(&mut self, id: &str, update: &str) {
         self.saving_labels.insert(id.into());
         let _ = super::dispatch_pr_action(
             Request::SaveLabels {
                 pr: id.into(),
                 name: None,
+                update: update.into(),
             },
             &self.target.ivars().sender,
         );
@@ -1083,7 +1084,7 @@ impl ReviewPopover {
         }
         if let Some(detail) = self.detail.take() {
             if let DetailPanel::Labels(picker) = &detail {
-                self.save_label_drafts(&picker.id);
+                self.save_label_drafts(&picker.id, &picker.update);
             }
             detail.remove(&self.target);
             self.scroll.setDocumentView(Some(&self.document));

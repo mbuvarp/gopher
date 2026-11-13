@@ -77,6 +77,8 @@ pub enum Command {
         viewer: String,
         label: crate::model::PrLabel,
         selected: bool,
+        /// The update displayed when the label change was requested.
+        update: String,
     },
     Refresh,
     Acknowledge {
@@ -479,6 +481,7 @@ async fn run(
                 viewer: account,
                 label,
                 selected,
+                update,
             } => {
                 if viewer.as_deref() == Some(account.as_str())
                     && let Some(pr) = prs.get_mut(&id)
@@ -491,6 +494,19 @@ async fn run(
                         pr.snapshot.labels.push(label);
                     }
                     store.save(pr)?;
+                    // Changing labels shows the user saw the displayed update. A
+                    // newer update keeps its notification state.
+                    if pr.acknowledged.as_deref() != Some(update.as_str()) {
+                        acknowledge(
+                            &store,
+                            pr,
+                            &update,
+                            true,
+                            &in_flight_notifications,
+                            &mut dismiss_after_delivery,
+                            &sink,
+                        )?;
+                    }
                     // A poll started before the mutation must not replace its result.
                     if polling {
                         invalidated_poll_ids.insert(id);
@@ -709,17 +725,16 @@ async fn run(
                 update,
                 checked,
             } => {
-                if let Some(pr) = prs.get_mut(&pr)
-                    && store.acknowledge(pr, &update, checked)?
-                    && checked
-                {
-                    let ids = store.notification_ids(&pr.snapshot.id, Some(&update))?;
-                    dismiss_after_delivery.extend(
-                        ids.iter()
-                            .filter(|id| in_flight_notifications.contains(*id))
-                            .cloned(),
-                    );
-                    sink(UiEvent::DismissNotifications(ids));
+                if let Some(pr) = prs.get_mut(&pr) {
+                    acknowledge(
+                        &store,
+                        pr,
+                        &update,
+                        checked,
+                        &in_flight_notifications,
+                        &mut dismiss_after_delivery,
+                        &sink,
+                    )?;
                 }
             }
             Command::Ignore(id) => {
@@ -1139,6 +1154,24 @@ fn displayed_prs(
         .collect()
 }
 
+/// Persists an acknowledgement of `update` and withdraws its notifications.
+/// Does nothing when the PR has moved on to a newer update.
+fn acknowledge(
+    store: &Store,
+    pr: &mut PullRequest,
+    update: &str,
+    checked: bool,
+    in_flight: &BTreeSet<String>,
+    dismiss_after_delivery: &mut BTreeSet<String>,
+    sink: &Sink,
+) -> Result<()> {
+    if store.acknowledge(pr, update, checked)? && checked {
+        let ids = store.notification_ids(&pr.snapshot.id, Some(update))?;
+        dismiss_after_delivery.extend(ids.iter().filter(|id| in_flight.contains(*id)).cloned());
+        sink(UiEvent::DismissNotifications(ids));
+    }
+    Ok(())
+}
 fn apply_ready_saved(pr: &mut PullRequest, expected: Option<&[Agent]>) {
     pr.snapshot.draft = false;
     pr.ready_pending = true;
@@ -1413,6 +1446,7 @@ mod tests {
                         color: "112233".into(),
                     },
                     selected: true,
+                    update: "displayed".into(),
                 })
                 .unwrap();
             run(
@@ -1436,6 +1470,77 @@ mod tests {
                     labels.is_empty(),
                     "An old account must not change the current cache"
                 );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_label_acknowledges_only_the_displayed_update() {
+        for current in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = Store::open(directory.path()).unwrap();
+            store.set_viewer("test").unwrap();
+            let pr = transition(
+                Snapshot {
+                    id: "PR_1".into(),
+                    repo: "owner/repo".into(),
+                    open: true,
+                    ..Default::default()
+                },
+                None,
+                None,
+                100,
+                0,
+            );
+            store.save(&pr).unwrap();
+            let notification = store.notification(&pr).unwrap().unwrap();
+            // An older display must not acknowledge the PR's newer update.
+            let displayed = if current {
+                pr.update_id.clone()
+            } else {
+                "older".into()
+            };
+            let (sender, receiver) = unbounded_channel();
+            sender.send(Command::Shutdown).unwrap();
+            sender
+                .send(Command::LabelSaved {
+                    pr: "PR_1".into(),
+                    viewer: "test".into(),
+                    label: PrLabel {
+                        name: "saved".into(),
+                        color: "112233".into(),
+                    },
+                    selected: true,
+                    update: displayed,
+                })
+                .unwrap();
+            let dismissed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let events = dismissed.clone();
+            run(
+                directory.path().into(),
+                Config {
+                    gh_path: Some(directory.path().join("missing-gh")),
+                    ..Default::default()
+                },
+                receiver,
+                sender,
+                Arc::new(move |event| {
+                    if let UiEvent::DismissNotifications(ids) = event {
+                        events.lock().unwrap().extend(ids);
+                    }
+                }),
+                IGNORED_CHECK_INTERVAL,
+            )
+            .await
+            .unwrap();
+            let saved = &store.load().unwrap()[0];
+            assert_eq!(saved.snapshot.labels[0].name, "saved");
+            if current {
+                assert_eq!(saved.acknowledged.as_ref(), Some(&pr.update_id));
+                assert!(dismissed.lock().unwrap().contains(&notification));
+            } else {
+                assert_eq!(saved.acknowledged, None);
+                assert!(!dismissed.lock().unwrap().contains(&notification));
             }
         }
     }
@@ -2318,6 +2423,7 @@ esac
                     color: "112233".into(),
                 },
                 selected: true,
+                update: "displayed".into(),
             })
             .unwrap();
         let step = poll_step(
