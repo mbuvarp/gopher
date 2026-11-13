@@ -172,15 +172,18 @@ pub enum Request {
         name: String,
         selected: bool,
     },
+    /// `update` is the displayed update ID, acknowledged once the save succeeds.
     SaveLabels {
         pr: String,
         name: Option<String>,
+        update: String,
     },
     /// Toggles and immediately saves one label from the PR's Actions menu.
     QuickLabel {
         pr: String,
         name: String,
         selected: bool,
+        update: String,
     },
     DismissError(DisplayedError),
     /// Refetch the PR and, only if the refetch reproduces what was displayed,
